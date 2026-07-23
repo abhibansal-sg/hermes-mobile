@@ -10,6 +10,9 @@ flag that the supervised launchd service (spec N6/A7) passes.
 
 from __future__ import annotations
 
+import plistlib
+from pathlib import Path
+
 import pytest
 
 from hermes_relay.__main__ import (
@@ -169,6 +172,18 @@ def test_service_shape_resolves_to_relay_config(monkeypatch):
     assert cfg.downstream.host == "0.0.0.0"
     assert cfg.downstream.port == 8788
     assert cfg.downstream.auth_token == "dashboard"
+
+
+def test_service_exposes_stock_runtime_and_plugin_paths():
+    template = (
+        Path(__file__).parents[1] / "scripts" / "ai.hermes.relay.plist"
+    ).read_bytes()
+    environment = plistlib.loads(template)["EnvironmentVariables"]
+    assert environment["PYTHONPATH"] == "__HERMES_HOME__/hermes-agent"
+    assert (
+        environment["HERMES_RELAY_PLUGIN_DIR"]
+        == "__HERMES_HOME__/plugins/hermes-mobile"
+    )
 
 
 def test_missing_token_raises(monkeypatch):

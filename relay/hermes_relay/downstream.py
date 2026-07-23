@@ -164,7 +164,7 @@ class DownstreamServer:
             return response
 
     def _authorized_upstream_token(self, raw_path: str, request: Any) -> Optional[str]:
-        """Authenticate locally while preserving validated device identity."""
+        """Authenticate locally, then use the stock gateway credential upstream."""
         from urllib.parse import parse_qs, urlsplit
 
         headers = getattr(request, "headers", {}) or {}
@@ -185,7 +185,7 @@ class DownstreamServer:
             device_tokens = plugin_bridge.import_device_tokens()
             for value in supplied:
                 if value and device_tokens.match(value) is not None:
-                    return value
+                    return self._upstream.token
         except Exception:
             _log.debug("device-token proxy auth unavailable", exc_info=True)
         return None
