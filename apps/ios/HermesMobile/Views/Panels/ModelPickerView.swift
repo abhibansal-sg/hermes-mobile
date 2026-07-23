@@ -1,28 +1,18 @@
 import SwiftUI
 
-/// Browse authenticated providers and their curated models, see which model is
-/// currently configured (`GET /api/model/info`), and assign a new main model
-/// (`POST /api/model/set`).
+/// Browse authenticated providers and their curated models and assign the
+/// default model for new chats through the stock gateway protocol.
 ///
 /// Selection writes the **main** slot and applies to *new* sessions — the
 /// running chat is not hot-swapped (server semantics; surfaced as a footnote).
 /// Presentable in a sheet or pushed onto a navigation stack.
 ///
-/// ABH-84: When `gatewayClient` is non-nil, a "Default Reasoning" and a
-/// "Default Fast Mode" control appear below the context header. These send
-/// `config.set` without a `session_id` (global write), matching the Settings
-/// scope. The controls are hidden on call sites that don't supply a client.
+/// Default reasoning and fast-mode controls use the same stock global
+/// `config.set` path as the model selection.
 struct ModelPickerView: View {
     let control: RestClient
 
-    /// WS client for global config.set (fast/reasoning defaults). When nil the
-    /// reasoning/fast controls are hidden — backwards-compatible with call sites
-    /// that only need the model-selection surface.
-    var gatewayClient: HermesGatewayClient?
-    /// Settings-owned connection store; preferred global config writer because
-    /// it uses the same `ConnectionStore.globalSet*` RPC helpers as the root
-    /// Settings toggles.
-    var connectionStore: ConnectionStore?
+    let connectionStore: ConnectionStore
 
     /// Invoked after a successful model switch so the owner can re-resolve the
     /// running model (F0 / Amendment B — `ConnectionStore.refreshActiveModel`).
@@ -60,13 +50,11 @@ struct ModelPickerView: View {
 
     init(
         control: RestClient,
-        gatewayClient: HermesGatewayClient? = nil,
-        connectionStore: ConnectionStore? = nil,
+        connectionStore: ConnectionStore,
         contextUsage: (used: Int, max: Int, percent: Int, compressions: Int)? = nil,
         onModelChanged: (() -> Void)? = nil
     ) {
         self.control = control
-        self.gatewayClient = gatewayClient
         self.connectionStore = connectionStore
         self.contextUsage = contextUsage
         self.onModelChanged = onModelChanged
@@ -82,9 +70,7 @@ struct ModelPickerView: View {
 
                 // ABH-84: Global default fast/reasoning controls (Settings surface).
                 // Shown when a global config writer was supplied.
-                if gatewayClient != nil || connectionStore != nil {
-                    globalDefaultsSection(options)
-                }
+                globalDefaultsSection(options)
 
                 ForEach(filteredProviders(options)) { provider in
                     Section {
@@ -330,7 +316,7 @@ struct ModelPickerView: View {
 
     private func load() async {
         if phase.value == nil { phase = .loading }
-        async let optionsResult = control.modelOptions()
+        async let optionsResult = connectionStore.globalModelOptions()
         async let infoResult = try? control.modelInfo()
         do {
             let options = try await optionsResult
@@ -346,7 +332,9 @@ struct ModelPickerView: View {
         pendingSelection = selection
         defer { pendingSelection = nil }
         do {
-            _ = try await control.setMainModel(provider: selection.provider, model: selection.model)
+            try await connectionStore.globalSetModel(
+                "\(selection.model) --provider \(selection.provider)"
+            )
             appliedSelection = selection
             // Tell the owner to re-resolve the running model so the header /
             // composer chip reflects the new main model (F0 / Amendment B).
@@ -358,9 +346,8 @@ struct ModelPickerView: View {
 
     // MARK: - Global defaults section (ABH-84)
 
-    /// Global default reasoning + fast controls. Visible only in the Settings
-    /// path (when `gatewayClient` is non-nil). Both send `config.set` WITHOUT a
-    /// `session_id` so the gateway writes the global config.yaml default.
+    /// Global default reasoning + fast controls. Both send `config.set` without
+    /// a `session_id` so the gateway writes the global default.
     @ViewBuilder
     private func globalDefaultsSection(_ options: ModelOptions) -> some View {
         // Find capabilities for the currently active (or applied) model.
@@ -421,7 +408,6 @@ struct ModelPickerView: View {
 
     /// Load current global reasoning effort + fast mode from the gateway config.
     private func loadGlobalConfig() async {
-        guard gatewayClient != nil || connectionStore != nil else { return }
         // Read from `GET /api/config` — the same endpoint the desktop uses.
         guard let agentSection = try? await control.agentConfig() else { return }
         let effort = agentSection["reasoning_effort"]?.stringValue ?? ""
@@ -431,23 +417,11 @@ struct ModelPickerView: View {
     }
 
     private func applyGlobalReasoning(_ effort: String) async {
-        guard gatewayClient != nil || connectionStore != nil else { return }
         pendingGlobalConfig = true
         defer { pendingGlobalConfig = false }
         let prev = globalReasoningEffort
         do {
-            if let connectionStore {
-                try await connectionStore.globalSetReasoning(effort.isEmpty ? "none" : effort)
-            } else if let gatewayClient {
-                _ = try await gatewayClient.requestRaw(
-                    "config.set",
-                    params: .object([
-                        "key": .string("reasoning"),
-                        "value": .string(effort.isEmpty ? "none" : effort),
-                    ]),
-                    timeout: .seconds(30)
-                )
-            }
+            try await connectionStore.globalSetReasoning(effort.isEmpty ? "none" : effort)
         } catch {
             globalReasoningEffort = prev
             actionError = (error as? GatewayError)?.errorDescription ?? error.localizedDescription
@@ -455,23 +429,11 @@ struct ModelPickerView: View {
     }
 
     private func applyGlobalFast(_ enabled: Bool) async {
-        guard gatewayClient != nil || connectionStore != nil else { return }
         pendingGlobalConfig = true
         defer { pendingGlobalConfig = false }
         let prev = globalFast
         do {
-            if let connectionStore {
-                try await connectionStore.globalSetFast(enabled)
-            } else if let gatewayClient {
-                _ = try await gatewayClient.requestRaw(
-                    "config.set",
-                    params: .object([
-                        "key": .string("fast"),
-                        "value": .string(enabled ? "fast" : "normal"),
-                    ]),
-                    timeout: .seconds(30)
-                )
-            }
+            try await connectionStore.globalSetFast(enabled)
         } catch {
             globalFast = prev
             actionError = (error as? GatewayError)?.errorDescription ?? error.localizedDescription

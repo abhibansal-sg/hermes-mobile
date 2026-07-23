@@ -184,7 +184,7 @@ final class ConnectionStore {
     // gateway's `session.info` events (emitted after a `config.set` hot-swap).
     // They are nil when no session is active or no info has arrived yet.
     // The session popup reads these to show current state; the global defaults
-    // are separate (Settings → ModelPickerView → POST /api/model/set).
+    // are separate (Settings → ModelPickerView → global `config.set`).
 
     /// The live session's model id as reported by the last `session.info`.
     /// Distinct from `activeModelName`: this is the per-session override after a
@@ -331,6 +331,15 @@ final class ConnectionStore {
         return ModelOptions(json: result)
     }
 
+    /// Stock global model inventory/defaults for Settings and draft chats.
+    func globalModelOptions() async throws -> ModelOptions {
+        let result = try await client.requestRaw(
+            "model.options",
+            timeout: .seconds(30)
+        )
+        return ModelOptions(json: result)
+    }
+
     /// Send `config.set` with `key="model"` and the active `session_id` so the
     /// model switch is scoped to the live session only (not global).
     func sessionSetModel(_ model: String, sessionId: String) async throws {
@@ -340,6 +349,18 @@ final class ConnectionStore {
                 "key": .string("model"),
                 "value": .string(model),
                 "session_id": .string(sessionId),
+            ]),
+            timeout: .seconds(30)
+        )
+    }
+
+    /// Set the model used by new sessions through the stock global config RPC.
+    func globalSetModel(_ model: String) async throws {
+        _ = try await client.requestRaw(
+            "config.set",
+            params: .object([
+                "key": .string("model"),
+                "value": .string(model),
             ]),
             timeout: .seconds(30)
         )

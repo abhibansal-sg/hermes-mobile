@@ -565,7 +565,7 @@ struct RestClient: Sendable {
     /// Decode `data` into a raw ``JSONValue`` with NO key conversion — dynamic
     /// keys (provider slugs, model ids, personality names) must survive verbatim,
     /// which `.convertFromSnakeCase` would rewrite. Used by the control surface's
-    /// `/api/model/options`, `/api/config`, `/api/cron/jobs`, `/api/skills` and by
+    /// `/api/config`, `/api/cron/jobs`, `/api/skills` and by
     /// the bare-array message/export payloads.
     func decodeJSONValue(from data: Data, context: String) throws -> JSONValue {
         do {

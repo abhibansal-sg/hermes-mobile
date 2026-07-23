@@ -1115,7 +1115,6 @@ struct SettingsView: View {
                     // fast/reasoning controls are shown in Settings.
                     ModelPickerView(
                         control: control,
-                        gatewayClient: connectionStore.client,
                         connectionStore: connectionStore
                     ) {
                         // Keep the running-model chip in sync after a switch made
