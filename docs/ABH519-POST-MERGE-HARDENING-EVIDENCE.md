@@ -23,9 +23,11 @@ and clarification response calls, including the existing ABH-88 alternate-path
 retry. A card clears only after an authoritative `resolved` or
 `alreadyHandled` result; transport/auth failures leave it retryable. The plugin
 permits a paired phone to act on a live desktop-owned session, permits the owning
-phone for a phone-owned session, and rejects unknown or another phone's session.
-No coordinator, transcript store, replay type, identity map, gateway method, or
-relay state was added.
+phone while its live WS socket is registered, treats a session with no live
+device socket as shared among paired devices, and rejects unknown sessions or a
+different phone while the owner's socket remains registered. No coordinator,
+transcript store, replay type, identity map, gateway method, or relay state was
+added.
 
 ## Corrected attention proof
 
@@ -45,11 +47,15 @@ prove a genuinely desktop-owned runtime.
   approved through S13, cleared only after acknowledgement, rendered the exact
   final response, and the driver then received `message.complete`. XCUITest:
   `/tmp/ios-hardening-approval-push-desktop-qwen-r4-internal.log`; driver:
-  `/tmp/ios-hardening-approval-driver-qwen-r4.log`.
+  `/tmp/ios-hardening-approval-driver-qwen-r4.log`. This probe used
+  `HERMES_TRANSPORT=gatewayDirect` against the isolated gateway; it did not
+  traverse the relay.
 
-The UI probes deliberately query assistant text views and transformed model
-answers rather than `.any` descendants or prompt literals, preventing prompt
-echoes and accessibility duplicates from producing false greens.
+Assistant-completion probes deliberately query assistant text views and
+transformed model answers rather than prompt literals. A few structural probes
+use `.any` only for unique exact labels, including the clarification-card header
+and `TASK_DOCK_DONE`; those labels are not used as assistant-attribution
+oracles.
 
 ## Two-device physical gate
 
@@ -84,8 +90,24 @@ the machine's `SWBBuildService` is a singleton.
   failure retention, cross-session echo prevention, and draft gate parking:
   **17 passed, 0 failed**. Log:
   `/tmp/ios-hardening-s13-swift-focused-r3-internal.log`.
+- Hosted iOS on final head `6529117f5`:
+  **1,894 executed, 6 skipped, 0 failures**. GitHub Actions run
+  `29986583458`.
 - `git diff --check`: pass.
 
-All model-driven hardware probes used Qwen 3.8 Max through the isolated gateway
-on port 9140 and transparent relay on port 9141. Live ports 9119 and 8788 were
-not changed.
+The clarification, completion-push, and cross-client probes exercised the relay
+path; the approval probe was gateway-direct as noted above. Every cited log has
+zero references to the live gateway/relay ports 9119 and 8788, which attests
+that those live services were not targeted. The specific isolated ports 9140
+and 9141 and the Qwen 3.8 Max probe model are operator assertions: the surviving
+artifacts do not record those values and therefore do not independently attest
+them.
+
+## Evidence process for future physical rounds
+
+Persist the driver script in the repository, or retain and cite its durable
+path. Each driver log line must include an ISO timestamp, runtime ID, stored
+session ID, and marker; the paired XCUITest must print the same marker so the
+phone and driver logs can be cross-correlated. The current phone-side proof is
+strong, but its three-line, untimestamped driver stubs do not meet that future
+attestation standard.
