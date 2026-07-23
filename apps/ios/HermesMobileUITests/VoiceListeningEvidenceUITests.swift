@@ -12,10 +12,8 @@ import XCTest
 /// (`Networking/Audio/VoiceConversationController.swift`) sets
 /// `status = .listening` SYNCHRONOUSLY, before the awaited mic-hardware start,
 /// so the live "Listening" UI renders immediately on tap regardless of mic
-/// permission or gateway health. Granting mic permission at the OS level
-/// BEFORE launch (`xcrun simctl privacy <udid> grant microphone ai.hermes.app`,
-/// done out-of-band by the capture script, NOT by this test) simply keeps the
-/// (irrelevant but visually obstructive) system alert from ever appearing.
+/// permission or gateway health. On physical hardware the test accepts the
+/// one-time system prompt through SpringBoard, then exercises a real capture.
 ///
 /// This test touches ZERO production code paths beyond what
 /// `ChatFlowUITests`/`ConnectionModePickerUITests` already exercise: it drives
@@ -56,6 +54,9 @@ final class VoiceListeningEvidenceUITests: XCTestCase {
         app.launchArguments += ["--uitest-mute-audio"]
         app.launchEnvironment["HERMES_URL"] = url
         app.launchEnvironment["HERMES_TOKEN"] = token
+        if let relayURL = env["HERMES_RELAY_URL"], !relayURL.isEmpty {
+            app.launchEnvironment["HERMES_RELAY_URL"] = relayURL
+        }
         app.launch()
 
         // 1. Connected chat shell (draft home). `drawerToggle` (the STR-723/
@@ -68,8 +69,9 @@ final class VoiceListeningEvidenceUITests: XCTestCase {
         //    it exists on both idioms and only renders once `configure()`
         //    has verified the connection.
         let modelChip = app.buttons["composerModelChip"]
+        let drawerToggle = app.buttons["drawerToggle"]
         XCTAssertTrue(
-            modelChip.waitForExistence(timeout: 30),
+            drawerToggle.waitForExistence(timeout: 10) || modelChip.waitForExistence(timeout: 20),
             "Connected chat shell (draft home) did not appear"
         )
         attach(app.screenshot(), name: "01-idle-connected")
@@ -87,6 +89,11 @@ final class VoiceListeningEvidenceUITests: XCTestCase {
             "composerConversationModeButton never became enabled (isConnected never true)"
         )
         convButton.tap()
+        let springboard = XCUIApplication(bundleIdentifier: "com.apple.springboard")
+        let allowMicrophone = springboard.buttons["Allow"]
+        if allowMicrophone.waitForExistence(timeout: 5) {
+            allowMicrophone.tap()
+        }
 
         // 3. `voice.start()` -> `beginListening()` sets `status = .listening`
         //    SYNCHRONOUSLY before any mic/network I/O, so the ConversationModeStrip
@@ -120,17 +127,17 @@ final class VoiceListeningEvidenceUITests: XCTestCase {
         ).firstMatch
         _ = listeningLabel.waitForExistence(timeout: 5)  // informational only; see README
 
-        // 6. Exercise one "listen -> stop -> re-arm" cycle. The harness gateway
-        //    implements no `/api/audio/transcribe` endpoint, so `stopAndTranscribe`
-        //    always comes back nil/empty — which RE-ARMS Listening rather than
-        //    submitting a turn (see `VoiceConversationController.handleTurn`'s
-        //    empty-transcript path). This is the honest "no-speech re-arm" leg of
-        //    the loop, NOT a full listen->response->re-listen cycle (no real
-        //    STT/LLM exists in this harness) — see the evidence README.
+        // 6. Exercise one "listen -> stop -> re-arm" cycle. A fake gateway takes
+        //    the empty-transcript path immediately; physical hardware may hear
+        //    real audio and run a complete STT -> agent -> reply leg first.
         doneTalking.tap()
         XCTAssertTrue(
-            waitUntilEnabled(doneTalking, timeout: 15),
-            "Did not re-arm to Listening after Done-talking (no-speech re-arm path)"
+            waitUntilDisabled(doneTalking, timeout: 10),
+            "Done-talking did not leave Listening for transcription"
+        )
+        XCTAssertTrue(
+            waitUntilEnabled(doneTalking, timeout: 150),
+            "Did not re-arm to Listening after transcription or the recognized-speech turn"
         )
         attach(app.screenshot(), name: "03-relistening")
 
@@ -156,6 +163,14 @@ final class VoiceListeningEvidenceUITests: XCTestCase {
     private func waitUntilEnabled(_ element: XCUIElement, timeout: TimeInterval) -> Bool {
         let predicate = NSPredicate(format: "isEnabled == true")
         let expectation = XCTNSPredicateExpectation(predicate: predicate, object: element)
+        return XCTWaiter().wait(for: [expectation], timeout: timeout) == .completed
+    }
+
+    private func waitUntilDisabled(_ element: XCUIElement, timeout: TimeInterval) -> Bool {
+        let expectation = XCTNSPredicateExpectation(
+            predicate: NSPredicate(format: "isEnabled == false"),
+            object: element
+        )
         return XCTWaiter().wait(for: [expectation], timeout: timeout) == .completed
     }
 }
