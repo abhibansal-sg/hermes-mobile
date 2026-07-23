@@ -131,16 +131,9 @@ struct SettingsView: View {
     /// Whether typing `@` in the composer opens the file-mention autocomplete.
     @AppStorage(DefaultsKeys.mentionAutocompleteEnabled) private var mentionAutocompleteEnabled = true
 
-    // MARK: Experimental transport (Wave-2 relay)
+    // MARK: Transparent proxy
 
-    /// The raw persisted ``TransportPath``. The toggle below maps it to a Bool
-    /// (`.relay` ⇔ on). Default `.gatewayDirect` matches
-    /// ``DefaultsKeys/transportPathValue(_:)``'s "absent ⇒ gateway-direct" rule,
-    /// so an untouched install is byte-identical to today.
-    @AppStorage(DefaultsKeys.transportPath) private var transportPathRaw = TransportPath.gatewayDirect.rawValue
-    /// The explicit relay WS URL the phone dials when the relay path is on. Read
-    /// by ``ConnectionStore/relayURL(forGateway:)`` on device (the sim used the
-    /// `HERMES_RELAY_URL` env var). Empty ⇒ derive from the gateway URL.
+    /// Optional proxy address. Empty uses the paired gateway address directly.
     @AppStorage(DefaultsKeys.relayURLOverride) private var relayURLOverride = ""
 
     // MARK: Per-event push prefs (F2-A / A4)
@@ -663,38 +656,22 @@ struct SettingsView: View {
         }
     }
 
-    // MARK: - Experimental transport (Wave-2 relay)
+    // MARK: - Transparent proxy
 
-    /// Developer/experimental controls for the Wave-2 relay transport. Default OFF
-    /// (`.gatewayDirect`) = today's behaviour, byte-identical. Flipping the toggle
-    /// writes ``DefaultsKeys/transportPath`` and the URL field writes
-    /// ``DefaultsKeys/relayURLOverride`` — the on-device equivalent of the
-    /// simulator's `HERMES_RELAY_URL` env var, read by
-    /// ``ConnectionStore/relayURL(forGateway:)``. Reconnect after changing either.
     @ViewBuilder
     private var experimentalTransportSection: some View {
         Section {
-            Toggle(isOn: Binding(
-                get: { transportPathRaw == TransportPath.relay.rawValue },
-                set: { transportPathRaw = ($0 ? TransportPath.relay : TransportPath.gatewayDirect).rawValue }
-            )) {
-                SettingsRowLabel(icon: "point.3.connected.trianglepath.dotted", title: "Relay transport")
-            }
-            .listRowBackground(theme.card)
-            .accessibilityIdentifier("settingsRelayTransportToggle")
-
-            TextField("ws://<tailnet-host>:8790", text: $relayURLOverride)
+            TextField("https://<tailnet-host>:8788", text: $relayURLOverride)
                 .textInputAutocapitalization(.never)
                 .autocorrectionDisabled()
                 .keyboardType(.URL)
                 .foregroundStyle(theme.fg)
-                .disabled(transportPathRaw != TransportPath.relay.rawValue)
                 .listRowBackground(theme.card)
                 .accessibilityIdentifier("settingsRelayTransportURLField")
         } header: {
-            Text("Experimental — Relay (Wave 2)")
+            Text("Gateway proxy")
         } footer: {
-            Text("Routes streaming through the Wave-2 relay instead of the gateway directly. Enter the relay's WebSocket URL (leave blank to derive it from the gateway). Default off keeps the existing gateway path. Reconnect after changing.")
+            Text("Optional. Enter the relay address used for both gateway WebSocket and HTTP traffic, then reconnect. Leave blank to use the paired gateway address.")
         }
     }
 

@@ -786,12 +786,6 @@ struct MessageBubble: View {
             }
         case .usage(_, let stats):
             usageFooter(stats)
-        case .item(_, let item):
-            // Wave-2 item-backed part (RELAY-PHONE-PROTOCOL §2): the new special
-            // renders (generic tool card, fileChange, image, browser, error)
-            // dispatch through the render-lane seam. Skeleton today; the render
-            // lane fleshes out `ChatItemView`.
-            ChatItemView(item: item)
         }
     }
 
@@ -2586,8 +2580,7 @@ extension MessageBubble: Equatable {
 /// unchanged: ▌ U+258C in `theme.midground`, 1.0 → 0.25 soft breathe, 1.2 s
 /// period = the ratified easeInOut-0.6-autoreverses shape). The prior
 /// `@State` + `onAppear` + `withAnimation(.repeatForever)` pattern stranded the
-/// cursor STATIC whenever the row remounted mid-stream (the streaming bubble is
-/// re-derived on every `applyRelayItems` pass; a view-identity change or an
+/// cursor STATIC whenever the row remounted mid-stream (a view-identity change or an
 /// animation-nil transaction resets `@State` without re-firing `onAppear`) —
 /// the motionless bare bar the owner photographed (IMG_2577/2585/2587). A
 /// time-driven pulse has no state to strand: any remount keeps breathing at the

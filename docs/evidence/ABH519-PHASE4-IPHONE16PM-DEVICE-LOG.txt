@@ -1,0 +1,22 @@
+Device: iPhone 16 Pro Max, iOS 26.5
+UDID: 00008140-000648640A33001C
+Capture: idevicesyslog filtered to HermesMobile during physical XCUITest
+Source: /tmp/abh519-phase4-device-clean.log
+
+Jul 23 07:19:44.599774 HermesMobile[5670] <Notice>: [ABH-519] CacheStore.init success
+Jul 23 07:19:54.458554 HermesMobile[5670] <Notice>: [ABH-519] persistDraftBornCacheSeed entry session=sess-acaaa0a3
+Jul 23 07:19:54.571365 HermesMobile[5670] <Notice>: [ABH-519] persistDraftBornCacheSeed upsertSession success session=sess-acaaa0a3 server=http://192.168.4.92:9149 profile=default
+Jul 23 07:19:54.606353 HermesMobile[5670] <Notice>: [ABH-519] persistDraftBornCacheSeed saveTranscript success session=sess-acaaa0a3
+Jul 23 07:19:58.832220 HermesMobile[5670] <Debug>: open-latency cache-paint(HIT) session=sess-acaaa0a3 +0.1ms
+Jul 23 07:20:01.958486 HermesMobile[5673] <Notice>: [ABH-519] CacheStore.init success
+Jul 23 07:20:02.669696 HermesMobile[5673] <Debug>: open-latency cache-paint(HIT) session=sess-acaaa0a3 +12.7ms
+Jul 23 07:20:13.300663 HermesMobile[5675] <Notice>: [ABH-519] CacheStore.init success
+Jul 23 07:20:13.903156 HermesMobile[5675] <Debug>: open-latency cache-paint(HIT) session=sess-acaaa0a3 +5.1ms
+Jul 23 07:20:24.602916 HermesMobile[5678] <Notice>: [ABH-519] CacheStore.init success
+Jul 23 07:20:25.166472 HermesMobile[5678] <Debug>: open-latency cache-paint(HIT) session=sess-acaaa0a3 +7.8ms
+Jul 23 07:20:36.064725 HermesMobile[5680] <Notice>: [ABH-519] CacheStore.init success
+Jul 23 07:20:36.636339 HermesMobile[5680] <Debug>: open-latency cache-paint(HIT) session=sess-acaaa0a3 +143.6ms
+
+XCUITest evidence:
+QA1-COLD-OPEN-EVIDENCE: open1: shellToComposer=2.28s turn=settled session=opened | open2: shellToComposer=2.33s cachePaint=true alert=false drawerClosed=true | open3: shellToComposer=2.27s cachePaint=true alert=false drawerClosed=true | open4: shellToComposer=2.32s cachePaint=true alert=false drawerClosed=true | open5: shellToComposer=2.30s cachePaint=true alert=false drawerClosed=true
+** TEST SUCCEEDED **

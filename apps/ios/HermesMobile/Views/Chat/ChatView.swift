@@ -206,48 +206,12 @@ struct ChatView: View {
     /// turn is actively running, not while the turn is paused on a human approval,
     /// clarification, sudo, or secret prompt (those have their own user-action UI).
     ///
-    /// QA-1 B8/A4 — the relay transport suppresses the row while the streaming
-    /// assistant bubble is on screen. The ratified Wave-2.5 design makes the
-    /// bubble's breathing cursor THE working signal ("Streaming caret = the
-    /// working signal … No fat working pill"; WAVE-ROADMAP.md) with the Turn Dock
-    /// the single home for interactive chrome (tasks/approvals/clarifies). The
-    /// relay projection (`ChatStore.applyRelayItems`) marks the assistant bubble
-    /// streaming for as long as ANY relay item is non-terminal, so while that
-    /// cursor renders the tail row is redundant — and unlike the direct path the
-    /// relay never sets the `activeToolName`/`turnStartedAt` event-router
-    /// internals per event, so beside a live turn the row could only ever read a
-    /// dishonest static "Working · 0s" (the owner's IMG_2517/2526 pill). The row
-    /// still shows PRE-FIRST-ITEM — between the relay submit and the first
-    /// rendered item — the honest accepted-and-waiting window, exactly mirroring
-    /// the approved direct path between `send` and `message.start`. Direct
-    /// transport: byte-identical to the approved behavior (desktop-parity tail
-    /// indicator with the honest tool name + ticking elapsed).
-    ///
-    /// QA-1 A9 render-gate seam: exposed as a PURE STATIC (the same unit-
-    /// testability pattern as ``transcriptPlaceholder``) so BOTH the chrome
-    /// lane's `TranscriptChromeGlowTests` and the render-conformance suite
-    /// (`RenderConformanceTests`, which replays recorded relay frames through
-    /// the real render lane) pin this rule directly. The instance property
-    /// delegates here.
+    /// Pure render-gate seam used by the chrome tests.
     static func shouldShowInlineTurnActivity(
         isStreaming: Bool,
-        hasPendingGate: Bool,
-        isRelayTransport: Bool,
-        lastMessage: ChatMessage? = nil
+        hasPendingGate: Bool
     ) -> Bool {
-        guard isStreaming, !hasPendingGate else { return false }
-        // QA-2 R4/A2 — the Working pill is IMPOSSIBLE on the relay path (state
-        // DELETED, not hidden). The send now appends an optimistic empty
-        // streaming assistant bubble (ChatStore's relay branch), so the
-        // breathing caret IS the working signal from the instant of send —
-        // the pre-first-item window the QA-1 B8 clause still showed the pill
-        // for no longer exists, and that clause (the last state that could
-        // flash the pill on relay) is gone. `lastMessage` is vestigial on the
-        // relay path (kept in the signature for the direct-path callers and
-        // the render gate's call sites). Direct transport below is
-        // byte-identical to the approved behavior.
-        if isRelayTransport { return false }
-        return true
+        isStreaming && !hasPendingGate
     }
 
     private var shouldShowInlineTurnActivity: Bool {
@@ -255,9 +219,7 @@ struct ChatView: View {
             isStreaming: chatStore.isStreaming,
             hasPendingGate: chatStore.pendingApproval != nil
                 || chatStore.pendingClarification != nil
-                || chatStore.pendingSecurePrompt != nil,
-            isRelayTransport: connectionStore.transportPath == .relay,
-            lastMessage: chatStore.messages.last
+                || chatStore.pendingSecurePrompt != nil
         )
     }
 
@@ -2479,13 +2441,6 @@ struct ChatView: View {
 
     private var isConnected: Bool {
         guard case .connected = connectionStore.phase else { return false }
-        // Wave-2 relay transport: the relay coordinator owns the session and
-        // drives the turn over the relay socket — it does NOT stamp the gateway
-        // `activeRuntimeId` the direct path uses. Gating the composer on that id
-        // would leave it permanently disabled in relay mode. The relay socket
-        // being open (already reflected in `phase == .connected` via the phase
-        // bridge) is the correct readiness signal here.
-        if connectionStore.transportPath == .relay { return true }
         // A fresh draft (chat-as-home) has no runtime yet — `ChatStore.send`
         // creates the gateway session lazily on the first prompt — so the
         // composer must be enabled the moment the gateway is connected.

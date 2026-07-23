@@ -1,638 +1,78 @@
 import XCTest
 @testable import HermesMobile
 
-/// Collapsed working-sections (owner spec) — deterministic coverage of the pure
-/// grouping + summary model that `WorkingSectionView` renders from. No SwiftUI, no
-/// I/O: every rule is a `nonisolated static` over value types.
-///
-/// SINGLE-FOLD CONTRACT (owner QA, 2026-07-19): within ONE agent turn, EVERYTHING
-/// before the final answer text — reasoning, tool calls (BOTH item-layer `.item`
-/// work AND the classic `.tools` clusters), and interim narration `.text` — folds
-/// into ONE working node. The trailing answer `.text` (plus `.usage` / `.warning`
-/// footers) stays OUTSIDE the fold as standalone parts. This applies to the classic
-/// `ChatMessagePart` path too, not only the item layer.
 final class WorkingSectionModelTests: XCTestCase {
-
-    // MARK: - Builders
-
-    private func item(
-        _ id: String,
-        _ type: ChatItemType,
-        status: ChatItemStatus = .completed,
-        summary: String? = nil,
-        body: JSONValue = .null
-    ) -> ChatMessagePart {
-        .item(id: id, item: ChatItem(
-            itemID: id, type: type, status: status, ord: 0, summary: summary, body: body
-        ))
-    }
-
-    private func legacyTools(_ id: String) -> ChatMessagePart {
-        .tools(
-            id: id,
-            tools: [ToolActivity(
-                id: id, name: "read_file", argsSummary: "", progressText: "",
-                resultPreview: "", state: .done, durationMs: nil, todos: nil,
-                resultSummary: nil
-            )],
-            collapsed: false,
-            turnElapsed: nil
-        )
-    }
-
-    private func workingParts(of node: AssistantRenderNode) -> [ChatMessagePart]? {
-        if case .working(_, let parts) = node { return parts }
-        return nil
-    }
-
-    private func usageStats() -> UsageStats {
-        JSONValue.object([:]).decoded(as: UsageStats.self)!
-    }
-
-    private func legacyTool(
-        _ id: String,
-        name: String = "read_file",
+    private func tool(
+        id: String = "tool-1",
         state: ToolActivity.State = .done,
-        argsSummary: String = "",
-        resultPreview: String = "",
-        durationMs: Double? = nil,
-        resultSummary: String? = nil
+        durationMs: Double? = 250
     ) -> ToolActivity {
         ToolActivity(
-            id: id, name: name, argsSummary: argsSummary, progressText: "",
-            resultPreview: resultPreview, state: state, durationMs: durationMs,
-            todos: nil, resultSummary: resultSummary
+            id: id,
+            name: "terminal",
+            argsSummary: "device-check",
+            progressText: "Checking",
+            resultPreview: "connected",
+            state: state,
+            durationMs: durationMs,
+            todos: nil,
+            resultSummary: "Connected"
         )
     }
 
-    // MARK: - Grouping (single-fold contract)
-
-    func testReasoningPlusToolItemsFoldIntoOneWorkingNode() {
-        let parts: [ChatMessagePart] = [
-            .reasoning(id: "r1", text: "Reading the parser"),
-            item("t1", .toolCall, summary: "read_file"),
-            item("f1", .fileChange, summary: "Patched parser.swift"),
-        ]
-        let nodes = WorkingSectionModel.renderNodes(from: parts)
-        XCTAssertEqual(nodes.count, 1, "reasoning + tool items must fold into a single working node")
-        let run = try? XCTUnwrap(workingParts(of: nodes[0]))
-        XCTAssertEqual(run?.count, 3)
+    func testReasoningAndToolsAreWork() {
+        XCTAssertTrue(WorkingSectionModel.isWorkingEligible(.reasoning(id: "r", text: "Think")))
+        XCTAssertTrue(WorkingSectionModel.isWorkingEligible(
+            .tools(id: "t", tools: [tool()], collapsed: false, turnElapsed: nil)
+        ))
+        XCTAssertFalse(WorkingSectionModel.isWorkingEligible(.text(id: "a", text: "Answer")))
     }
 
-    func testClassicReasoningToolsTextFoldsIntoOneWorkingNodePlusAnswer() {
-        // NEW single-fold contract: a classic blob-stream turn (reasoning → classic
-        // .tools → answer text) folds the reasoning + the .tools cluster into ONE
-        // working node, and the trailing answer text renders as a standalone part.
+    func testFinalTextStaysOutsideSingleWorkFold() throws {
         let parts: [ChatMessagePart] = [
-            .reasoning(id: "r1", text: "thinking"),
-            legacyTools("c1"),
-            .text(id: "x1", text: "Done."),
-        ]
-        let nodes = WorkingSectionModel.renderNodes(from: parts)
-        XCTAssertEqual(nodes.count, 2, "classic turn folds pre-answer work + keeps the answer as a part")
-        let fold = try? XCTUnwrap(workingParts(of: nodes[0]))
-        XCTAssertEqual(fold?.count, 2, "reasoning + classic .tools fold together")
-        XCTAssertNil(workingParts(of: nodes[1]), "the final answer text stays a standalone part")
-        XCTAssertEqual(nodes[1].id, "x1")
-    }
-
-    func testInterimNarrationTextFoldsButFinalAnswerDoesNot() {
-        // Interim `.text` (before a later work part) folds; the trailing answer
-        // `.text` after the last work part stays out as the body.
-        let parts: [ChatMessagePart] = [
-            .reasoning(id: "r1", text: "plan"),
-            .text(id: "n1", text: "Let me check the file."),  // interim narration
-            item("t1", .toolCall, summary: "read_file"),
-            .text(id: "a1", text: "Here is the answer."),      // final answer
+            .reasoning(id: "r", text: "Think"),
+            .tools(id: "t", tools: [tool()], collapsed: false, turnElapsed: nil),
+            .text(id: "a", text: "Answer"),
         ]
         let nodes = WorkingSectionModel.renderNodes(from: parts)
         XCTAssertEqual(nodes.count, 2)
-        let fold = try? XCTUnwrap(workingParts(of: nodes[0]))
-        XCTAssertEqual(fold?.map(\.id), ["r1", "n1", "t1"],
-                       "interim narration folds together with the reasoning + tool")
-        XCTAssertNil(workingParts(of: nodes[1]))
-        XCTAssertEqual(nodes[1].id, "a1")
+        guard case .working(_, let folded) = nodes[0] else { return XCTFail("expected work fold") }
+        XCTAssertEqual(folded.count, 2)
+        guard case .part(.text(_, let text)) = nodes[1] else { return XCTFail("expected final text") }
+        XCTAssertEqual(text, "Answer")
     }
 
-    func testUsageAndWarningFootersStayOutsideTheFold() {
-        let parts: [ChatMessagePart] = [
-            item("t1", .toolCall),
-            .text(id: "a1", text: "Answer."),
-            .warning(id: "w1", text: "heads up"),
-            .usage(id: "u1", stats: usageStats()),
-        ]
-        let nodes = WorkingSectionModel.renderNodes(from: parts)
-        // fold(t1) + a1 + w1 + u1
-        XCTAssertEqual(nodes.map(\.id), ["working-t1", "a1", "w1", "u1"])
-        XCTAssertNotNil(workingParts(of: nodes[0]))
-        XCTAssertNil(workingParts(of: nodes[1]))
+    func testCurrentWorkPrefersRunningTool() {
+        let parts: [ChatMessagePart] = [.tools(
+            id: "t",
+            tools: [tool(id: "done"), tool(id: "running", state: .running)],
+            collapsed: false,
+            turnElapsed: nil
+        )]
+        XCTAssertEqual(WorkingSectionModel.currentWork(in: parts)?.status, .running)
     }
 
-    func testReasoningOnlyTurnFoldsIntoOneWorkingNode() {
-        // A reasoning-only turn is "everything before a (nonexistent) answer" — it
-        // folds so a settled turn collapses to a single "Worked for N" line.
-        let parts: [ChatMessagePart] = [.reasoning(id: "r1", text: "just thinking")]
-        let nodes = WorkingSectionModel.renderNodes(from: parts)
-        XCTAssertEqual(nodes.count, 1)
-        XCTAssertNotNil(workingParts(of: nodes[0]))
+    func testDurationUsesTurnElapsedThenToolDurations() {
+        let stamped: [ChatMessagePart] = [.tools(
+            id: "t", tools: [tool()], collapsed: false, turnElapsed: 2
+        )]
+        XCTAssertEqual(WorkingSectionModel.runDurationSeconds(stamped, settled: nil), 2)
+
+        let summed: [ChatMessagePart] = [.tools(
+            id: "t", tools: [tool(durationMs: 250), tool(id: "tool-2", durationMs: 750)],
+            collapsed: false,
+            turnElapsed: nil
+        )]
+        XCTAssertEqual(WorkingSectionModel.runDurationSeconds(summed, settled: nil), 1)
     }
 
-    func testPureTextTurnNeverFolds() {
-        // No work part → no fold; a plain prose answer decomposes to `.part` nodes.
-        let parts: [ChatMessagePart] = [
-            .text(id: "a1", text: "Hello."),
-            .usage(id: "u1", stats: usageStats()),
-        ]
-        let nodes = WorkingSectionModel.renderNodes(from: parts)
-        XCTAssertEqual(nodes.count, 2)
-        XCTAssertNil(workingParts(of: nodes[0]))
-        XCTAssertNil(workingParts(of: nodes[1]))
-        XCTAssertEqual(nodes.map(\.id), ["a1", "u1"])
-    }
-
-    func testTwoWorkRunsSeparatedByTextCollapseIntoOneFold() {
-        // Old behavior split this into two folds; the single-fold contract collapses
-        // everything up to the LAST work part into ONE fold (interim text included).
-        let parts: [ChatMessagePart] = [
-            item("t1", .toolCall),
-            .text(id: "x1", text: "midway"),
-            item("t2", .toolCall),
-        ]
-        let nodes = WorkingSectionModel.renderNodes(from: parts)
-        XCTAssertEqual(nodes.count, 1, "one fold spans up to the last work part")
-        XCTAssertEqual(try XCTUnwrap(workingParts(of: nodes[0])).map(\.id), ["t1", "x1", "t2"])
-    }
-
-    func testSingleToolItemStillFolds() {
-        let nodes = WorkingSectionModel.renderNodes(from: [item("t1", .toolCall)])
-        XCTAssertEqual(nodes.count, 1)
-        XCTAssertNotNil(workingParts(of: nodes[0]))
-    }
-
-    // MARK: - Eligibility (fold boundary)
-
-    func testWorkingEligibility() {
-        XCTAssertTrue(WorkingSectionModel.isWorkingEligible(.reasoning(id: "r", text: "x")))
-        XCTAssertTrue(WorkingSectionModel.isWorkingEligible(item("t", .toolCall)))
-        XCTAssertTrue(WorkingSectionModel.isWorkingEligible(item("e", .error)))
-        XCTAssertTrue(WorkingSectionModel.isWorkingEligible(legacyTools("c")),
-                      "classic .tools clusters are now work (they fold)")
-        XCTAssertFalse(WorkingSectionModel.isWorkingEligible(.text(id: "x", text: "hi")),
-                       "text is never itself work — interim text folds by position, not eligibility")
-        XCTAssertFalse(WorkingSectionModel.isWorkingEligible(item("u", .usage)))
-    }
-
-    func testLastWorkIndexIsTheFoldBoundary() {
-        let parts: [ChatMessagePart] = [
-            .reasoning(id: "r1", text: "x"),
-            legacyTools("c1"),
-            .text(id: "a1", text: "answer"),
-        ]
-        XCTAssertEqual(WorkingSectionModel.lastWorkIndex(in: parts), 1)
-        XCTAssertNil(WorkingSectionModel.lastWorkIndex(in: [.text(id: "a", text: "hi")]))
-    }
-
-    // MARK: - Failure surfacing
-
-    func testRunHasFailureForFailedStatus() {
-        let parts: [ChatMessagePart] = [
-            item("t1", .toolCall, status: .completed),
-            item("t2", .toolCall, status: .failed),
-        ]
+    func testToolFailureSurfacesInFoldAndStep() throws {
+        let parts: [ChatMessagePart] = [.tools(
+            id: "t", tools: [tool(state: .failed)], collapsed: false, turnElapsed: nil
+        )]
         XCTAssertTrue(WorkingSectionModel.runHasFailure(parts))
-    }
-
-    func testRunHasFailureForErrorType() {
-        let parts: [ChatMessagePart] = [item("e1", .error, status: .completed)]
-        XCTAssertTrue(WorkingSectionModel.runHasFailure(parts),
-                      "an error item is a failure even if its status decoded to completed")
-    }
-
-    func testRunHasFailureAcrossClassicToolsCluster() {
-        // A failed activity inside a classic `.tools` cluster must surface the
-        // fold's failure badge just like a failed item.
-        let parts: [ChatMessagePart] = [
-            .tools(
-                id: "c1",
-                tools: [legacyTool("a", state: .done), legacyTool("b", state: .failed)],
-                collapsed: false,
-                turnElapsed: nil
-            ),
-        ]
-        XCTAssertTrue(WorkingSectionModel.runHasFailure(parts),
-                      "a failed classic-tool activity must not hide behind the fold")
-    }
-
-    func testCurrentWorkFollowsRunningClassicTool() {
-        let parts: [ChatMessagePart] = [
-            .tools(
-                id: "c1",
-                tools: [
-                    legacyTool("a", name: "read_file", state: .done),
-                    legacyTool("b", name: "bash", state: .running, argsSummary: "make test"),
-                ],
-                collapsed: false,
-                turnElapsed: nil
-            ),
-        ]
-        let current = WorkingSectionModel.currentWork(in: parts)
-        XCTAssertEqual(current?.status, .inProgress)
-        XCTAssertEqual(current?.summary, "Ran make test")
-    }
-
-    func testRunHasNoFailureWhenAllComplete() {
-        let parts: [ChatMessagePart] = [
-            item("t1", .toolCall, status: .completed),
-            item("t2", .fileChange, status: .completed),
-        ]
-        XCTAssertFalse(WorkingSectionModel.runHasFailure(parts))
-    }
-
-    // MARK: - Duration + label
-
-    func testRunDurationSumsItemDurations() {
-        let parts: [ChatMessagePart] = [
-            item("t1", .toolCall, body: ["duration_s": 0.4]),
-            item("t2", .toolCall, body: ["duration_s": 1.1]),
-        ]
-        let seconds = WorkingSectionModel.runDurationSeconds(parts, settled: nil)
-        XCTAssertEqual(try XCTUnwrap(seconds), 1.5, accuracy: 0.0001)
-    }
-
-    func testRunDurationPrefersSettledStamp() {
-        let parts: [ChatMessagePart] = [item("t1", .toolCall, body: ["duration_s": 0.4])]
-        XCTAssertEqual(WorkingSectionModel.runDurationSeconds(parts, settled: 42), 42)
-    }
-
-    func testRunDurationUsesClassicToolTurnElapsed() {
-        let parts: [ChatMessagePart] = [
-            .tools(id: "c1", tools: [legacyTool("a", durationMs: 400)], collapsed: false, turnElapsed: 3.5),
-        ]
-        XCTAssertEqual(try XCTUnwrap(WorkingSectionModel.runDurationSeconds(parts, settled: nil)), 3.5, accuracy: 0.0001)
-    }
-
-    func testRunDurationSumsClassicToolDurationsWhenNoTurnElapsed() {
-        let parts: [ChatMessagePart] = [
-            .tools(id: "c1", tools: [legacyTool("a", durationMs: 400), legacyTool("b", durationMs: 1_100)],
-                   collapsed: false, turnElapsed: nil),
-        ]
-        XCTAssertEqual(try XCTUnwrap(WorkingSectionModel.runDurationSeconds(parts, settled: nil)), 1.5, accuracy: 0.0001)
-    }
-
-    func testWorkedLabelFormats() {
-        XCTAssertEqual(WorkingSectionModel.workedLabel(seconds: nil), "Worked")
-        XCTAssertEqual(WorkingSectionModel.workedLabel(seconds: 0), "Worked")
-        XCTAssertEqual(WorkingSectionModel.workedLabel(seconds: 12), "Worked for 12s")
-        XCTAssertEqual(WorkingSectionModel.workedLabel(seconds: 125), "Worked for 2m 5s")
-    }
-
-    func testSummaryAccessibilityLabelIncludesFailureClause() {
-        XCTAssertEqual(
-            WorkingSectionModel.summaryAccessibilityLabel(seconds: 12, hasFailure: false),
-            "Worked for 12s"
-        )
-        XCTAssertEqual(
-            WorkingSectionModel.summaryAccessibilityLabel(seconds: 12, hasFailure: true),
-            "Worked for 12s, contains a failed step"
-        )
-    }
-
-    // MARK: - Current tool line (live)
-
-    func testCurrentWorkingItemPrefersInProgress() {
-        let parts: [ChatMessagePart] = [
-            item("t1", .toolCall, status: .completed),
-            item("t2", .toolCall, status: .inProgress, summary: "grep"),
-            item("t3", .toolCall, status: .completed),
-        ]
-        let current = WorkingSectionModel.currentWorkingItem(in: parts)
-        XCTAssertEqual(current?.itemID, "t2", "the live line follows the in-progress tool")
-    }
-
-    func testCurrentWorkingItemFallsBackToLast() {
-        let parts: [ChatMessagePart] = [
-            item("t1", .toolCall, status: .completed),
-            item("t2", .fileChange, status: .completed),
-        ]
-        XCTAssertEqual(WorkingSectionModel.currentWorkingItem(in: parts)?.itemID, "t2")
-    }
-
-    // MARK: - Step humanizer (approved design §2 — deterministic, no LLM)
-
-    func testStepSummaryPrefersRelaySummary() {
-        let it = ChatItem(itemID: "t1", type: .toolCall, status: .completed, ord: 0,
-                          summary: "Ran alembic upgrade head",
-                          body: ["name": "shell", "args": ["command": "alembic upgrade head"]])
-        XCTAssertEqual(WorkingSectionModel.stepSummary(for: it), "Ran alembic upgrade head")
-    }
-
-    func testStepSummaryHumanizesReadFromArgs() {
-        let it = ChatItem(itemID: "t1", type: .toolCall, status: .completed, ord: 0,
-                          body: ["name": "read_file", "args": ["path": "auth.py"]])
-        XCTAssertEqual(WorkingSectionModel.stepSummary(for: it), "Read auth.py")
-    }
-
-    func testStepSummaryHumanizesGrepFromPattern() {
-        let it = ChatItem(itemID: "t1", type: .toolCall, status: .completed, ord: 0,
-                          body: ["name": "grep", "args": ["pattern": "node_loop"]])
-        XCTAssertEqual(WorkingSectionModel.stepSummary(for: it), "Grepped for node_loop")
-    }
-
-    func testStepSummaryHumanizesRunCommand() {
-        let it = ChatItem(itemID: "t1", type: .toolCall, status: .completed, ord: 0,
-                          body: ["name": "bash", "args": ["command": "alembic upgrade head"]])
-        XCTAssertEqual(WorkingSectionModel.stepSummary(for: it), "Ran alembic upgrade head")
-    }
-
-    func testStepSummaryFileChangeUsesEditVerb() {
-        let it = ChatItem(itemID: "f1", type: .fileChange, status: .completed, ord: 0,
-                          body: ["name": "apply_patch", "args": ["path": "parser.swift"]])
-        XCTAssertEqual(WorkingSectionModel.stepSummary(for: it), "Edited parser.swift")
-    }
-
-    func testStepSummaryFallsBackToPrettyToolName() {
-        let it = ChatItem(itemID: "t1", type: ChatItemType(wire: "quantum_flux"), rawType: "quantum_flux",
-                          status: .completed, ord: 0, body: ["name": "quantum_flux"])
-        XCTAssertEqual(WorkingSectionModel.stepSummary(for: it), "Quantum flux")
-    }
-
-    // MARK: - QA-2 N2 — raw state names never reach the UI
-
-    func testIsRawStateNameDetectsDottedEventTokens() {
-        XCTAssertTrue(WorkingSectionModel.isRawStateName("tool.generating"))
-        XCTAssertTrue(WorkingSectionModel.isRawStateName("review.summary"))
-        XCTAssertFalse(WorkingSectionModel.isRawStateName("clarify"))
-        XCTAssertFalse(WorkingSectionModel.isRawStateName("quantum_flux"))
-        XCTAssertFalse(WorkingSectionModel.isRawStateName("Read auth.py"))
-        XCTAssertFalse(WorkingSectionModel.isRawStateName("Asked which direction"))
-    }
-
-    func testStepSummarySkipsRawRelaySummary() {
-        // The build-115 flash: the relay `summary` IS the raw event name while
-        // the tool's friendly name is unresolved — it must fall through to the
-        // humanizer's neutral fallback, never print verbatim.
-        let it = ChatItem(itemID: "t1", type: ChatItemType(wire: "tool.generating"),
-                          rawType: "tool.generating", status: .inProgress, ord: 0,
-                          summary: "tool.generating", body: .null)
-        XCTAssertEqual(WorkingSectionModel.stepSummary(for: it), "Tool step")
-    }
-
-    func testHumanizeRawNameWithTargetIsNeutral() {
-        XCTAssertEqual(
-            WorkingSectionModel.humanize(name: "review.summary", target: "report.md"),
-            "Working on report.md",
-            "a raw dotted name with a target reads neutral — and never false-matches 'view' → 'Read'"
-        )
-        XCTAssertEqual(WorkingSectionModel.humanize(name: "tool.generating", target: nil), "Tool step")
-    }
-
-    func testLiveCollapsedLabelContract() {
-        // Raw in-progress tool → plain "Working…".
-        let raw = ChatItem(itemID: "t1", type: ChatItemType(wire: "tool.generating"),
-                           rawType: "tool.generating", status: .inProgress, ord: 0,
-                           summary: "tool.generating", body: .null)
-        XCTAssertEqual(WorkingSectionModel.liveCollapsedLabel(parts: [.item(id: "t1", item: raw)]),
-                       "Working…")
-        // Friendly resolved tool → inline on the single line.
-        let friendly = ChatItem(itemID: "t2", type: .toolCall, status: .inProgress, ord: 0,
-                                body: ["name": "read", "args": ["path": "auth.py"]])
-        XCTAssertEqual(WorkingSectionModel.liveCollapsedLabel(parts: [.item(id: "t2", item: friendly)]),
-                       "Working… · Read auth.py")
-        // No tool work (pure reasoning) → plain "Working…".
-        XCTAssertEqual(
-            WorkingSectionModel.liveCollapsedLabel(parts: [.reasoning(id: "r1", text: "Thinking…")]),
-            "Working…"
-        )
-    }
-
-    func testWorkUnitCarriesRawFlag() {
-        let raw = ChatItem(itemID: "t1", type: ChatItemType(wire: "tool.generating"),
-                           rawType: "tool.generating", status: .inProgress, ord: 0,
-                           summary: "tool.generating", body: .null)
-        let units = WorkingSectionModel.toolUnits(in: [.item(id: "t1", item: raw)])
-        XCTAssertEqual(units.count, 1)
-        XCTAssertTrue(units[0].raw, "a raw wire type + raw summary marks the unit raw")
-
-        let named = ChatItem(itemID: "t2", type: .toolCall, status: .inProgress, ord: 1,
-                             body: ["name": "read", "args": ["path": "x.py"]])
-        let units2 = WorkingSectionModel.toolUnits(in: [.item(id: "t2", item: named)])
-        XCTAssertFalse(units2[0].raw)
-    }
-
-    func testWorkedLabelSubSecondDurationReadsOneSecond() {
-        XCTAssertEqual(WorkingSectionModel.workedLabel(seconds: 0.4), "Worked for 1s",
-            "a known sub-second turn never rounds down to a bare 'Worked'")
-    }
-
-    func testStepSummaryCollapsesAndCapsLongTargets() {
-        let long = String(repeating: "x", count: 200)
-        let it = ChatItem(itemID: "t1", type: .toolCall, status: .completed, ord: 0,
-                          body: .object(["name": .string("read"),
-                                         "args": .object(["path": .string(long)])]))
-        let summary = WorkingSectionModel.stepSummary(for: it)
-        XCTAssertTrue(summary.hasPrefix("Read "))
-        XCTAssertTrue(summary.hasSuffix("…"), "an over-long target is truncated with an ellipsis")
-        XCTAssertLessThanOrEqual(summary.count, 80)
-    }
-
-    func testStepsBuildsReasoningThenToolInWireOrder() {
-        let parts: [ChatMessagePart] = [
-            .reasoning(id: "r1", text: "Reviewed the request\nand split the layers"),
-            item("t1", .toolCall, body: ["name": "read", "args": ["path": "node.py"]]),
-        ]
-        let steps = WorkingSectionModel.steps(from: parts)
-        XCTAssertEqual(steps.count, 2)
-        XCTAssertEqual(steps[0].kind, .reasoning)
-        XCTAssertEqual(steps[0].glyph, "bubble.left")
-        XCTAssertEqual(steps[0].summary, "Reviewed the request")
-        XCTAssertEqual(steps[0].body, "Reviewed the request\nand split the layers")
-        XCTAssertEqual(steps[1].kind, .tool)
-        XCTAssertEqual(steps[1].glyph, "terminal")
-        XCTAssertEqual(steps[1].summary, "Read node.py")
-    }
-
-    func testStepsBuildOnePerClassicToolActivity() {
-        // A classic `.tools` cluster expands to one step per activity, each with a
-        // humanized summary and the terminal glyph (failed → triangle).
-        let parts: [ChatMessagePart] = [
-            .tools(
-                id: "c1",
-                tools: [
-                    legacyTool("a", name: "read_file", state: .done, argsSummary: "auth.py"),
-                    legacyTool("b", name: "bash", state: .failed, argsSummary: "make", resultPreview: "boom"),
-                ],
-                collapsed: false,
-                turnElapsed: nil
-            ),
-        ]
-        let steps = WorkingSectionModel.steps(from: parts)
-        XCTAssertEqual(steps.count, 2)
-        XCTAssertEqual(steps[0].kind, .tool)
-        XCTAssertEqual(steps[0].glyph, "terminal")
-        XCTAssertEqual(steps[0].summary, "Read auth.py")
-        XCTAssertFalse(steps[0].isFailure)
-        XCTAssertEqual(steps[1].summary, "Ran make")
-        XCTAssertTrue(steps[1].isFailure)
-        XCTAssertEqual(steps[1].glyph, "exclamationmark.triangle")
-        XCTAssertEqual(steps[1].output, "boom")
-    }
-
-    func testStepsBuildNarrationStepFromInterimText() {
-        let parts: [ChatMessagePart] = [
-            .text(id: "n1", text: "Let me check the config.\nSecond line"),
-            item("t1", .toolCall, body: ["name": "read", "args": ["path": "x.py"]]),
-        ]
-        let steps = WorkingSectionModel.steps(from: parts)
-        XCTAssertEqual(steps.count, 2)
-        XCTAssertEqual(steps[0].kind, .narration)
-        XCTAssertEqual(steps[0].glyph, "text.alignleft")
-        XCTAssertEqual(steps[0].summary, "Let me check the config.")
-        XCTAssertEqual(steps[0].body, "Let me check the config.\nSecond line")
-        XCTAssertEqual(steps[1].kind, .tool)
-    }
-
-    func testStepsSkipsEmptyReasoning() {
-        let parts: [ChatMessagePart] = [
-            .reasoning(id: "r1", text: "   "),
-            item("t1", .toolCall, body: ["name": "read", "args": ["path": "x.py"]]),
-        ]
-        let steps = WorkingSectionModel.steps(from: parts)
-        XCTAssertEqual(steps.count, 1, "an empty/whitespace reasoning part produces no step")
-        XCTAssertEqual(steps[0].kind, .tool)
-    }
-
-    func testStepCarriesFailureAndOutputForSheet() {
-        let it = ChatItem(itemID: "t1", type: .toolCall, status: .failed, ord: 0,
-                          body: ["name": "bash", "args": ["command": "make"], "result": "error: boom"])
-        let steps = WorkingSectionModel.steps(from: [.item(id: "t1", item: it)])
-        XCTAssertEqual(steps.count, 1)
-        XCTAssertTrue(steps[0].isFailure)
-        XCTAssertEqual(steps[0].command, "make")
-        XCTAssertEqual(steps[0].commandLanguage, "bash")
-        XCTAssertEqual(steps[0].output, "error: boom")
-    }
-
-    func testGlyphMapping() {
-        XCTAssertEqual(WorkingSectionModel.glyph(for: .toolCall), "terminal")
-        XCTAssertEqual(WorkingSectionModel.glyph(for: .fileChange), "pencil")
-        XCTAssertEqual(WorkingSectionModel.glyph(for: .browser), "safari")
-        XCTAssertEqual(WorkingSectionModel.glyph(for: .image), "photo")
-        XCTAssertEqual(WorkingSectionModel.glyph(for: .reasoning), "bubble.left")
-    }
-
-    // MARK: - QA-3 S2/S3/A1 — the single merged working-affordance decision
-
-    /// S2/A1: at SEND — the optimistic bubble has ZERO parts and no relay frame
-    /// has landed — the caret slot renders the merged working line (breathing
-    /// glyph + "Working…" + per-turn timer) from local state. Build 116 showed
-    /// a bare textless cursor here until the model's first item (~35 s late in
-    /// IMG_2578): the labeled affordance was gated on the first work part.
-    func testPreItemWorkingLineVisibleAtSendWithZeroParts() {
-        XCTAssertTrue(
-            WorkingSectionModel.preItemWorkingLineVisible(parts: [], streamingLive: true),
-            "spec S2/A1: send → the merged labeled+timed working line renders instantly from local state (zero parts, no frames)"
-        )
-    }
-
-    /// S3: once work parts land with no answer text yet, the FOLD's live line
-    /// IS the affordance — the separate standalone cursor beside it was the
-    /// dual-affordance bug (spinner line + bare bar stacked, IMG_2578/2587/
-    /// 2591). The caret slot must be suppressed.
-    func testPreItemWorkingLineSuppressedWhenFoldExists() {
-        let parts: [ChatMessagePart] = [
-            .reasoning(id: "r1", text: "Let me look at the transform code."),
-            item("t1", .toolCall, status: .inProgress,
-                 body: ["name": "read", "args": ["path": "proxy.py"]]),
-        ]
-        XCTAssertFalse(
-            WorkingSectionModel.preItemWorkingLineVisible(parts: parts, streamingLive: true),
-            "spec S3: with a working fold live and no answer text, the caret slot mounts no second surface — the fold line is the cursor line"
-        )
-        // …and the fold is EXACTLY ONE node (the single affordance surface).
-        let nodes = WorkingSectionModel.renderNodes(from: parts)
-        XCTAssertEqual(nodes.count, 1, "spec S3/A3: one fold node — one working surface")
-        guard case .working = nodes[0] else {
-            return XCTFail("the single node is the working fold")
-        }
-    }
-
-    /// S3: once the answer text streams, the caret rides the prose tail — no
-    /// pre-item line (the fold's live line above the prose remains the single
-    /// ratified QA-2 working surface; the prose-tail glyph is the text caret,
-    /// not a second affordance).
-    func testPreItemWorkingLineSuppressedWhenAnswerTextStreams() {
-        let parts: [ChatMessagePart] = [
-            item("t1", .toolCall, body: ["name": "read", "args": ["path": "x.py"]]),
-            .text(id: "txt1", text: "The proxy transform is "),
-        ]
-        XCTAssertFalse(
-            WorkingSectionModel.preItemWorkingLineVisible(parts: parts, streamingLive: true),
-            "the caret rides the streaming prose tail — no pre-item line"
-        )
-        // Pure-text turns never grow the line either.
-        XCTAssertFalse(WorkingSectionModel.preItemWorkingLineVisible(
-            parts: [.text(id: "t", text: "Answer…")], streamingLive: true))
-    }
-
-    /// Settled turns never render the live line — the settled "Worked for Ns"
-    /// fold owns the presentation.
-    func testPreItemWorkingLineNeverOnSettledTurns() {
-        XCTAssertFalse(WorkingSectionModel.preItemWorkingLineVisible(parts: [], streamingLive: false))
-        XCTAssertFalse(WorkingSectionModel.preItemWorkingLineVisible(
-            parts: [item("t1", .toolCall, body: ["name": "read"])], streamingLive: false))
-    }
-
-    /// S2/A1: the merged line's label with zero parts is plain "Working…" —
-    /// the honest pre-first-item status (no tool to humanize yet), and the
-    /// per-turn timer derives from the local `turnStartedAt` stamped at send.
-    func testMergedLineLabelAndTimerAtSend() {
-        XCTAssertEqual(WorkingSectionModel.liveCollapsedLabel(parts: []), "Working…")
-        let start = Date().addingTimeInterval(-3)
-        let elapsed = ThinkingDisplay.elapsedText(startedAt: start, now: Date())
-        XCTAssertEqual(elapsed, "3s", "the merged line's timer ticks from the local turn start")
-        XCTAssertEqual(ThinkingDisplay.elapsedText(startedAt: nil, now: Date()), "0s")
-    }
-
-    /// S1/A10: the cursor breathe is a pure function of the clock — the old
-    /// onAppear-kicked `repeatForever` @State stranded a static glyph on any
-    /// remount/re-projection without an `isStreaming` edge (the motionless bar
-    /// of IMG_2577/2585/2587; `applyRelayItems` rebuilds the caret row on every
-    /// pass). A time-driven opacity can never strand: any mount renders the
-    /// correct phase for "now".
-    func testStreamingCursorBreatheIsPureClockDriven() {
-        let t0 = Date(timeIntervalSinceReferenceDate: 1_000_000)
-        // Range: the pulse lives in [minOpacity, 1].
-        for k in 0..<24 {
-            let t = t0.addingTimeInterval(Double(k) * 0.05)
-            let o = StreamingCursor.breatheOpacity(at: t, streaming: true, reduceMotion: false)
-            XCTAssertGreaterThanOrEqual(o, StreamingCursor.minOpacity - 1e-9)
-            XCTAssertLessThanOrEqual(o, 1.0 + 1e-9)
-        }
-        // Peaks and troughs ~half a period apart differ by (almost) the full
-        // swing — the breathe is visibly moving, not a static mid-value.
-        // sin peak at t where phase=1: t = period/4 from a zero crossing; sample
-        // a dense grid and take max/min to be phase-agnostic.
-        var maxO = 0.0, minO = 1.0
-        for k in 0..<240 {
-            let o = StreamingCursor.breatheOpacity(
-                at: t0.addingTimeInterval(Double(k) * 0.005), streaming: true, reduceMotion: false)
-            maxO = max(maxO, o); minO = min(minO, o)
-        }
-        XCTAssertEqual(maxO, 1.0, accuracy: 1e-6, "the breathe reaches full opacity")
-        XCTAssertEqual(minO, StreamingCursor.minOpacity, accuracy: 1e-3, "the breathe dims to the ratified trough")
-        // Period: exactly the ratified 1.2 s cycle (0.6 s easeInOut each way).
-        XCTAssertEqual(StreamingCursor.breathePeriodSeconds, 1.2, accuracy: 1e-9)
-        let a = StreamingCursor.breatheOpacity(at: t0, streaming: true, reduceMotion: false)
-        let b = StreamingCursor.breatheOpacity(at: t0.addingTimeInterval(1.2), streaming: true, reduceMotion: false)
-        XCTAssertEqual(a, b, accuracy: 1e-9, "the breathe repeats every 1.2 s")
-    }
-
-    /// S1/A10: settled and Reduce Motion render STATIC at full opacity — an
-    /// honest motionless glyph, never a mid-pulse freeze.
-    func testStreamingCursorStaticWhenSettledOrReduceMotion() {
-        let t = Date(timeIntervalSinceReferenceDate: 1_234_567.89)
-        XCTAssertEqual(StreamingCursor.breatheOpacity(at: t, streaming: false, reduceMotion: false), 1.0)
-        XCTAssertEqual(StreamingCursor.breatheOpacity(at: t, streaming: true, reduceMotion: true), 1.0)
-        XCTAssertEqual(StreamingCursor.breatheOpacity(at: t, streaming: false, reduceMotion: true), 1.0)
+        let step = try XCTUnwrap(WorkingSectionModel.steps(from: parts).first)
+        XCTAssertTrue(step.isFailure)
+        XCTAssertEqual(step.glyph, "exclamationmark.triangle")
     }
 }

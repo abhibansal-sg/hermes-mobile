@@ -21,7 +21,7 @@ mkdir -p "$EVID/gwhome"
 source "$VENV/bin/activate"
 
 export HERMES_HOME="$EVID/gwhome"
-# Stable loopback token so the relay's GatewayClient can auth via ?token=.
+# Stable loopback token used by the transparent relay upstream.
 if [ ! -s "$EVID/.gwtoken" ]; then
   python -c "import secrets;print(secrets.token_hex(16))" > "$EVID/.gwtoken"
   chmod 600 "$EVID/.gwtoken"

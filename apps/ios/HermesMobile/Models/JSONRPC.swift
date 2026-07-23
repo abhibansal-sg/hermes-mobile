@@ -89,7 +89,7 @@ enum GatewayError: Error, LocalizedError, Sendable {
 
     var errorDescription: String? {
         switch self {
-        case .rpc(let code, let message): return "Gateway error \(code): \(message)"
+        case .rpc(_, let message): return RawErrorSanitizer.displayText(message)
         case .notConnected: return "Not connected to the Hermes gateway"
         case .timeout(let method): return "Request timed out: \(method)"
         case .decoding(let method, let underlying):

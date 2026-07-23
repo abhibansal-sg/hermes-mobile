@@ -25,24 +25,13 @@ enum ChatMessagePart: Identifiable, Sendable, Equatable {
     case text(id: String, text: String)
     case warning(id: String, text: String)
     case usage(id: String, stats: UsageStats)
-    /// Wave-2 item-backed part (docs/RELAY-PHONE-PROTOCOL.md §2). Carries a
-    /// relay `ChatItem` for the NEW special-render kinds — generic `toolCall`,
-    /// `fileChange`, `image`, `browser`, `error` — that the render lane draws via
-    /// `ChatItemView`. ADDITIVE: the five legacy cases above are unchanged and
-    /// remain the compat layer for the live blob stream; text-shaped items
-    /// (`agentMessage`/`reasoning`/`usage`) still project onto those legacy
-    /// cases (see `ChatItem.renderPart`). Only the relay/mock item path emits
-    /// `.item` today.
-    case item(id: String, item: ChatItem)
-
     var id: String {
         switch self {
         case .reasoning(let id, _),
              .tools(let id, _, _, _),
              .text(let id, _),
              .warning(let id, _),
-             .usage(let id, _),
-             .item(let id, _):
+             .usage(let id, _):
             return id
         }
     }
@@ -92,17 +81,6 @@ struct ChatMessage: Identifiable, Sendable, Equatable {
     /// streaming never reassigns it.
     var timestamp: Date
     var presentation: Presentation
-    /// Wave-2 relay projection marker (QA-1 transcript family B5/B6/B7/B13).
-    /// `true` ONLY on rows synthesized by `ChatStore.applyRelayItems` — the
-    /// relay's reconciled item projection. The relay projection MERGES with the
-    /// painted transcript: UNTAGGED rows (the GRDB cache seed, optimistic user
-    /// echoes, direct-path rows) are the settled history the live relay turn
-    /// appends below, so history + live turn COEXIST instead of the projection
-    /// replacing the transcript. A re-projection replaces only tagged rows, so
-    /// streaming never duplicates nor wipes the scrollback, and an empty-store
-    /// projection (session open, zero frames) leaves the cache paint intact.
-    var relayProjected: Bool
-
     /// Seed convenience init: materializes scalar seed content into deterministic
     /// `parts` (reasoning → tools → text → warning → usage), the same fixed
     /// within-row order the desktop seed normalizer uses. This keeps existing
@@ -125,8 +103,7 @@ struct ChatMessage: Identifiable, Sendable, Equatable {
         usage: UsageStats? = nil,
         warning: String? = nil,
         timestamp: Date = Date(),
-        presentation: Presentation = .normal,
-        relayProjected: Bool = false
+        presentation: Presentation = .normal
     ) {
         self.id = id
         self.role = role
@@ -136,7 +113,6 @@ struct ChatMessage: Identifiable, Sendable, Equatable {
         self.reasoningElapsed = reasoningElapsed
         self.timestamp = timestamp
         self.presentation = presentation
-        self.relayProjected = relayProjected
 
         if !parts.isEmpty {
             // Caller supplied an already-ordered part list (e.g. the future seed

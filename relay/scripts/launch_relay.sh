@@ -6,9 +6,8 @@
 #   gateway  ws://127.0.0.1:9127/api/ws?token=   (upstream, stock, isolated)
 #   relay    ws://127.0.0.1:8788                 (downstream, phone-facing)
 #
-# The iOS app (flag ON) connects to the DOWNSTREAM port; the relay dials the
-# gateway UP, reframes raw events into the ratified item envelope
-# (docs/RELAY-PHONE-PROTOCOL.md), and serves seq/ack/replay frames to the phone.
+# The iOS app connects to the DOWNSTREAM port; the relay authenticates and
+# forwards the gateway's stock WS/HTTP protocol byte-for-byte.
 #
 # Env consumed by hermes_relay.__main__:
 #   HERMES_RELAY_GATEWAY_TOKEN     (required) — the loopback ?token=

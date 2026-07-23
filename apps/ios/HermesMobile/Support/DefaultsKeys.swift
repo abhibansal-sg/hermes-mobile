@@ -21,6 +21,17 @@ enum DefaultsKeys {
     /// reconnect work while preserving the pairing and every local cache.
     static let connectionOffline = "hermes.connectionOffline"
 
+    /// `String` — optional address of the transparent gateway proxy. Empty or
+    /// absent uses the paired gateway address directly.
+    static let relayURLOverride = "hermes.relayURLOverride"
+
+    static func relayURLOverrideValue(_ defaults: UserDefaults = .standard) -> String? {
+        let raw = defaults.string(forKey: relayURLOverride)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let raw, !raw.isEmpty else { return nil }
+        return raw
+    }
+
     /// `Data` — protected, non-content cleanup retry metadata. This contains
     /// only the gateway URL and device id; never a credential or user content.
     static let gatewayCleanupTombstone = "hermes.gatewayCleanupTombstone"

@@ -269,40 +269,6 @@ final class AttachmentStore {
         guard !trimmedSession.isEmpty else {
             throw AttachmentError.notConfigured
         }
-        // Relay transport (B9 / A5): the gateway-direct WS is IDLE in relay
-        // mode, so `file.attach` over `connection.client` would throw "Not
-        // connected to the Hermes gateway". The identical base64 payload rides
-        // the relay's `attach` RPC instead — the relay drives the gateway's
-        // `file.attach` (§5), so the flow + result shape are byte-identical to
-        // the direct path below. No REST round-trip on either transport here.
-        if connection.transportPath == .relay,
-           let coordinator = connection.relayCoordinator {
-            let dataURL = await Task.detached(priority: .userInitiated) {
-                Self.fileDataURL(data, mimeType: mime)
-            }.value
-            let result: JSONValue
-            do {
-                result = try await coordinator.attach(
-                    sessionID: trimmedSession,
-                    kind: "file",
-                    name: filename,
-                    dataURL: dataURL
-                )
-            } catch {
-                let message = (error as? LocalizedError)?.errorDescription
-                    ?? error.localizedDescription
-                throw AttachmentError.failed(message)
-            }
-            guard let refText = result["ref_text"]?.stringValue, !refText.isEmpty else {
-                throw AttachmentError.failed("The gateway did not return a file reference.")
-            }
-            return FileAttachResult(
-                name: result["name"]?.stringValue ?? filename,
-                path: result["path"]?.stringValue ?? "",
-                refPath: result["ref_path"]?.stringValue ?? refText,
-                refText: refText
-            )
-        }
         let client = connection.client
         // Base64-encode off the main actor: for a file at the 25 MB cap this is a
         // multi-MB string build that would otherwise block the UI on @MainActor.
@@ -354,50 +320,8 @@ final class AttachmentStore {
     /// with a readable message on the first failure (the offending attachment is
     /// marked `.failed` and kept).
     ///
-    /// Relay transport (B9 / A5): the `POST /api/upload` REST round-trip is
-    /// unreachable on a relay-only reach, so each image instead rides the
-    /// relay's `attach` RPC as inlined base64 (`image.attach_bytes` on the
-    /// gateway side). `sessionId` may be `nil` there — a brand-new chat — in
-    /// which case the relay creates + owns the session and the coordinator
-    /// adopts its id for the follow-up submit (exactly like a relay text send
-    /// into a draft). On the direct path `sessionId` is always resolved
-    /// non-empty before this is called.
     @discardableResult
     func uploadAndAttach(sessionId: String?, connection: ConnectionStore) async throws -> [String] {
-        if connection.transportPath == .relay,
-           let coordinator = connection.relayCoordinator {
-            var attachedPaths: [String] = []
-            let ids = pending.map(\.id)
-            for id in ids {
-                guard let index = pending.firstIndex(where: { $0.id == id }) else { continue }
-                let jpeg = pending[index].jpegData
-                pending[index].state = .uploading
-                do {
-                    // Base64-encode off the main actor (mirrors attachFile):
-                    // a cap-size photo normalises to ~1 MB JPEG / ~1.4 MB b64.
-                    let dataURL = await Task.detached(priority: .userInitiated) {
-                        Self.fileDataURL(jpeg, mimeType: "image/jpeg")
-                    }.value
-                    let result = try await coordinator.attach(
-                        sessionID: sessionId,
-                        kind: "image",
-                        name: "\(UUID().uuidString).jpg",
-                        dataURL: dataURL
-                    )
-                    attachedPaths.append(result["path"]?.stringValue ?? "")
-                    // Success: drop it so a partial-batch retry doesn't double-attach.
-                    pending.removeAll { $0.id == id }
-                } catch {
-                    let message = (error as? LocalizedError)?.errorDescription
-                        ?? error.localizedDescription
-                    if let failIndex = pending.firstIndex(where: { $0.id == id }) {
-                        pending[failIndex].state = .failed(message)
-                    }
-                    throw AttachmentError.failed(message)
-                }
-            }
-            return attachedPaths
-        }
         let trimmedSession = sessionId?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         guard !trimmedSession.isEmpty else {
             throw AttachmentError.notConfigured
