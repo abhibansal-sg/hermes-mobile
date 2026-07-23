@@ -1,9 +1,7 @@
-"""Unit tests for the hermes-mobile opt-in push relay client.
+"""Unit tests for the hermes-mobile push relay client.
 
-Slice B adapts Fetch's relay client but keeps Hermes direct APNs mode as the
-default. These tests pin the adaptation deltas: no hosted default, Hermes env
-prefix/path/app body, owner-only credential writes, 401 re-mint, attestation
-surfacing, dedupe, and our push-kind taxonomy mapping.
+These tests pin the Hermes env prefix/path/app body, owner-only credential
+writes, 401 re-mint, attestation surfacing, dedupe, and push-kind mapping.
 """
 
 from __future__ import annotations

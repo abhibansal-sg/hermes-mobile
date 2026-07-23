@@ -257,7 +257,7 @@ extension RestClient {
     /// ``ServerCapabilities`` folds it with one switch if a dedicated capability is
     /// added later.
     ///
-    /// Refinement (mirroring `probeDevicesEndpoint`): a `200` must ALSO carry a
+    /// A `200` must also carry a
     /// `providers` array to count as `.available`; a `200` lacking one is
     /// `.inconclusive` (defensive against a same-path collision).
     func probeProvidersEndpoint() async -> UploadProbeResult {

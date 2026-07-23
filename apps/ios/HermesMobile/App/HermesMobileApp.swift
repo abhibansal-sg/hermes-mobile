@@ -22,7 +22,6 @@ final class StateFlushCoordinator {
     struct Dependencies {
         var flushDraft: () async -> Void
         var suspendOutbox: () async -> Void
-        var flushSyncCursor: () -> Void
         var flushWidgetSnapshot: () -> Void
         var flushPendingNavigation: () async -> Void
     }
@@ -50,7 +49,6 @@ final class StateFlushCoordinator {
             guard !Task.isCancelled else { self.finish(); return }
             await self.dependencies.suspendOutbox()
             guard !Task.isCancelled else { self.finish(); return }
-            self.dependencies.flushSyncCursor()
             self.dependencies.flushWidgetSnapshot()
             await self.dependencies.flushPendingNavigation()
             self.finish()
@@ -278,9 +276,6 @@ struct HermesMobileApp: App {
                     }
                     environment.connectionStore.handleScenePhase(newPhase)
                     environment.appLock.handleScenePhase(newPhase)
-                    // UX1: start/stop the 30-second foreground heartbeat so the
-                    // session list refreshes without user interaction in the foreground.
-                    environment.sessionStore.handleScenePhaseActive(newPhase == .active)
                     if newPhase == .active {
                         environment.queueStore.resumeFromBackground()
                         Task { await AttachmentBlobCache.shared.respondToLowAvailableCapacity() }

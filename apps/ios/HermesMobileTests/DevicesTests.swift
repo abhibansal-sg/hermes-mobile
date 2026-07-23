@@ -90,16 +90,7 @@ final class DevicesTests: XCTestCase {
         super.tearDown()
     }
 
-    // MARK: - Capability probe state machine
-
-    func testProbeDevicesEndpointInconclusiveOnUnreachableHost() async {
-        // A transport failure (nothing listening) must classify inconclusive,
-        // never throw — so a flaky probe leaves `devices` at `.unknown`, the
-        // Devices section stays hidden, AND no auto-upgrade issue call fires.
-        let rest = RestClient(baseURL: URL(string: "http://127.0.0.1:1")!, token: "t")
-        let result = await rest.probeDevicesEndpoint()
-        XCTAssertEqual(result, .inconclusive)
-    }
+    // MARK: - Capability state
 
     func testProbeClassificationByStatusAndBody() {
         // Pin the status→result classification the probe applies, incl. the body
@@ -514,6 +505,26 @@ final class DevicesTests: XCTestCase {
         let parsed = HermesURLRouter.parsePairPayload(payload)
         XCTAssertEqual(parsed?.isDeviceToken, false)
         XCTAssertNil(parsed?.deviceId)
+    }
+
+    func testRelayPairingLinkParsesWithoutUsingDashboardTokenPath() {
+        let payload = "hermesapp://pair?relay=https%3A%2F%2Frelay.example.test%2Froot&agent=agent_123&pairing=pair_secret_456&kind=relay"
+        let parsed = HermesURLRouter.parsePairPayload(payload)
+
+        XCTAssertEqual(parsed?.relayPair?.relayURL, "https://relay.example.test/root")
+        XCTAssertEqual(parsed?.relayPair?.agentID, "agent_123")
+        XCTAssertEqual(parsed?.relayPair?.pairingSecret, "pair_secret_456")
+        XCTAssertEqual(parsed?.isRelayPairing, true)
+        XCTAssertEqual(parsed?.isDeviceToken, false)
+    }
+
+    func testRelayPairingLinkRejectsMissingFields() {
+        XCTAssertNil(HermesURLRouter.parsePairPayload(
+            "hermesapp://pair?kind=relay&agent=agent_123&pairing=pair_secret_456"
+        ))
+        XCTAssertNil(HermesURLRouter.parsePairPayload(
+            "hermesapp://pair?kind=relay&relay=https%3A%2F%2Frelay.example.test&agent=agent_123"
+        ))
     }
 
     func testQRRejectsMissingRequiredFields() {

@@ -1,5 +1,5 @@
 """
-hermes-mobile plugin — APNs push engine (dormant by default).
+hermes-mobile plugin — gateway-event push adapter.
 
 Moved verbatim from ``hermes_cli/push_notify.py`` (ABH-88 de-patch, W1) plus
 the gateway event-intake block moved from ``tui_gateway/server.py``. The
@@ -7,17 +7,13 @@ the gateway event-intake block moved from ``tui_gateway/server.py``. The
 ``/api/plugins/hermes-mobile/push/...``); event intake rides the gateway's S2
 emit-observer seam (see CONTRACT-DEPATCH.md), wired by :func:`activate`.
 
-Sends Apple Push Notification service (APNs) alert pushes to iOS devices that
-have registered their device token with the gateway. The whole subsystem is a
-silent no-op unless **both**:
+Alert delivery is owned by the hosted push relay: this module translates stock
+gateway events and queues them through :mod:`relay_client`. It deliberately
+does not keep a second device-token registry or a second alert APNs sender.
 
-  * ``HERMES_PUSH_ENABLED`` is truthy, and
-  * the APNs auth key file (``HERMES_APNS_KEY_FILE``) exists on disk.
-
-That keeps the gateway shippable without any APNs credentials: hooks can call
-:func:`notify` unconditionally and nothing happens until an operator opts in.
-
-Configuration (all via environment):
+Direct APNs remains only for ActivityKit remote updates because the relay does
+not yet expose a Live Activity token/update contract. That path is dormant
+unless the following legacy APNs credentials are configured:
 
   ============================  ====================================================
   ``HERMES_PUSH_ENABLED``       truthy ("1", "true", "yes", "on") to arm the sender
@@ -32,13 +28,8 @@ Auth uses a JWT (ES256) provider token per the APNs token-based authentication
 spec — built once and reused for up to ~50 minutes (Apple rejects tokens older
 than 60 minutes and refuses tokens minted more than once every 20 minutes).
 
-Device tokens live in a JSON registry at ``<HERMES_HOME>/push_tokens.json``
-(``~/.hermes/push_tokens.json`` by default), populated by the plugin's
-``POST``/``DELETE .../push/register`` routes. Invalid tokens are pruned
-automatically when APNs replies ``410 Unregistered``.
-
-The pure builders (:func:`build_provider_jwt`, :func:`build_push_headers`,
-:func:`build_alert_payload`) take no I/O and are unit-tested directly.
+Live Activity tokens live in ``<HERMES_HOME>/live_activity_tokens.json`` and
+are pruned when APNs reports that they are dead.
 
 Optional deps (PyJWT + cryptography) are imported lazily; importing this module
 never fails. If they are absent the sender degrades to a no-op and the JWT
@@ -161,7 +152,7 @@ class APNsConfig:
 
 
 # ---------------------------------------------------------------------------
-# Pure builders — no I/O, unit-tested directly.
+# ActivityKit APNs builders.
 # ---------------------------------------------------------------------------
 
 def build_provider_jwt(
@@ -194,71 +185,6 @@ def build_provider_jwt(
     )
 
 
-def build_push_headers(
-    *,
-    provider_jwt: str,
-    topic: str,
-    push_type: str = "alert",
-    priority: int = 10,
-    collapse_id: Optional[str] = None,
-    expiration: int = 0,
-) -> Dict[str, str]:
-    """Build the APNs HTTP/2 request headers for an alert push.
-
-    ``expiration`` of 0 means "deliver once, do not store" — appropriate for
-    time-sensitive turn / approval alerts. ``collapse_id`` (<=64 bytes) lets
-    APNs coalesce updates for the same logical event.
-    """
-    headers: Dict[str, str] = {
-        "authorization": f"bearer {provider_jwt}",
-        "apns-topic": topic,
-        "apns-push-type": push_type,
-        "apns-priority": str(priority),
-        "apns-expiration": str(expiration),
-    }
-    if collapse_id:
-        # APNs caps the collapse id at 64 bytes.
-        headers["apns-collapse-id"] = collapse_id[:64]
-    return headers
-
-
-def build_alert_payload(
-    *,
-    title: str,
-    body: str,
-    event_type: str,
-    payload: Optional[Dict[str, Any]] = None,
-    sound: str = "default",
-    badge: Optional[int] = None,
-    category: Optional[str] = None,
-) -> Dict[str, Any]:
-    """Shape the APNs JSON payload for an alert push.
-
-    Produces the standard ``aps`` envelope plus a flat ``hermes`` block of
-    custom keys (event type + caller-supplied payload) the iOS app reads on
-    tap. ``payload`` keys never overwrite the reserved ``aps``/``hermes``
-    envelope; the whole custom block is namespaced under ``hermes``.
-
-    ``category`` (when set) becomes ``aps.category`` so iOS can attach the
-    matching ``UNNotificationCategory`` action set (e.g. Approve/Deny on
-    ``HERMES_APPROVAL``). Omitted when None to keep legacy alerts unchanged.
-    """
-    aps: Dict[str, Any] = {
-        "alert": {"title": title, "body": body},
-        "sound": sound,
-    }
-    if badge is not None:
-        aps["badge"] = badge
-    if category:
-        aps["category"] = category
-
-    custom: Dict[str, Any] = {"event_type": event_type}
-    if payload:
-        custom.update(payload)
-
-    return {"aps": aps, "hermes": custom}
-
-
 _CORRELATED_EVENTS = {
     "approval.request": "approval",
     "clarify.request": "clarify",
@@ -269,9 +195,9 @@ _CORRELATED_EVENTS = {
 def _gateway_scope() -> str:
     """Stable, non-secret namespace for one gateway/profile installation."""
     try:
-        scope = str(_registry_path().parent.resolve())
+        scope = str(_la_registry_path().parent.resolve())
     except Exception:
-        scope = str(_registry_path().parent)
+        scope = str(_la_registry_path().parent)
     return "gw_" + hashlib.sha256(scope.encode("utf-8")).hexdigest()[:16]
 
 
@@ -368,18 +294,6 @@ def build_manifest_invalidation_payload(
     }
 
 
-def build_manifest_invalidation_headers(
-    *, provider_jwt: str, topic: str, scope: str
-) -> Dict[str, str]:
-    return build_push_headers(
-        provider_jwt=provider_jwt,
-        topic=topic,
-        push_type="background",
-        priority=5,
-        collapse_id=f"hermes-sync:{scope}",
-    )
-
-
 # ---------------------------------------------------------------------------
 # Live Activity (ActivityKit) remote-update payload + headers.
 #
@@ -452,88 +366,36 @@ def build_live_activity_payload(
 
 
 # ---------------------------------------------------------------------------
-# Device token registry — JSON file at <HERMES_HOME>/push_tokens.json.
-# A module-level lock serialises read-modify-write so concurrent register /
-# notify (token pruning) calls don't clobber the file.
+# Shared token validation and Live Activity APNs error handling.
+# Alert-device registration and delivery are relay-owned.
 # ---------------------------------------------------------------------------
 
-_registry_lock = threading.Lock()
-
-# iOS APNs device tokens are 64 hex chars (32 bytes). We validate loosely
-# (hex, even length, sane size) so future token lengths don't hard-break.
 _MIN_TOKEN_LEN = 32
 _MAX_TOKEN_LEN = 200
 
 
-def _registry_path() -> Path:
-    """Resolve the token registry path, honouring HERMES_HOME overrides.
-
-    Falls back to ``~/.hermes/push_tokens.json`` if the hermes config package
-    can't be imported (keeps this module importable in isolation / tests).
-    """
-    try:
-        from hermes_cli.config import get_hermes_home
-
-        return get_hermes_home() / "push_tokens.json"
-    except Exception:  # pragma: no cover - defensive fallback
-        return Path(os.path.expanduser("~/.hermes")) / "push_tokens.json"
-
-
 def _normalize_token(token: str) -> Optional[str]:
-    """Return a lowercased hex device token, or None if it's malformed."""
+    """Return a lowercased hex device token, or None if it is malformed."""
     if not isinstance(token, str):
         return None
-    t = token.strip().lower().replace(" ", "")
-    if not (_MIN_TOKEN_LEN <= len(t) <= _MAX_TOKEN_LEN):
+    value = token.strip().lower().replace(" ", "")
+    if not (_MIN_TOKEN_LEN <= len(value) <= _MAX_TOKEN_LEN):
         return None
     try:
-        int(t, 16)
+        int(value, 16)
     except ValueError:
         return None
-    return t
-
-
-def _load_registry() -> List[Dict[str, Any]]:
-    """Load the registry as a list of ``{token, platform, registered_at}``."""
-    path = _registry_path()
-    try:
-        raw = path.read_text(encoding="utf-8")
-    except (FileNotFoundError, OSError):
-        return []
-    try:
-        data = json.loads(raw)
-    except (json.JSONDecodeError, ValueError):
-        _log.warning("push_tokens.json is corrupt; treating as empty")
-        return []
-    if not isinstance(data, list):
-        return []
-    out: List[Dict[str, Any]] = []
-    for entry in data:
-        if isinstance(entry, dict) and isinstance(entry.get("token"), str):
-            out.append(entry)
-    return out
-
-
-def _save_registry(entries: List[Dict[str, Any]]) -> None:
-    path = _registry_path()
-    try:
-        # Registry holds APNs device tokens. Create the temp file at 0600 before
-        # writing bytes, then atomically replace, so a permissive umask cannot
-        # briefly expose token material before a post-write chmod.
-        atomic_json_write(path, entries, indent=2, mode=0o600)
-    except OSError as exc:
-        _log.warning("Could not persist push_tokens.json: %s", exc)
+    return value
 
 
 def _default_env() -> str:
-    """Server-level fallback APNs environment for tokens registered by older
-    clients that don't report one."""
-    return "sandbox" if _is_truthy(os.environ.get("HERMES_APNS_USE_SANDBOX")) else "production"
+    return (
+        "sandbox"
+        if _is_truthy(os.environ.get("HERMES_APNS_USE_SANDBOX"))
+        else "production"
+    )
 
 
-# The per-event preference vocabulary. A registry entry may opt into a subset;
-# ``None``/absent means "all events" so legacy entries (registered before prefs
-# existed) keep receiving every push.
 PUSH_EVENT_KINDS = (
     "approval",
     "clarify",
@@ -543,292 +405,10 @@ PUSH_EVENT_KINDS = (
 )
 
 
-def _normalize_events(events: Optional[List[str]]) -> Optional[List[str]]:
-    """Validate a per-event preference list.
-
-    Returns a de-duplicated, order-preserving subset of :data:`PUSH_EVENT_KINDS`
-    or ``None`` (meaning "all events" — the legacy default). An empty list is
-    preserved as an explicit "no events" opt-out (distinct from ``None``).
-    """
-    if events is None:
-        return None
-    if not isinstance(events, (list, tuple)):
-        return None
-    seen: List[str] = []
-    for ev in events:
-        if isinstance(ev, str) and ev in PUSH_EVENT_KINDS and ev not in seen:
-            seen.append(ev)
-    return seen
-
-
-def _entry_wants_event(entry: Dict[str, Any], event_kind: str) -> bool:
-    """Does this registry entry want a push for ``event_kind``?
-
-    Absent/``None`` ``events`` → all events (legacy entries). An explicit list
-    filters; an explicit empty list means "no events".
-    """
-    prefs = entry.get("events")
-    if prefs is None:
-        return True
-    if not isinstance(prefs, list):
-        return True  # malformed → fail open (don't silently drop a device)
-    return event_kind in prefs
-
-
-def register_token(
-    token: str,
-    platform: str = "ios",
-    env: str = "",
-    events: Optional[List[str]] = None,
-    device_id: Optional[str] = None,
-) -> bool:
-    """Add (or refresh) a device token in the registry. Returns False if the
-    token is malformed.
-
-    ``env`` is the APNs environment the *client build* belongs to
-    ("sandbox" for Xcode/dev-signed installs, "production" for
-    TestFlight/App Store). Tokens are routed to the matching APNs host per
-    entry — a single gateway can serve both build flavors simultaneously.
-
-    ``events`` is the per-event opt-in list (subset of
-    :data:`PUSH_EVENT_KINDS`); ``None`` means "all events" (legacy default).
-    On re-register the stored prefs are replaced with the new value so the app
-    can change its Notification toggles by re-POSTing.
-
-    ``device_id`` (QA-2 R1c) is the client's STABLE per-install identity.
-    Dedup is two-tier: an exact token match refreshes in place; otherwise,
-    when a ``device_id`` is supplied and an existing entry carries that same
-    id, that entry's token is REPLACED (APNs rotates tokens on
-    reinstall/restore/re-sign — the device keeps exactly ONE entry). A same
-    ``device_id`` refresh also collapses any stale duplicate entries stamped
-    with that id (pre-dedup legacy rows). Entries without a ``device_id``
-    (legacy clients) keep token-string-only semantics.
-    """
-    normalized = _normalize_token(token)
-    if normalized is None:
-        return False
-    environment = env if env in ("sandbox", "production") else _default_env()
-    normalized_events = _normalize_events(events)
-    with _registry_lock:
-        entries = _load_registry()
-        now = time.time()
-        matched: Optional[Dict[str, Any]] = None
-        for entry in entries:
-            if _normalize_token(entry.get("token", "")) == normalized:
-                matched = entry
-                break
-        if matched is not None:
-            matched["platform"] = platform
-            matched["env"] = environment
-            matched["registered_at"] = now
-            if normalized_events is None:
-                matched.pop("events", None)
-            else:
-                matched["events"] = normalized_events
-            if device_id:
-                matched["device_id"] = device_id
-                # One token per device: this token now owns the device, so
-                # drop any OTHER entries stamped with the same device_id
-                # (stale duplicates accumulated before device-id dedup).
-                entries = [
-                    e for e in entries
-                    if e is matched or e.get("device_id") != device_id
-                ]
-                entries = _evict_null_device_id_legacy(entries, platform=platform)
-            _save_registry(entries)
-            return True
-        new_entry: Dict[str, Any] = {
-            "token": normalized, "platform": platform, "env": environment,
-            "registered_at": now,
-        }
-        if normalized_events is not None:
-            new_entry["events"] = normalized_events
-        if device_id:
-            new_entry["device_id"] = device_id
-            # Same device, NEW (rotated) token — replace the device's old
-            # entry so the registry converges to one row per device instead
-            # of appending forever (QA-2 R1c: 5 accumulating entries).
-            for idx, entry in enumerate(entries):
-                if entry.get("device_id") == device_id:
-                    entries[idx] = new_entry
-                    entries = _evict_null_device_id_legacy(entries, platform=platform)
-                    _save_registry(entries)
-                    _log.info(
-                        "push registry: device …%s rotated its token — "
-                        "replaced the old entry (one token per device)",
-                        device_id[-6:],
-                    )
-                    return True
-        entries.append(new_entry)
-        if device_id:
-            # QA-3 S13: a successful device_id-keyed registration converges the
-            # registry by evicting legacy null-device_id rows for this platform
-            # — the pre-device-id-dedup rows that QA-2's eviction could never
-            # reach (they have no device_id to match). Fan-out then posts to
-            # exactly one token per device instead of N stale ones Apple 200s
-            # into the void.
-            entries = _evict_null_device_id_legacy(entries, platform=platform)
-        _save_registry(entries)
-    return True
-
-
-def _evict_null_device_id_legacy(
-    entries: List[Dict[str, Any]], *, platform: str
-) -> List[Dict[str, Any]]:
-    """Drop legacy entries with no ``device_id`` for ``platform`` (QA-3 S13).
-
-    Rows stamped without a ``device_id`` predate the device-id dedup protocol
-    (or were written by a client that never sent one — the build-116 phone
-    before the per-install-id iOS fix). They survive QA-2's device-keyed
-    eviction because that path only removes rows whose ``device_id`` *matches*
-    — null-id rows match nothing, so fan-out keeps posting to them (Apple
-    returns 200 for a stale token into the void, so they never age out).
-
-    A real device that is still active re-registers on every launch with a
-    device_id (after the iOS per-install-id fix), so once ANY device_id-keyed
-    registration lands for a platform, the null-id rows for that platform are
-    definitionally superseded and safe to drop. Logged for diagnosability.
-    """
-    if not entries:
-        return entries
-    kept: List[Dict[str, Any]] = []
-    evicted = 0
-    for entry in entries:
-        same_platform = entry.get("platform", "ios") == platform
-        has_device_id = bool(entry.get("device_id"))
-        if same_platform and not has_device_id:
-            evicted += 1
-            continue
-        kept.append(entry)
-    if evicted:
-        _log.info(
-            "push registry: evicted %d legacy null-device_id %s entr%s "
-            "(device_id-keyed registration converges the registry)",
-            evicted, platform, "y" if evicted == 1 else "ies",
-        )
-    return kept
-
-
-def unregister_token(token: str) -> bool:
-    """Remove a device token. Returns True if a token was removed."""
-    normalized = _normalize_token(token)
-    if normalized is None:
-        return False
-    with _registry_lock:
-        entries = _load_registry()
-        kept = [
-            e for e in entries
-            if _normalize_token(e.get("token", "")) != normalized
-        ]
-        if len(kept) == len(entries):
-            return False
-        _save_registry(kept)
-    return True
-
-
-def registered_tokens() -> List[str]:
-    """All currently registered (normalized) device tokens."""
-    out: List[str] = []
-    for entry in _load_registry():
-        n = _normalize_token(entry.get("token", ""))
-        if n:
-            out.append(n)
-    return out
-
-
-def registry_entries() -> List[Dict[str, Any]]:
-    """Return a defensive copy for authorization-aware registry projections."""
-    with _registry_lock:
-        return copy.deepcopy(_load_registry())
-
-
-def registered_tokens_by_env() -> Dict[str, List[str]]:
-    """Registered tokens grouped by APNs environment ("sandbox"/"production").
-
-    Entries persisted before env tracking existed inherit the server-level
-    default so older registries keep working unchanged.
-    """
-    fallback = _default_env()
-    grouped: Dict[str, List[str]] = {}
-    for entry in _load_registry():
-        n = _normalize_token(entry.get("token", ""))
-        if not n:
-            continue
-        env = entry.get("env")
-        if env not in ("sandbox", "production"):
-            env = fallback
-        grouped.setdefault(env, []).append(n)
-    return grouped
-
-
-def recipients_for_event(
-    event_kind: str, excluding_device_ids: set[str] | None = None
-) -> Dict[str, List[str]]:
-    """Tokens grouped by APNs env, filtered to those wanting ``event_kind``.
-
-    Mirrors :func:`registered_tokens_by_env` but drops entries whose per-event
-    prefs exclude this kind. Entries with no prefs (legacy) receive everything.
-    Unknown ``event_kind`` values fall open to all entries.
-    """
-    fallback = _default_env()
-    grouped: Dict[str, List[str]] = {}
-    known = event_kind in PUSH_EVENT_KINDS
-    excluded = excluding_device_ids or set()
-    for entry in _load_registry():
-        n = _normalize_token(entry.get("token", ""))
-        if not n:
-            continue
-        if entry.get("device_id") in excluded:
-            continue
-        if known and not _entry_wants_event(entry, event_kind):
-            continue
-        env = entry.get("env")
-        if env not in ("sandbox", "production"):
-            env = fallback
-        grouped.setdefault(env, []).append(n)
-    return grouped
-
-
-def _drop_tokens(tokens: List[str]) -> None:
-    """Prune the given tokens from the registry.
-
-    Called when APNs declares a token permanently dead: HTTP ``410`` (any
-    reason, canonically ``Unregistered``) OR HTTP ``400`` with reason
-    ``BadDeviceToken`` (QA-2 R1: a token APNs will never accept again — most
-    commonly an env mismatch, e.g. a sandbox token posted to the production
-    host, or a rotated/reinstalled token). Other 4xx reasons
-    (``TopicDisallowed``/``BadPath``/``MissingTopic``…) are SERVER-side config
-    problems — the token itself is fine, so they must NOT evict.
-    """
-    drop = {t for t in (_normalize_token(t) for t in tokens) if t}
-    if not drop:
-        return
-    with _registry_lock:
-        entries = _load_registry()
-        kept = [
-            e for e in entries
-            if _normalize_token(e.get("token", "")) not in drop
-        ]
-        if len(kept) != len(entries):
-            _save_registry(kept)
-
-
-# APNs rejection reasons that mean "this exact token will NEVER deliver"
-# (vs. request/config errors where the token is fine and retrying later —
-# or fixing the server config — would succeed). ``BadDeviceToken`` arrives
-# as HTTP 400 and is the signature of an env-mismatched or rotated token;
-# ``Unregistered`` canonically arrives as HTTP 410 but is matched by reason
-# too so a status-code drift can't keep a dead token alive forever.
 _EVICTABLE_APNS_REASONS = frozenset({"BadDeviceToken", "Unregistered"})
 
 
 def _apns_reason(response_text: str) -> Optional[str]:
-    """Parse the APNs error body ``{"reason": "..."}``; ``None`` when absent.
-
-    APNs answers non-200s with a small JSON document naming the reason. Never
-    raises: an unparseable/non-dict/missing-reason body yields ``None`` and the
-    caller falls back to status-code-only handling.
-    """
     try:
         parsed = json.loads(response_text)
     except (ValueError, TypeError):
@@ -841,26 +421,16 @@ def _apns_reason(response_text: str) -> Optional[str]:
 
 
 def _is_dead_token(status: int, reason: Optional[str]) -> bool:
-    """True when APNs declared the token permanently undeliverable (QA-2 R1).
-
-    410 regardless of reason (canonical ``Unregistered``), or a 400 whose
-    parsed reason is in :data:`_EVICTABLE_APNS_REASONS`. Every other non-200
-    keeps the token: TopicDisallowed/BadPath/MissingTopic are config errors,
-    429/5xx are transient.
-    """
-    if status == 410:
-        return True
-    return reason in _EVICTABLE_APNS_REASONS
+    return status == 410 or reason in _EVICTABLE_APNS_REASONS
 
 
 # ---------------------------------------------------------------------------
 # Live Activity token registry — JSON file at
 # <HERMES_HOME>/live_activity_tokens.json, keyed by session_id.
 #
-# Unlike the alert registry (a flat list of device tokens), Live Activity
-# pushes target the *activity's* own push token, which rotates and is unique
-# per in-flight activity. We therefore key by session_id and UPSERT on
-# rotation. Pruned on 410 Unregistered like the alert registry.
+# Live Activity pushes target the *activity's* own rotating token, not the
+# relay-owned app device token. We therefore key by session_id and UPSERT on
+# rotation. Dead tokens are pruned from this local ActivityKit-only registry.
 # ---------------------------------------------------------------------------
 
 _la_registry_lock = threading.Lock()
@@ -903,8 +473,7 @@ def _load_la_registry() -> Dict[str, Dict[str, Any]]:
 def _save_la_registry(entries: Dict[str, Dict[str, Any]]) -> None:
     path = _la_registry_path()
     try:
-        # Registry holds ActivityKit push tokens; same atomic 0600 posture as
-        # the alert registry.
+        # Registry holds ActivityKit push tokens; write atomically as 0600.
         atomic_json_write(path, entries, indent=2, mode=0o600)
     except OSError as exc:
         _log.warning("Could not persist live_activity_tokens.json: %s", exc)
@@ -1092,205 +661,23 @@ def _send_one(
     return resp.status_code, (resp.text or "")
 
 
-def direct_apns_test_push_available() -> bool:
-    """True when direct APNs is armed and at least one alert token exists."""
-    return APNsConfig.from_env().is_armed() and any(
-        registered_tokens_by_env().values()
-    )
-
-
-def send_direct_apns_test_push() -> int:
-    """Send a direct-APNs settings test push via the normal APNs path."""
-    return _notify_direct_apns(
-        "test_push",
-        "Hermes test push",
-        "Direct APNs push delivery test from Hermes Mobile settings.",
-        {"source": "direct_test_push"},
-    )
-
-
-def _notify_direct_apns(
-    event_type: str,
-    title: str,
-    body: str,
-    payload: Optional[Dict[str, Any]] = None,
-    *,
-    category: Optional[str] = None,
-    expiration: int = 0,
-    collapse_id: Optional[str] = None,
-    excluding_device_ids: set[str] | None = None,
-) -> int:
-    """Send an alert push through direct APNs to registered tokens.
-
-    ``expiration`` (seconds) is the APNs store-and-forward window: 0 means
-    "deliver once, do not store" (time-sensitive alerts); a positive value
-    lets APNs hold the push for an offline device and deliver on wake.
-    """
-    config = APNsConfig.from_env()
-    if not config.is_armed():
-        _log.debug("push notify: not armed (enabled=%s) — no-op", config.enabled)
-        return 0
-
-    # Filter recipients by per-event preference before doing any work.
-    recipients = recipients_for_event(event_type, excluding_device_ids)
-    if not any(recipients.values()):
-        return 0
-
-    try:
-        import httpx
-    except ImportError:
-        _log.warning("push notify: httpx unavailable — cannot send (%s)", PIP_INSTALL_HINT)
-        return 0
-
-    try:
-        provider_jwt = _get_provider_jwt(config)
-    except PushDependencyError:
-        _log.warning("push notify: %s", PIP_INSTALL_HINT)
-        return 0
-    except OSError as exc:
-        _log.warning("push notify: cannot read APNs key file: %s", exc)
-        return 0
-
-    headers = build_push_headers(
-        provider_jwt=provider_jwt,
-        topic=config.topic,
-        expiration=expiration,
-        collapse_id=collapse_id,
-    )
-    body_bytes = json.dumps(
-        build_alert_payload(
-            title=title, body=body, event_type=event_type, payload=payload,
-            category=category,
-        )
-    ).encode("utf-8")
-
-    # Route each token to its own APNs environment: dev-signed builds carry
-    # sandbox tokens, TestFlight/App Store builds carry production tokens, and
-    # one gateway commonly serves both at once.
-    env_hosts = {"sandbox": _APNS_HOST_SANDBOX, "production": _APNS_HOST_PROD}
-    accepted = 0
-    stale: List[str] = []
-    for env, env_tokens in recipients.items():
-        if not env_tokens:
-            continue
-        base_url = f"https://{env_hosts.get(env, config.host)}:{_APNS_PORT}"
-        try:
-            with httpx.Client(http2=True, base_url=base_url, timeout=10.0) as conn:
-                for device_token in env_tokens:
-                    try:
-                        status, text = _send_one(
-                            conn,
-                            device_token=device_token,
-                            headers=headers,
-                            body=body_bytes,
-                        )
-                    except Exception as exc:  # network hiccup on a single token
-                        _log.warning("push notify: send failed for one token: %s", exc)
-                        continue
-                    if status == 200:
-                        accepted += 1
-                        continue
-                    # QA-2 R1: evict permanently-dead tokens — 410 Unregistered
-                    # AND 400 BadDeviceToken (env-mismatched / rotated tokens
-                    # that previously re-hammered forever). Other non-200s are
-                    # logged and KEPT (transient/config errors).
-                    reason = _apns_reason(text)
-                    if _is_dead_token(status, reason):
-                        stale.append(device_token)
-                        _log.info(
-                            "push notify: evicting dead token …%s (APNs %s%s)",
-                            device_token[-6:], status,
-                            f" {reason}" if reason else "",
-                        )
-                    else:
-                        _log.info("push notify: APNs %s for token …%s: %s",
-                                  status, device_token[-6:], text[:200])
-        except Exception as exc:  # pragma: no cover - connection-level failure
-            _log.warning("push notify: APNs %s connection failed: %s", env, exc)
-
-    if stale:
-        _drop_tokens(stale)
-        _log.info("push notify: pruned %d dead token(s) (410/400 BadDeviceToken)",
-                  len(stale))
-
-    return accepted
-
-
-def _notify_direct_manifest_invalidation(
-    scope: str, revision: int, reason: str
-) -> int:
-    """Send one frozen silent envelope to every token, ignoring alert prefs."""
-    config = APNsConfig.from_env()
-    recipients = registered_tokens_by_env()
-    if not config.is_armed() or not any(recipients.values()):
-        return 0
-    try:
-        import httpx
-        provider_jwt = _get_provider_jwt(config)
-    except Exception:
-        _log.warning("manifest invalidation push unavailable", exc_info=True)
-        return 0
-    headers = build_manifest_invalidation_headers(
-        provider_jwt=provider_jwt, topic=config.topic, scope=scope
-    )
-    encoded = json.dumps(
-        build_manifest_invalidation_payload(scope, revision, reason),
-        separators=(",", ":"),
-    ).encode("utf-8")
-    hosts = {"sandbox": _APNS_HOST_SANDBOX, "production": _APNS_HOST_PROD}
-    accepted, stale = 0, []
-    for env, tokens in recipients.items():
-        try:
-            with httpx.Client(
-                http2=True, base_url=f"https://{hosts.get(env, config.host)}:{_APNS_PORT}",
-                timeout=10.0,
-            ) as conn:
-                for token in tokens:
-                    try:
-                        status, text = _send_one(
-                            conn, device_token=token, headers=headers, body=encoded
-                        )
-                        accepted += status == 200
-                        # QA-2 R1: same eviction rule as the alert path —
-                        # 410 Unregistered AND 400 BadDeviceToken.
-                        reason = _apns_reason(text)
-                        if _is_dead_token(status, reason):
-                            stale.append(token)
-                            _log.info(
-                                "manifest invalidation: evicting dead token …%s (APNs %s%s)",
-                                token[-6:], status,
-                                f" {reason}" if reason else "",
-                            )
-                    except Exception:
-                        _log.warning(
-                            "manifest invalidation failed for one token", exc_info=True
-                        )
-        except Exception:
-            _log.warning("manifest invalidation APNs connection failed", exc_info=True)
-    _drop_tokens(stale)
-    return accepted
-
-
 def notify_manifest_invalidation(scope: str, revision: int, reason: str) -> int:
-    """Best-effort direct/relay background send; never raises."""
+    """Best-effort relay-owned background invalidation; never raises."""
     try:
-        payload = build_manifest_invalidation_payload(scope, revision, reason)
-        if os.environ.get("HERMES_MOBILE_RELAY_URL"):
-            from . import relay_client
+        from . import relay_client
 
-            topic = APNsConfig.from_env().topic
-            relay_client.send_manifest_invalidation_background(
-                payload=payload,
-                headers={
-                    "apns-topic": topic,
-                    "apns-push-type": "background",
-                    "apns-priority": "5",
-                    "apns-expiration": "0",
-                    "apns-collapse-id": f"hermes-sync:{scope}"[:64],
-                },
-            )
-            return 1
-        return _notify_direct_manifest_invalidation(scope, revision, reason)
+        payload = build_manifest_invalidation_payload(scope, revision, reason)
+        relay_client.send_manifest_invalidation_background(
+            payload=payload,
+            headers={
+                "apns-topic": DEFAULT_TOPIC,
+                "apns-push-type": "background",
+                "apns-priority": "5",
+                "apns-expiration": "0",
+                "apns-collapse-id": f"hermes-sync:{scope}"[:64],
+            },
+        )
+        return 1
     except Exception:
         _log.warning("manifest invalidation push failed", exc_info=True)
         return 0
@@ -1307,73 +694,26 @@ def notify(
     collapse_id: Optional[str] = None,
     excluding_device_ids: set[str] | None = None,
 ) -> int:
-    """Send an alert push to every registered device token.
+    """Queue one alert with the push relay. Never raises."""
+    del expiration, collapse_id, excluding_device_ids
+    try:
+        from . import relay_client
 
-    Silent no-op (returns 0) unless push is enabled AND the APNs key file
-    exists. Tokens APNs declares permanently dead — ``410 Unregistered`` or
-    ``400 BadDeviceToken`` — are pruned from the registry (QA-2 R1). Returns
-    the count of pushes accepted (HTTP 200). In relay mode, returns 1 only
-    when background relay delivery was kicked off; relay delivery failures
-    are surfaced via relay warnings/failure counters.
-
-    ``event_type`` is also used as the per-event preference key (one of
-    :data:`PUSH_EVENT_KINDS` — ``approval``/``clarify``/``turn_complete``):
-    only tokens that opted into this kind (or have no prefs) receive the push.
-    ``category`` (e.g. ``HERMES_APPROVAL``) becomes ``aps.category`` for the
-    iOS action set.
-
-    In relay mode, ``event_type``/``category``/``payload`` are forwarded to the
-    relay so it can rebuild the same ``aps.category`` + ``hermes`` envelope the
-    direct APNs path emits (STR-10A) instead of only a flat, non-actionable
-    alert.
-
-    Never raises: transport / credential errors are logged and swallowed so a
-    push failure can never break the calling gateway hook.
-    """
-    if os.environ.get("HERMES_MOBILE_RELAY_URL"):
-        # Mirror the direct-APNs per-event gate: a known alert event type
-        # must have at least one recipient whose preferences include it,
-        # otherwise we skip the relay enqueue and return 0. Unknown event
-        # types fall open to the legacy unconditional relay delivery.
-        if event_type in PUSH_EVENT_KINDS and not any(
-            recipients_for_event(event_type, excluding_device_ids).values()
-        ):
-            return 0
-        try:
-            from . import relay_client
-        except Exception:
-            _log.debug("relay push notify failed", exc_info=True)
-            return 0
-        try:
-            relay_payload = payload if isinstance(payload, dict) else {}
-            # NOTE: relay_client.send_event_background carries no expiration
-            # field — the relay is a separate transport with its own delivery
-            # policy. The direct-APNs path below is the store-and-forward
-            # guarantee for the 4h turn-complete window (STR-987).
-            relay_client.send_event_background(
-                kind=relay_client.map_push_kind(event_type),
-                session_id=relay_payload.get("session_id"),
-                title=title,
-                body=body,
-                source=relay_payload.get("source"),
-                event_type=event_type,
-                category=category,
-                payload=relay_payload or None,
-            )
-            return 1
-        except Exception:
-            _log.debug("relay push notify failed", exc_info=True)
-            return 0
-    return _notify_direct_apns(
-        event_type,
-        title,
-        body,
-        payload,
-        category=category,
-        expiration=expiration,
-        collapse_id=collapse_id,
-        excluding_device_ids=excluding_device_ids,
-    )
+        relay_payload = payload if isinstance(payload, dict) else {}
+        relay_client.send_event_background(
+            kind=relay_client.map_push_kind(event_type),
+            session_id=relay_payload.get("session_id"),
+            title=title,
+            body=body,
+            source=relay_payload.get("source"),
+            event_type=event_type,
+            category=category,
+            payload=relay_payload or None,
+        )
+        return 1
+    except Exception:
+        _log.debug("relay push notify failed", exc_info=True)
+        return 0
 
 
 def notify_live_activity(

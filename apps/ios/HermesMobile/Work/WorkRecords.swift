@@ -255,7 +255,6 @@ struct WorkJobInput: Sendable {
     var comment: String?
     var storedSessionID: String?
     var expiresAt: Date?
-    var legacyImportKey: String?
     var createdAt: Date?
 
     init(
@@ -269,7 +268,6 @@ struct WorkJobInput: Sendable {
         comment: String? = nil,
         storedSessionID: String? = nil,
         expiresAt: Date? = nil,
-        legacyImportKey: String? = nil,
         createdAt: Date? = nil
     ) {
         self.jobID = jobID
@@ -282,7 +280,6 @@ struct WorkJobInput: Sendable {
         self.comment = comment
         self.storedSessionID = storedSessionID
         self.expiresAt = expiresAt
-        self.legacyImportKey = legacyImportKey
         self.createdAt = createdAt
     }
 }

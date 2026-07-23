@@ -27,8 +27,8 @@ import SwiftUI
 // MARK: - Picker content view
 
 /// Compact session model picker shown in the popover.
-/// Loads provider/model list + capabilities from `GET /api/model/options`,
-/// then sends WS `config.set` with `session_id` for all mutations.
+/// Loads the stock model inventory, then sends WS `config.set` with
+/// `session_id` for all mutations.
 struct SessionModelPickerContent: View {
     let connection: ConnectionStore
     /// The live runtime session — nil on a DRAFT chat (no session yet). In
@@ -432,18 +432,15 @@ struct SessionModelPickerContent: View {
     private func loadOptions() async {
         // Session-scoped WS load first: its `model`/`provider` reflect the
         // LIVE session agent (post hot-swap), which is what "current" means
-        // here. REST `/api/model/options` (global view) is the fallback for
-        // older gateways without the WS method — and the only path in draft
-        // mode (no session yet; "current" = the global default a new chat
-        // would start on).
+        // here. Draft mode requests the same stock method without a session id,
+        // so "current" is the global default a new chat would start on.
         var options: ModelOptions?
         if let sessionId, !sessionId.isEmpty {
             options = try? await connection.sessionModelOptions(sessionId: sessionId)
         }
         if options == nil {
-            guard let control = connection.control else { return }
             do {
-                options = try await control.modelOptions()
+                options = try await connection.globalModelOptions()
             } catch {
                 phase = .failed((error as? LocalizedError)?.errorDescription ?? error.localizedDescription)
                 return

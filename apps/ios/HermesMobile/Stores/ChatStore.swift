@@ -373,21 +373,6 @@ final class ChatStore {
         return nil
     }
 
-    /// Whether the most recent `send(text:)` call actually dispatched
-    /// `prompt.submit` to the server, vs. refusing before ever asking (empty
-    /// text, no connection, no resolvable runtime, attachment-upload
-    /// failure). Reset to `false` at the top of every `send`; only
-    /// meaningful immediately after a call returns `false`.
-    ///
-    /// Exists for programmatic callers that need to tell "the server never
-    /// saw this" (safe to treat the attempt as if it never happened) apart
-    /// from "we asked and lost the answer" (a `prompt.submit` transport
-    /// failure could mean the server accepted it — never safe to assume
-    /// otherwise). `PendingIntentRouter.deliverAskPrompt` uses this to decide
-    /// whether it's safe to also delete a session it created solely for a
-    /// refused `.ask` prompt, rather than just re-parking the prompt.
-    private(set) var lastSendReachedServer = false
-
     /// Last `backfill()` REST failure, or `nil` if the most recent backfill
     /// succeeded or none has run. Observability for the mirror-recovery path:
     /// a foreign turn whose live stream was dropped relies entirely on backfill,
@@ -2651,7 +2636,6 @@ final class ChatStore {
     /// grab whatever attachments happen to be pending at drain time.
     @discardableResult
     func send(text: String, includeAttachments: Bool = true) async -> Bool {
-        lastSendReachedServer = false
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         let hasAttachments = includeAttachments && (attachments?.hasPending ?? false)
         guard !trimmed.isEmpty || hasAttachments else { return false }
@@ -2769,7 +2753,6 @@ final class ChatStore {
         messages.append(userMessage)
         setStreaming(true, reason: "send.localTurn")  // ownership=LOCAL (token already held)
         lastError = nil
-        lastSendReachedServer = true
         do {
             _ = try await client.requestRaw(
                 "prompt.submit",
@@ -2811,7 +2794,6 @@ final class ChatStore {
         beginLocalTurn()
         setStreaming(true, reason: "outbox.submit")
         lastError = nil
-        lastSendReachedServer = true
         let priorBindingMode = sessions?.beginPromptSubmission(runtimeID: runtimeSessionID)
         do {
             let result = try await client.requestRaw(

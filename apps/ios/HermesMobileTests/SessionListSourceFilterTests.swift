@@ -50,7 +50,7 @@ final class SessionListSourceFilterTests: XCTestCase {
 
         XCTAssertEqual(store.visibleSessions.map(\.id), ["telegram", "tui", "cliUnknownCount"],
             "Recents should show only human-facing non-empty rows; nil count is kept because old gateways may omit it")
-        XCTAssertEqual(store.filteredCount, 3)
+        XCTAssertEqual(store.visibleSessions.count, 3)
         XCTAssertEqual(SessionStore.recentsExcludeSources, ["cron", "subagent"],
             "Fresh drawer pages must ask the server to omit both autonomous sources")
     }

@@ -280,28 +280,6 @@ final class CacheFirstLaunchTests: XCTestCase {
         ))
     }
 
-    func testCommittedManifestTimestampSurvivesReloadAfterAWeek() async throws {
-        let cache = try makeInMemoryCache()
-        let scope = CacheScope(serverId: serverURL, profileId: DefaultsKeys.allProfilesScope)
-        let timestamp = Date().addingTimeInterval(-7 * 86_400).timeIntervalSince1970
-        let json = """
-        {"revision":42,"cursor":"done","has_more":false,"server_time":\(timestamp)}
-        """
-        let page = try JSONDecoder().decode(SyncManifestPage.self, from: Data(json.utf8))
-        _ = try await cache.applyManifest(ManifestChain(validating: [page]), scope: scope)
-
-        let restored = try await cache.loadManifestProjection(scope: scope)
-        XCTAssertEqual(restored.revision, 42)
-        let restoredTime = try XCTUnwrap(restored.lastSyncedAt)
-        XCTAssertEqual(restoredTime.timeIntervalSince1970, timestamp, accuracy: 0.001)
-        let label = FreshnessPresentation.resolve(
-            phase: .offline("network unavailable"), manifestFreshness: restored.freshness,
-            lastSyncedAt: restored.lastSyncedAt,
-            now: Date(timeIntervalSince1970: timestamp + 7 * 86_400)
-        )
-        XCTAssertEqual(label.text, "Offline · Last synced 1w ago")
-    }
-
     func testCachePaintRestoresLastOpenedSelectionAndTranscript() async throws {
         let (connection, sessions, chat) = makeGraph()
         let cache = try makeInMemoryCache()

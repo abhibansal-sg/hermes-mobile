@@ -245,156 +245,6 @@ struct RestClient: Sendable {
         return (wrapper.sessions, wrapper.total)
     }
 
-    /// `GET {mobileAPIPrefix}/project-sessions?project_id=<root>` — the plugin's
-    /// hydrated per-project session list, and the CORRECT data source for Project
-    /// detail.
-    ///
-    /// The plugin route folds worktree cwds under the git-common repo root with
-    /// the exact same machinery the `/projects` overview COUNT uses, so the
-    /// returned list matches that count. The stock `GET /api/sessions?cwd_prefix=`
-    /// path (``sessionsWithTotal(cwdPrefix:)``) cannot: a project's `root` is the
-    /// folded git-common repo root, while its sessions run in WORKTREES whose cwds
-    /// are siblings of that root — the `cwd_prefix` LIKE never matches, so the
-    /// detail list comes back empty even though the count is > 0.
-    ///
-    /// Throws `RestError.badStatus(404, …)` on an older gateway that predates the
-    /// plugin route; the caller (``ProjectsStore/refreshSessions(for:)``) then
-    /// falls back to the legacy `cwd_prefix` path.
-    ///
-    /// The wire response is `{"project_id": …, "sessions": [...], "total": N}`.
-    /// A project `root` is arbitrary user-filesystem text, so it is encoded via
-    /// `URLQueryItem`/`URLComponents` with the same literal-`+` hardening as
-    /// ``sessionsWithTotal`` (FastAPI/Starlette decode a raw `+` as a space).
-    func projectSessions(
-        projectId: String
-    ) async throws -> (sessions: [SessionSummary], total: Int?) {
-        var components = URLComponents()
-        components.queryItems = [URLQueryItem(name: "project_id", value: projectId)]
-        let rawQuery = (components.percentEncodedQuery ?? "")
-            .replacingOccurrences(of: "+", with: "%2B")
-        let path = "\(mobileAPIPrefix)/project-sessions?\(rawQuery)"
-        let data = try await get(path: path)
-        struct Wrapper: Decodable {
-            let sessions: [SessionSummary]
-            let total: Int?
-        }
-        let wrapper = try decode(Wrapper.self, from: data, context: "projectSessions")
-        return (wrapper.sessions, wrapper.total)
-    }
-
-    /// `POST {mobileAPIPrefix}/projects` — create a project (name + root path).
-    ///
-    /// The plugin route validates the input and delegates to the stock
-    /// `hermes_cli.projects_db.create_project` (ZERO core patch — the plugin
-    /// imports and calls it). The response is a single ``Project`` entry in the
-    /// same `{id, label, root, session_count}` contract as the overview list, so
-    /// the caller can open the new project immediately.
-    func createProject(name: String, root: String) async throws -> Project {
-        var request = makeRequest(path: "\(mobileAPIPrefix)/projects", method: "POST")
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.httpBody = try encodeBody(
-            .object(["name": .string(name), "root": .string(root)]),
-            context: "createProject"
-        )
-        let data = try await perform(request)
-        return try decode(Project.self, from: data, context: "createProject", strategy: .useDefaultKeys)
-    }
-
-    /// `GET /api/plugins/hermes-mobile/sessions?...&updated_since=cursor` —
-    /// cursor-based session-list delta for the global Recents rail.
-    ///
-    /// Only the hermes-mobile plugin mount serves this endpoint. Legacy clients,
-    /// older plugin builds, transport failures, and malformed responses return
-    /// `nil` so callers can use the stock full-list endpoint without changing the
-    /// existing compatibility chain.
-    func sessionListDelta(
-        limit: Int = 100,
-        minMessages: Int = 1,
-        excludeSource: [String] = [],
-        source: String? = nil,
-        updatedSince: String? = nil
-    ) async -> SessionListDeltaResult? {
-        guard pathStyle == .plugin else { return nil }
-
-        var queryItems: [URLQueryItem] = [
-            URLQueryItem(name: "limit", value: String(limit)),
-            URLQueryItem(name: "order", value: "recent"),
-            URLQueryItem(name: "archived", value: "exclude"),
-        ]
-        if minMessages > 0 {
-            queryItems.append(URLQueryItem(name: "min_messages", value: String(minMessages)))
-        }
-        if !excludeSource.isEmpty {
-            queryItems.append(URLQueryItem(
-                name: "exclude_sources",
-                value: excludeSource.joined(separator: ",")
-            ))
-        }
-        if let source, !source.isEmpty {
-            queryItems.append(URLQueryItem(name: "source", value: source))
-        }
-        if let updatedSince, !updatedSince.isEmpty {
-            queryItems.append(URLQueryItem(name: "updated_since", value: updatedSince))
-        }
-
-        var components = URLComponents()
-        components.queryItems = queryItems
-        // The cursor is opaque and may contain "+". FastAPI treats a literal plus
-        // as a space, so apply the same hardening as `sessionsWithTotal`.
-        let encodedQuery = (components.percentEncodedQuery ?? "")
-            .replacingOccurrences(of: "+", with: "%2B")
-        let path = encodedQuery.isEmpty
-            ? "\(mobileAPIPrefix)/sessions"
-            : "\(mobileAPIPrefix)/sessions?\(encodedQuery)"
-
-        do {
-            let data = try await get(path: path)
-            let root = try decodeJSONValue(from: data, context: "sessionListDelta")
-            guard let cursor = root["cursor"]?.coercedStringValue
-                    ?? root["next_cursor"]?.coercedStringValue
-                    ?? root["updated_through"]?.coercedStringValue,
-                  !cursor.isEmpty,
-                  let rows = root["sessions"]?.arrayValue else {
-                throw RestError.decoding("sessionListDelta: expected sessions[] and cursor")
-            }
-
-            let sessions: [SessionSummary] = try rows.enumerated().map { index, row in
-                guard let decoded: SessionSummary = row.decoded() else {
-                    throw RestError.decoding("sessionListDelta: invalid sessions[\(index)]")
-                }
-                return decoded
-            }
-
-            let tombstoneValues: [JSONValue]
-            if let rawTombstones = root["tombstones"] {
-                guard let array = rawTombstones.arrayValue else {
-                    throw RestError.decoding("sessionListDelta: expected tombstones[]")
-                }
-                tombstoneValues = array
-            } else {
-                tombstoneValues = []
-            }
-            let tombstones: [SessionListTombstone] = try tombstoneValues.enumerated().map { index, item in
-                let id = item.coercedStringValue
-                    ?? item["id"]?.coercedStringValue
-                    ?? item["session_id"]?.coercedStringValue
-                guard let id, !id.isEmpty else {
-                    throw RestError.decoding("sessionListDelta: invalid tombstones[\(index)]")
-                }
-                return SessionListTombstone(id: id)
-            }
-
-            return SessionListDeltaResult(
-                sessions: sessions,
-                tombstones: tombstones,
-                cursor: cursor,
-                total: root["total"]?.intValue
-            )
-        } catch {
-            return nil
-        }
-    }
-
     /// `GET /api/sessions/{id}/messages` — stored transcript for a session.
     ///
     /// The response is either `{"messages": [...]}` or a bare `[...]` array;
@@ -471,7 +321,7 @@ struct RestClient: Sendable {
         }
     }
 
-    /// Outcome of the zero-side-effect ``probeUploadEndpoint()`` capability check.
+    /// Outcome of the zero-side-effect plugin/profile capability checks.
     enum UploadProbeResult: Sendable, Equatable {
         /// `400` — the endpoint exists and rejected the missing multipart field.
         case available
@@ -484,8 +334,7 @@ struct RestClient: Sendable {
     /// Side-effect-free probe of the plugin mount itself (ABH-88): `GET
     /// /api/plugins/hermes-mobile/devices` — an ABSOLUTE path, independent of
     /// this client's ``pathStyle``. A de-patched gateway returns `200` with a
-    /// well-formed `{"devices":[…]}` body (mirrors ``probeDevicesEndpoint``'s
-    /// body check); a pre-de-patch gateway has no plugin mount and returns
+    /// well-formed `{"devices":[…]}` body; a pre-de-patch gateway has no plugin mount and returns
     /// `404`/`405`. Drives ``ServerCapabilities/pluginMount``, which selects
     /// the path family every OTHER mobile call uses.
     func probePluginMountEndpoint() async -> UploadProbeResult {
@@ -506,27 +355,6 @@ struct RestClient: Sendable {
                 return .unavailable
             default:
                 return .inconclusive
-            }
-        } catch {
-            return .inconclusive
-        }
-    }
-
-    /// Side-effect-free probe of `POST <prefix>/upload`: send an EMPTY body and
-    /// classify the status. The patched gateway rejects the absent multipart
-    /// field with `400`; a stock gateway has no route and returns `404`/`405`.
-    /// No file is ever created. Never throws — failures map to `.inconclusive`.
-    func probeUploadEndpoint() async -> UploadProbeResult {
-        let request = makeRequest(path: "\(mobileAPIPrefix)/upload", method: "POST")
-        // No body, no multipart Content-Type: the server sees a request missing
-        // the required `file` field and 400s without writing anything.
-        do {
-            let (_, response) = try await session.data(for: request)
-            guard let http = response as? HTTPURLResponse else { return .inconclusive }
-            switch http.statusCode {
-            case 400: return .available
-            case 404, 405: return .unavailable
-            default: return .inconclusive
             }
         } catch {
             return .inconclusive
@@ -715,7 +543,7 @@ struct RestClient: Sendable {
     /// Decode `data` into a raw ``JSONValue`` with NO key conversion — dynamic
     /// keys (provider slugs, model ids, personality names) must survive verbatim,
     /// which `.convertFromSnakeCase` would rewrite. Used by the control surface's
-    /// `/api/model/options`, `/api/config`, `/api/cron/jobs`, `/api/skills` and by
+    /// `/api/config`, `/api/cron/jobs`, `/api/skills` and by
     /// the bare-array message/export payloads.
     func decodeJSONValue(from data: Data, context: String) throws -> JSONValue {
         do {

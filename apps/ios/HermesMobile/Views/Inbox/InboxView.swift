@@ -31,9 +31,7 @@ struct InboxView: View {
                             item: item, inbox: inbox,
                             sessionTitle: sessionTitle(for: item), theme: theme,
                             authority: FreshnessPresentation.resolve(
-                                phase: connection.phase,
-                                manifestFreshness: sessions.manifestFreshness,
-                                lastSyncedAt: sessions.manifestLastSyncedAt
+                                phase: connection.phase
                             )
                         )
                             .listRowInsets(EdgeInsets(top: 8, leading: 12, bottom: 8, trailing: 12))

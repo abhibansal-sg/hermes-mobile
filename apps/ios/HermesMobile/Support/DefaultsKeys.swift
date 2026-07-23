@@ -93,7 +93,6 @@ enum DefaultsKeys {
 
     /// Encoded session-list delta cursors, partitioned by their full fetch scope.
     /// Owned and restored by ``SessionStore``.
-    static let sessionListDeltaCursors = "hermes.sessionListDeltaCursors"
 
     /// Sentinel value of ``activeProfile`` meaning the cross-profile aggregate
     /// view (matches the server's `profile="all"` wire value).
@@ -106,7 +105,6 @@ enum DefaultsKeys {
 
     /// `String` — a prompt captured by an App Intent while disconnected, replayed
     /// on next launch. Owned by ``PendingIntent``.
-    static let pendingIntentPrompt = "hermes.pendingIntentPrompt"
 
     // MARK: App lock
 

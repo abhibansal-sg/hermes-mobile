@@ -147,11 +147,9 @@ actor WorkRepository {
     }
 
     static func openAppGroup(
-        scope: WorkScope?,
         observation: WorkRepositoryObservation? = nil
     ) async throws -> WorkRepository {
         let repository = try WorkRepository(configuration: .appGroup(), observation: observation)
-        try await repository.importLegacyWork(from: LegacyWorkImportSource(scope: scope))
         try await repository.refreshObservation()
         return repository
     }
@@ -167,7 +165,6 @@ actor WorkRepository {
         kind: WorkIntentKind,
         text: String? = nil,
         scope: WorkScope? = nil,
-        legacyImportKey: String? = nil,
         now: Date = Date()
     ) async throws -> WorkJob {
         try ensureProtectedDataAvailable()
@@ -186,18 +183,11 @@ actor WorkRepository {
             intentKind: kind,
             text: normalizedText,
             expiresAt: now.addingTimeInterval(Self.appIntentLifetime),
-            legacyImportKey: legacyImportKey,
             createdAt: now
         )
         let job = Self.makeJob(input, preparedAssets: [], now: timestamp)
 
         let persisted = try await database.write { db -> WorkJob in
-            if let legacyImportKey,
-               let existing = try WorkJob
-                .filter(Column("legacy_import_key") == legacyImportKey)
-                .fetchOne(db) {
-                return existing
-            }
             try Self.expireAppIntents(db, at: timestamp)
             let activeCount = try Int.fetchOne(
                 db,
@@ -1260,7 +1250,9 @@ actor WorkRepository {
             leaseOwner: nil,
             leaseExpiresAt: nil,
             expiresAt: input.expiresAt?.timeIntervalSince1970,
-            legacyImportKey: input.legacyImportKey,
+            // Retained as a read-compatible tombstone for databases upgraded
+            // from the one-release importer. New jobs never populate it.
+            legacyImportKey: nil,
             createdAt: now,
             updatedAt: now,
             acceptedAt: nil,

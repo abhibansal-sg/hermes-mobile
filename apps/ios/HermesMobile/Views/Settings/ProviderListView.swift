@@ -65,7 +65,7 @@ enum ProviderKeySaveDecision: Equatable {
 /// On a successful key save / custom add / disconnect, the row's auth status
 /// flips locally and `onProvidersChanged` fires so the owner can re-resolve the
 /// running model + repopulate the Model picker (the gateway's
-/// `/api/model/options` reflects the new provider's models).
+/// stock `model.options` reflects the new provider's models).
 struct ProviderListView: View {
     /// The REST client for the active connection (device or shared token — both
     /// accepted by the plugin routes, same as DevicesView).

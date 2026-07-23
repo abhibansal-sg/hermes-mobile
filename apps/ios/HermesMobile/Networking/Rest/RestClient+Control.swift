@@ -12,15 +12,15 @@ import Foundation
 // IMPORTANT decoding note: several of these endpoints return *dynamic* keys
 // (provider slugs, model ids, personality names, per-model capability maps).
 // `JSONDecoder.convertFromSnakeCase` rewrites dictionary keys, which would
-// corrupt those. So the dynamic-key endpoints (`/api/model/options`,
-// `/api/config`, `/api/skills`, `/api/cron/jobs`) are parsed from a raw
+// corrupt those. So dynamic-key endpoints (`/api/config`, `/api/skills`,
+// `/api/cron/jobs`) are parsed from a raw
 // `JSONValue` with explicit field reads, NOT through the snake-case strategy.
 // The fixed-shape endpoints (`/api/model/info`, `/api/analytics/usage`) decode
 // via the snake-case strategy.
 
 // MARK: Model options
 
-/// One provider row from `GET /api/model/options` → `providers[]`.
+/// One provider row from stock `model.options` → `providers[]`.
 /// Mirrors `hermes_cli.inventory.build_models_payload` rows.
 struct ModelProvider: Identifiable, Sendable, Equatable {
     let slug: String
@@ -65,7 +65,7 @@ struct ModelCapability: Sendable, Equatable {
     }
 }
 
-/// Decoded `GET /api/model/options` response.
+/// Decoded stock `model.options` response.
 struct ModelOptions: Sendable, Equatable {
     let providers: [ModelProvider]
     /// The currently configured main model id (may be empty).
@@ -87,14 +87,6 @@ struct ModelInfo: Decodable, Sendable, Equatable {
     let autoContextLength: Int?
     let configContextLength: Int?
     let effectiveContextLength: Int?
-}
-
-/// `POST /api/model/set` result.
-struct ModelSetResult: Decodable, Sendable, Equatable {
-    let ok: Bool?
-    let scope: String?
-    let provider: String?
-    let model: String?
 }
 
 // MARK: Personalities
@@ -584,36 +576,17 @@ struct SkillEntry: Identifiable, Sendable, Equatable {
 // timeout, ``RestError`` mapping) rather than cloning it. The panel views take a
 // ``RestClient`` via init (``ConnectionStore.control``).
 //
-// Fixed-shape responses (`/api/model/info`, `/api/analytics/usage`, `/api/model/set`)
-// decode through `.convertFromSnakeCase`. Dynamic-key responses
-// (`/api/model/options`, `/api/config`, `/api/cron/jobs`, `/api/skills`) parse from
+// Fixed-shape responses (`/api/model/info`, `/api/analytics/usage`) decode
+// through `.convertFromSnakeCase`. Dynamic-key responses
+// (`/api/config`, `/api/cron/jobs`, `/api/skills`) parse from
 // a raw ``JSONValue`` so provider/model/personality keys survive verbatim.
 extension RestClient {
 
     // MARK: Model
 
-    /// `GET /api/model/options` — providers + curated models + capabilities.
-    func modelOptions() async throws -> ModelOptions {
-        ModelOptions(json: try await getJSON(path: "/api/model/options"))
-    }
-
     /// `GET /api/model/info` — resolved metadata for the configured main model.
     func modelInfo() async throws -> ModelInfo {
         try await getDecoded(ModelInfo.self, path: "/api/model/info", context: "model.info")
-    }
-
-    /// `POST /api/model/set` — assign provider/model to the main slot. Applies
-    /// to *new* sessions; the running chat is unaffected (server semantics).
-    @discardableResult
-    func setMainModel(provider: String, model: String) async throws -> ModelSetResult {
-        let body: JSONValue = .object([
-            "scope": .string("main"),
-            "provider": .string(provider),
-            "model": .string(model),
-        ])
-        return try await postDecoded(
-            ModelSetResult.self, path: "/api/model/set", body: body, context: "model.set"
-        )
     }
 
     // MARK: Config / personalities

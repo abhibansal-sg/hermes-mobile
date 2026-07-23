@@ -275,9 +275,7 @@ enum HermesURLRouter {
             if routeToRunningTurnIfNeeded(url, sessions: sessions, chat: chat, inbox: inbox) {
                 return
             }
-            PendingIntentRouter.apply(
-                .newSession, connection: connection, sessions: sessions, chat: chat
-            )
+            sessions.startDraft()
 
         case "session":
             // `hermesapp://session/<storedId>` — the stored id is the first path

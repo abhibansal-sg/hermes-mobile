@@ -1,12 +1,8 @@
 import XCTest
 @testable import HermesMobile
 
-/// F4A-A1 coverage for the `fs` (eager) + `subagentEvents` (passive) capability
-/// fields added to `ServerCapabilities`. The eager `fs` probe needs a live HTTP
-/// round-trip (exercised by the integration gate + `RestClient` decode tests);
-/// here we pin the STATE-MACHINE invariants that don't need a server: the
-/// default tri-state, the passive setters' idempotent transitions, and that
-/// `reset()` clears both new fields back to `.unknown`.
+/// Capability-matrix coverage: one plugin-mount result owns the bundled upload,
+/// file, and device features; profiles remains an independent stock probe.
 @MainActor
 final class ServerCapabilitiesFSTests: XCTestCase {
 
@@ -36,20 +32,70 @@ final class ServerCapabilitiesFSTests: XCTestCase {
         XCTAssertEqual(caps.broadcast, .unknown)
     }
 
-    func testProbeFsResultMapping() async {
-        // The probe shapes its result as the shared UploadProbeResult tri-state;
-        // assert each arm maps to the right capability State the same way the
-        // upload probe does (the switch lives in ServerCapabilities.probeFs, but
-        // its mapping is the contract: available→available, unavailable→
-        // unavailable, inconclusive→unknown). We verify the RestClient probe
-        // classifies an unroutable host as inconclusive (never throws).
+    func testPluginMountControlsBundledCapabilitiesWithOneProbe() async {
+        let config = URLSessionConfiguration.ephemeral
+        config.protocolClasses = [CapabilityMatrixProtocol.self]
+        let session = URLSession(configuration: config)
+        defer { session.invalidateAndCancel() }
         let rest = RestClient(
-            baseURL: URL(string: "http://127.0.0.1:1")!,   // nothing listening
-            token: "t"
+            baseURL: URL(string: "http://gateway.test")!,
+            token: "t",
+            session: session
         )
-        let result = await rest.probeFsEndpoint()
-        // A connection refused / transport failure must classify as inconclusive,
-        // never throw — so a flaky network leaves `fs` at `.unknown` (optimistic).
-        XCTAssertEqual(result, .inconclusive)
+        let caps = ServerCapabilities()
+
+        await caps.probe(serverURL: "http://gateway.test", rest: rest, force: true)
+
+        XCTAssertEqual(caps.pluginMount, .available)
+        XCTAssertEqual(caps.upload, .available)
+        XCTAssertEqual(caps.fs, .available)
+        XCTAssertEqual(caps.devices, .available)
+        XCTAssertEqual(caps.profiles, .unavailable)
+        XCTAssertEqual(
+            Set(CapabilityMatrixProtocol.paths),
+            ["/api/plugins/hermes-mobile/devices", "/api/profiles/sessions"]
+        )
     }
+}
+
+private final class CapabilityMatrixProtocol: URLProtocol, @unchecked Sendable {
+    private static let lock = NSLock()
+    nonisolated(unsafe) private static var recordedPaths: [String] = []
+
+    static var paths: [String] {
+        lock.lock()
+        defer { lock.unlock() }
+        return recordedPaths
+    }
+
+    override class func canInit(with request: URLRequest) -> Bool { true }
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+
+    override func startLoading() {
+        let path = request.url?.path ?? ""
+        Self.lock.lock()
+        Self.recordedPaths.append(path)
+        Self.lock.unlock()
+
+        let status: Int
+        let body: String
+        if path == "/api/plugins/hermes-mobile/devices" {
+            status = 200
+            body = #"{"devices":[]}"#
+        } else {
+            status = 404
+            body = #"{"detail":"not found"}"#
+        }
+        let response = HTTPURLResponse(
+            url: request.url!,
+            statusCode: status,
+            httpVersion: nil,
+            headerFields: ["Content-Type": "application/json"]
+        )!
+        client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+        client?.urlProtocol(self, didLoad: Data(body.utf8))
+        client?.urlProtocolDidFinishLoading(self)
+    }
+
+    override func stopLoading() {}
 }

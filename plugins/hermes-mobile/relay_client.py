@@ -279,10 +279,8 @@ class RelayClient:
             "body": body,
             "source": source,
         }
-        # STR-10A: forward the direct-path actionable metadata (Hermes event
-        # kind, requested APNs category, custom hermes payload) so the relay
-        # can rebuild the same aps.category + hermes envelope direct APNs
-        # sends. All optional so legacy relay servers / callers keep working.
+        # Forward actionable metadata so the relay can build the APNs category
+        # and Hermes payload. All fields stay optional for older relay servers.
         if event_type is not None:
             json_body["event_type"] = event_type
         if category is not None:

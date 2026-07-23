@@ -32,7 +32,7 @@ enum SharedInboxWriter {
             if let configuration {
                 repository = try WorkRepository(configuration: configuration)
             } else {
-                repository = try await WorkRepository.openAppGroup(scope: nil)
+                repository = try await WorkRepository.openAppGroup()
             }
         } catch WorkRepositoryError.appGroupUnavailable {
             throw WriteError.appGroupUnavailable

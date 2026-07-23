@@ -293,28 +293,3 @@ def test_live_activity_endpoint_requires_token(loopback_client, isolated_home):
         json={"token": _LA_TOKEN, "session_id": "s-1"},
     )
     assert r.status_code == 401
-
-
-def test_register_endpoint_persists_events(loopback_client, isolated_home):
-    import json
-    r = loopback_client.post(
-        "/api/plugins/hermes-mobile/push/register",
-        json={"token": _LA_TOKEN, "env": "sandbox",
-              "events": ["approval", "turn_complete"]},
-        headers=_TOKEN_HEADER,
-    )
-    assert r.status_code == 200
-    entries = json.loads((isolated_home / "push_tokens.json").read_text())
-    assert entries[0]["events"] == ["approval", "turn_complete"]
-
-
-def test_register_endpoint_events_optional(loopback_client, isolated_home):
-    import json
-    r = loopback_client.post(
-        "/api/plugins/hermes-mobile/push/register",
-        json={"token": _LA_TOKEN, "env": "sandbox"},
-        headers=_TOKEN_HEADER,
-    )
-    assert r.status_code == 200
-    entries = json.loads((isolated_home / "push_tokens.json").read_text())
-    assert "events" not in entries[0]

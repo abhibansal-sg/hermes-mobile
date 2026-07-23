@@ -5,9 +5,8 @@ import SwiftUI
 /// A deliberately small form: a name field + a root-folder path field (the
 /// project is created on the *Mac* gateway, so the path is a Mac filesystem
 /// path). On submit it calls the injected `create` closure — which routes
-/// through ``ProjectsStore/createProject(name:root:)`` → the plugin
-/// `POST /projects` route → the stock `hermes_cli.projects_db.create_project`
-/// (ZERO core patch) — and on success hands the created ``Project`` back to the
+/// through ``ProjectsStore/createProject(name:root:)`` → the stock
+/// `projects.create` gateway RPC — and on success hands the created ``Project`` back to the
 /// caller (which refreshes + opens it) and dismisses.
 ///
 /// Design language matches the drawer: theme-tokened surfaces, the same

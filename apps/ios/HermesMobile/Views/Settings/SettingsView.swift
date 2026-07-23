@@ -72,7 +72,7 @@ import UserNotifications
 /// **Privacy & Security** (App Lock, Secrets biometric gate, File
 /// @-mentions), **Agent & Panels** (Usage, Automations, Skills, Learning
 /// Journey, Artifacts, Webhooks), **Advanced** (approval-bypass escalation,
-/// Relay Push, Gateway Status, System Logs, Share debug report, the
+/// Gateway Status, System Logs, Share debug report, the
 /// experimental relay-transport toggle), and **About**. Every row from the
 /// prior flat layout remains reachable — only headers, grouping, and a few
 /// jargon-y labels changed; no bindings or behavior moved. Appearance stays
@@ -963,26 +963,6 @@ struct SettingsView: View {
                 .foregroundStyle(theme.mutedFg)
                 .listRowBackground(theme.card)
 
-            // Relay Push (ABH-282 — plugin-mount only). Rendered only once the
-            // hermes-mobile plugin mount is available, because the config
-            // route lives at `/api/plugins/hermes-mobile/relay/config`.
-            if connectionStore.capabilities.pluginMount == .available,
-               let rest = connectionStore.rest {
-                NavigationLink {
-                    RelaySettingsView(rest: rest)
-                        .background(theme.bg)
-                } label: {
-                    SettingsRow(icon: "antenna.radiowaves.left.and.right", title: "Relay Push", value: nil)
-                }
-                .listRowBackground(theme.card)
-                .accessibilityIdentifier("settingsRelayPush")
-
-                Text("Configure the optional relay URL and registration token used for relay push mode.")
-                    .font(.footnote)
-                    .foregroundStyle(theme.mutedFg)
-                    .listRowBackground(theme.card)
-            }
-
             if connectionStore.control != nil {
                 panelLink(.gateway)
                 panelLink(.logs)
@@ -1115,7 +1095,6 @@ struct SettingsView: View {
                     // fast/reasoning controls are shown in Settings.
                     ModelPickerView(
                         control: control,
-                        gatewayClient: connectionStore.client,
                         connectionStore: connectionStore
                     ) {
                         // Keep the running-model chip in sync after a switch made

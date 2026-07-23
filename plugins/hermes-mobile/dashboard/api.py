@@ -43,8 +43,8 @@ import secrets
 import stat
 import sys
 import time
-import urllib.error
 import urllib.parse
+import urllib.error
 import urllib.request
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -246,43 +246,6 @@ def _device_owns_live_activity_session(
     if isinstance(existing_owner, str) and existing_owner:
         return existing_owner == device_id
     return False
-
-
-def _manifest_error(exc: Any) -> JSONResponse:
-    return JSONResponse(
-        status_code=exc.status,
-        content={"error": {
-            "code": exc.code,
-            "message": exc.message,
-            "reset_required": bool(exc.reset),
-            "retry_after_seconds": None,
-        }},
-    )
-
-
-@router.get("/sync/manifest")
-async def sync_manifest(request: Request, scope: str = Query(...), cursor: Optional[str] = None):
-    """Return one immutable page of the plugin-owned mobile sync manifest."""
-    if not _has_dashboard_api_auth(request):
-        return JSONResponse(status_code=401, content={"detail": "Unauthorized"})
-    if _is_device_auth(request) and not _device_has_scope(request, "chat"):
-        sync = _plugin_module("sync_manifest")
-        return _manifest_error(sync.ManifestError(403, "insufficient_scope", "Device token lacks chat scope"))
-    sync = _plugin_module("sync_manifest")
-    device_id = _request_device_id(request)
-    visibility = f"device:{device_id}" if device_id else "shared"
-    engine = _plugin_module("push_engine")
-    try:
-        return sync.build_manifest(
-            scope=scope, cursor=cursor, visibility=visibility,
-            visibility_check=lambda session_id: _device_owns_stored_session(request, session_id),
-            device_registered=sync.device_is_registered(device_id, engine.registry_entries()),
-        )
-    except sync.ManifestError as exc:
-        return _manifest_error(exc)
-    except Exception:
-        _log.exception("sync manifest failed")
-        return _manifest_error(sync.ManifestError(503, "state_unavailable", "Authoritative state could not be snapshotted"))
 
 
 # ---------------------------------------------------------------------------
@@ -1299,23 +1262,18 @@ async def fs_diff(request: Request, session_id: str = "", path: str = ""):
 
 
 # ---------------------------------------------------------------------------
-# APNs push registration (formerly ``hermes_cli.push_notify.router`` mounted
-# at /api/push/*; now plugin-owned at .../push/*). The engine lives in this
-# plugin's ``push_engine.py``; sending stays dormant until HERMES_PUSH_ENABLED
-# + key file (see push_engine module docstring).
+# Push registration. Alert tokens and delivery are relay-owned; the plugin
+# retains only the gateway-event adapter and ActivityKit-specific token path.
 # ---------------------------------------------------------------------------
 
 
 class PushRegisterBody(BaseModel):
     token: str
     platform: str = "ios"
-    env: str = ""  # "sandbox" | "production"; empty → server default
-    # Per-event opt-in subset of ["approval","clarify","turn_complete"].
-    # None/absent → all events (legacy entries keep working).
+    env: str = ""  # "sandbox" | "production"; empty → production
+    # Per-event opt-in subset. None/absent enables all relay push kinds.
     events: Optional[List[str]] = None
-    # Stable per-install device identity (QA-2 R1c): lets the registry keep
-    # ONE token per device (a re-register with a rotated token replaces the
-    # device's old entry). Absent → legacy token-string-only dedup.
+    # Retained for request compatibility; relay registration is token-owned.
     device_id: Optional[str] = None
 
 
@@ -1344,122 +1302,9 @@ class LiveActivityBody(BaseModel):
     env: str = ""  # "sandbox" | "production"; empty → server default
 
 
-class RelayConfigBody(BaseModel):
-    relay_url: Optional[str] = None
-    registration_token: Optional[str] = None
-
-
-def _relay_config_payload() -> Dict[str, Any]:
-    relay = _plugin_module("relay_client")
-    token = relay.relay_registration_token()
-    return {
-        "relay_url": relay.relay_url(),
-        "registration_token_set": bool(token),
-        "registration_token_prefix": token[:8] if token else None,
-        "push_kinds": list(relay.RELAY_PUSH_KINDS),
-    }
-
-
-async def _relay_status_payload(relay: Any) -> Dict[str, Any]:
-    """Return a truthful coarse relay health payload from real local signals."""
-    failure_count = relay.relay_delivery_failure_count()
-    try:
-        tunnel_status = await relay.relay_client().tunnel_status()
-    except Exception as exc:
-        tunnel_status = {"ok": False, "reason": type(exc).__name__}
-        detail = str(exc).strip()
-        if detail:
-            tunnel_status["detail"] = detail
-
-    if failure_count > 0:
-        health = "failing"
-    elif tunnel_status.get("reason") == "tunnel_status_unimplemented":
-        health = "unknown"
-    elif bool(tunnel_status.get("ok") or tunnel_status.get("agent_online")):
-        health = "ok"
-    else:
-        health = "failing"
-
-    return {
-        "configured": True,
-        "health": health,
-        "delivery_failure_count": failure_count,
-        "tunnel_status": tunnel_status,
-    }
-
-
-def _validate_relay_url(raw_url: Optional[str]) -> str | None:
-    value = (raw_url or "").strip().rstrip("/")
-    if not value:
-        return None
-    parsed = urllib.parse.urlparse(value)
-    if parsed.scheme != "https":
-        raise ValueError("relay_url must use https")
-    if not parsed.netloc:
-        raise ValueError("relay_url must include a host")
-    return value
-
-
-@router.get("/relay/config")
-async def get_relay_config(request: Request) -> Dict[str, Any]:
-    """Return relay push configuration without revealing the registration token."""
-    if not _has_dashboard_api_auth(request):
-        raise HTTPException(status_code=401, detail="Unauthorized")
-    if not _device_has_scope(request, "approve"):
-        raise HTTPException(status_code=403, detail="Device token lacks approve scope")
-    return _relay_config_payload()
-
-
-@router.get("/relay/status")
-async def get_relay_status(request: Request) -> Any:
-    """Return the relay's truthful coarse health without probing fake signals."""
-    if not _has_dashboard_api_auth(request):
-        raise HTTPException(status_code=401, detail="Unauthorized")
-    if not _device_has_scope(request, "approve"):
-        raise HTTPException(status_code=403, detail="Device token lacks approve scope")
-
-    relay = _plugin_module("relay_client")
-    if not relay.relay_url_configured():
-        return JSONResponse(
-            status_code=400,
-            content={
-                "configured": False,
-                "health": "unconfigured",
-                "delivery_failure_count": relay.relay_delivery_failure_count(),
-                "detail": "relay URL is not configured",
-            },
-        )
-
-    return await _relay_status_payload(relay)
-
-
-@router.put("/relay/config")
-async def set_relay_config(body: RelayConfigBody, request: Request) -> Any:
-    """Set or clear relay push configuration via relay_client's env storage."""
-    if not _has_dashboard_api_auth(request):
-        raise HTTPException(status_code=401, detail="Unauthorized")
-    if not _device_has_scope(request, "approve"):
-        raise HTTPException(status_code=403, detail="Device token lacks approve scope")
-
-    try:
-        relay_url = _validate_relay_url(body.relay_url)
-    except ValueError as exc:
-        return JSONResponse(status_code=400, content={"error": str(exc), "code": 4001})
-
-    relay = _plugin_module("relay_client")
-    try:
-        relay.set_relay_config(
-            relay_url=relay_url,
-            registration_token=body.registration_token,
-        )
-    except ValueError as exc:
-        return JSONResponse(status_code=400, content={"error": str(exc), "code": 4001})
-    return _relay_config_payload()
-
-
 @router.post("/relay/pair")
 async def pair_relay_device(request: Request) -> Any:
-    """Mint a relay pairing tuple without revealing the agent secret."""
+    """Mint the one mobile pairing link; never expose the agent secret."""
     if not _has_dashboard_api_auth(request):
         raise HTTPException(status_code=401, detail="Unauthorized")
     if not _device_has_scope(request, "approve"):
@@ -1479,33 +1324,20 @@ async def pair_relay_device(request: Request) -> Any:
     except relay.RelayConfigurationError as exc:
         return JSONResponse(status_code=400, content={"error": str(exc), "code": 4001})
 
-    return {
-        "kind": "relay",
+    query = urllib.parse.urlencode({
         "relay": relay_url_value,
         "agent": agent_id,
         "pairing": pairing_secret,
-    }
+        "kind": "relay",
+    })
+    return {"url": f"hermesapp://pair?{query}"}
 
 
-def _relay_test_push_error_detail(exc: Exception) -> str:
-    """Return a user-visible relay delivery error with the real failure class."""
-    message = str(exc).strip()
-    if message:
-        return f"{type(exc).__name__}: {message}"
-    return type(exc).__name__
-
-
-def _relay_device_environment(push_engine: Any, requested_env: str) -> str:
+def _relay_device_environment(requested_env: str) -> str:
     """Resolve the APNs environment for relay device enrollment."""
     if requested_env in ("sandbox", "production"):
         return requested_env
-    config = push_engine.APNsConfig.from_env()
-    return "sandbox" if config.use_sandbox else "production"
-
-
-def _relay_device_bundle_id(push_engine: Any) -> str:
-    """Resolve the APNs bundle id/topic used by direct APNs sends."""
-    return str(push_engine.APNsConfig.from_env().topic)
+    return "production"
 
 
 def _relay_device_preferences(relay: Any, events: Optional[List[str]]) -> Dict[str, bool]:
@@ -1516,89 +1348,32 @@ def _relay_device_preferences(relay: Any, events: Optional[List[str]]) -> Dict[s
     return {kind: kind in wanted for kind in relay.RELAY_PUSH_KINDS}
 
 
-def _record_relay_enrollment_failure(relay: Any) -> None:
-    record = getattr(relay, "_record_delivery_failure", None)
-    if callable(record):
-        record()
-
-
-def _register_relay_device_if_configured(body: PushRegisterBody, push_engine: Any) -> None:
-    relay = None
+async def _register_relay_device(body: PushRegisterBody) -> None:
+    relay = _plugin_module("relay_client")
+    if not relay.relay_url_configured():
+        raise HTTPException(status_code=503, detail="Push relay is not configured")
     try:
-        relay = _plugin_module("relay_client")
-        if not relay.relay_url_configured():
-            return
-        relay.register_device_background(
+        await relay.relay_client().register_device(
             token=body.token,
             platform=body.platform,
-            environment=_relay_device_environment(push_engine, body.env),
-            bundle_id=_relay_device_bundle_id(push_engine),
+            environment=_relay_device_environment(body.env),
+            bundle_id="ai.hermes.app",
             preferences=_relay_device_preferences(relay, body.events),
         )
     except Exception as exc:
-        if relay is not None:
-            _record_relay_enrollment_failure(relay)
         _log.warning("Hermes relay device enrollment failed: %s", exc, exc_info=True)
+        raise HTTPException(status_code=503, detail="Push relay enrollment failed") from exc
 
 
-def _unregister_relay_device_if_configured(body: PushUnregisterBody) -> None:
-    relay = None
-    try:
-        relay = _plugin_module("relay_client")
-        if not relay.relay_url_configured():
-            return
-        relay.unregister_device_background(token=body.token)
-    except Exception as exc:
-        if relay is not None:
-            _record_relay_enrollment_failure(relay)
-        _log.warning("Hermes relay device unenrollment failed: %s", exc, exc_info=True)
-
-
-@router.post("/relay/test-push")
-async def test_relay_push(request: Request) -> Any:
-    """Synchronously test the configured push transport and report truthfully."""
-    if not _has_dashboard_api_auth(request):
-        raise HTTPException(status_code=401, detail="Unauthorized")
-    if not _device_has_scope(request, "approve"):
-        raise HTTPException(status_code=403, detail="Device token lacks approve scope")
-
-    engine = _plugin_module("push_engine")
-    if engine.direct_apns_test_push_available():
-        accepted = engine.send_direct_apns_test_push()
-        if accepted > 0:
-            return {
-                "ok": True,
-                "transport": "direct_apns",
-                "detail": "sent via direct APNs",
-            }
-        return {
-            "ok": False,
-            "transport": "direct_apns",
-            "detail": "direct APNs test push was not accepted",
-        }
-
+async def _unregister_relay_device(body: PushUnregisterBody) -> None:
     relay = _plugin_module("relay_client")
     if not relay.relay_url_configured():
-        return {"ok": False, "transport": "none", "detail": "no push configured"}
-
+        raise HTTPException(status_code=503, detail="Push relay is not configured")
     try:
-        await relay.relay_client().send_event(
-            kind="attention",
-            session_id=None,
-            title="Hermes test push",
-            body="Relay push delivery test from Hermes Mobile settings.",
-            source="relay_test_push",
-        )
-    except relay.RelayConfigurationError:
-        return {"ok": False, "transport": "none", "detail": "no push configured"}
+        await relay.relay_client().unregister_device(token=body.token)
     except Exception as exc:
-        return {
-            "ok": False,
-            "transport": "relay",
-            "detail": _relay_test_push_error_detail(exc),
-        }
-
-    return {"ok": True, "transport": "relay", "detail": "sent via relay"}
+        _log.warning("Hermes relay device unenrollment failed: %s", exc, exc_info=True)
+        raise HTTPException(status_code=503, detail="Push relay unenrollment failed") from exc
 
 
 @router.post("/push/register")
@@ -1606,21 +1381,7 @@ async def register_push_token(body: PushRegisterBody, request: Request) -> Dict[
     """Register an iOS APNs device token for server push."""
     if not _has_dashboard_api_auth(request):
         raise HTTPException(status_code=401, detail="Unauthorized")
-    engine = _plugin_module("push_engine")
-    # QA-2 R1c: the client's own stable device id wins (it survives re-pair
-    # and is the identity iOS sends over the relay socket too); the
-    # request-state device identity is the legacy fallback.
-    device_id = (body.device_id or "").strip() or _request_device_id(request)
-    if not engine.register_token(
-        body.token, platform=body.platform, env=body.env, events=body.events,
-        device_id=device_id,
-    ):
-        raise HTTPException(status_code=400, detail="Invalid device token")
-    try:
-        _plugin_module("manifest_invalidation").invalidate("all", "push_registry")
-    except Exception:
-        _log.warning("push registration invalidation failed", exc_info=True)
-    _register_relay_device_if_configured(body, engine)
+    await _register_relay_device(body)
     return {"ok": True}
 
 
@@ -1650,15 +1411,8 @@ async def unregister_push_token(body: PushUnregisterBody, request: Request) -> D
     """Unregister a previously-registered device token."""
     if not _has_dashboard_api_auth(request):
         raise HTTPException(status_code=401, detail="Unauthorized")
-    engine = _plugin_module("push_engine")
-    removed = engine.unregister_token(body.token)
-    if removed:
-        try:
-            _plugin_module("manifest_invalidation").invalidate("all", "push_registry")
-        except Exception:
-            _log.warning("push registration invalidation failed", exc_info=True)
-    _unregister_relay_device_if_configured(body)
-    return {"ok": True, "removed": removed}
+    await _unregister_relay_device(body)
+    return {"ok": True, "removed": True}
 
 
 @router.post("/push/live-activity")
@@ -2589,323 +2343,6 @@ async def artifacts_gallery(
         "total_capped": payload["total_capped"],
         "offset": offset,
     }
-
-
-# ---------------------------------------------------------------------------
-# Projects overview (ABH-350) — read-only list mirroring the desktop's projects
-# tab. The desktop derives projects by merging filesystem-scanned git repo roots
-# with session-derived repo roots (tui_gateway.server._discover_repos_payload).
-# Rather than recompute that scan here, we PROXY the gateway's payload and
-# reshape it to the {id, label, root, session_count} contract the iOS Projects
-# tab consumes. The gateway already junk-filters (hermes home + bare home); we
-# re-apply the same filter defensively so a future change upstream cannot leak
-# junk through this surface.
-# ---------------------------------------------------------------------------
-
-def _is_project_junk(root: str) -> bool:
-    """True for roots we never surface as a project.
-
-    Mirrors ``tui_gateway.server._is_repo_junk``: the bare home dir and the
-    hermes-home subtree are config/sessions/skills stores, not workspaces.
-    """
-    if not root:
-        return True
-    from hermes_constants import get_hermes_home
-
-    real = os.path.realpath(root)
-    home = os.path.realpath(os.path.expanduser("~"))
-    hermes_home = os.path.realpath(str(get_hermes_home()))
-    return real == home or real == hermes_home or real.startswith(
-        hermes_home + os.sep
-    )
-
-
-@router.get("/projects")
-async def projects_overview(request: Request) -> List[Dict[str, Any]]:
-    """Read-only projects overview for the iOS Projects tab.
-
-    Proxies ``tui_gateway.server._discover_repos_payload`` (the same merge of
-    filesystem-scanned + session-derived git repo roots the desktop uses) and
-    reshapes each entry to ``{id, label, root, session_count}``, then UNIONs the
-    explicit ``projects_db`` projects (``pdb.list_projects``) so a freshly
-    created zero-session project is visible immediately.
-
-    ``id`` is the repo root path (stable identity, matching how desktop keys
-    project entries — and how ``POST /projects`` keys its return value, the
-    normalized ``primary_path``). ``session_count`` is the number of sessions
-    whose cwd resolved to that repo root. Junk-filtered (no ~/.hermes, no bare
-    home).
-
-    Why the union is needed: ``_discover_repos_payload`` derives roots from
-    session cwds ∪ filesystem-scanned git repos — neither of which sees a brand
-    new project whose folder is empty / has no sessions yet. Without merging
-    ``list_projects``, ``POST /projects`` would create a row the overview never
-    surfaces, so the client lands on the empty detail and the project vanishes
-    on Back until a session actually runs under that root (STR / wave25-b2).
-    """
-    if not _has_dashboard_api_auth(request):
-        raise HTTPException(status_code=401, detail="Unauthorized")
-
-    # Proxy the gateway's payload — reuse, do not recompute the scan.
-    repos: List[Dict[str, Any]] = []
-    try:
-        from tui_gateway.server import _discover_repos_payload
-        from hermes_state import SessionDB
-
-        db = SessionDB(read_only=True)
-        repos = _discover_repos_payload(db, backfill=False)
-    except Exception as exc:
-        _log.debug("projects overview: gateway payload unavailable: %s", exc)
-        repos = []
-
-    out: List[Dict[str, Any]] = []
-    seen_roots: set[str] = set()
-    for entry in repos or []:
-        root = str(entry.get("root") or "")
-        if not root or _is_project_junk(root):
-            continue
-        real = os.path.realpath(root)
-        if real in seen_roots:
-            continue
-        seen_roots.add(real)
-        label = str(entry.get("label") or os.path.basename(root.rstrip("/\\")) or root)
-        out.append(
-            {
-                "id": root,
-                "label": label,
-                "root": root,
-                "session_count": int(entry.get("sessions") or 0),
-            }
-        )
-
-    # UNION the explicit projects_db projects that the session/filesystem scan
-    # did not already surface. A newly created project has zero sessions and may
-    # point at an empty/not-yet-existing folder, so it is otherwise invisible.
-    # Its root is the normalized ``primary_path`` — the exact id ``POST
-    # /projects`` returns — so re-opening it hits the same server-owned detail
-    # query path. Defensive: a projects_db read failure must not blank the
-    # (already-built) discovered overview.
-    try:
-        from hermes_cli import projects_db as pdb
-
-        with pdb.connect_closing() as conn:
-            db_projects = pdb.list_projects(conn)
-    except Exception as exc:
-        _log.debug("projects overview: projects_db unavailable: %s", exc)
-        db_projects = []
-
-    for project in db_projects or []:
-        root = str(getattr(project, "primary_path", None) or "")
-        if not root:
-            folders = getattr(project, "folders", None) or []
-            root = str(getattr(folders[0], "path", "")) if folders else ""
-        if not root or _is_project_junk(root):
-            continue
-        real = os.path.realpath(root)
-        if real in seen_roots:
-            continue
-        seen_roots.add(real)
-        label = str(
-            getattr(project, "name", None)
-            or os.path.basename(root.rstrip("/\\"))
-            or root
-        )
-        out.append(
-            {
-                "id": root,
-                "label": label,
-                "root": root,
-                "session_count": 0,
-            }
-        )
-    return out
-
-
-class CreateProjectBody(BaseModel):
-    """Request body for ``POST /projects``: a project name + its root folder."""
-
-    name: str
-    root: str
-
-
-@router.post("/projects")
-async def create_project_route(body: CreateProjectBody, request: Request) -> Dict[str, Any]:
-    """Create a project from the iOS Projects tab (name + root path).
-
-    ZERO-CORE-PATCH: delegates to the stock
-    ``hermes_cli.projects_db.create_project`` (imported + called, never edited)
-    so mobile project creation is identical to the desktop's. Returns the new
-    project reshaped to the SAME ``{id, label, root, session_count}`` contract
-    as the ``/projects`` overview — ``id`` is the normalized root path, matching
-    how overview entries are keyed — so the client can open it immediately.
-
-    Validation: 401 without a session token, 400 on an empty name / empty root
-    or a root that exists but is not a directory.
-    """
-    if not _has_dashboard_api_auth(request):
-        raise HTTPException(status_code=401, detail="Unauthorized")
-
-    name = str(body.name or "").strip()
-    if not name:
-        raise HTTPException(status_code=400, detail="Project name is required")
-    raw_root = str(body.root or "").strip()
-    if not raw_root:
-        raise HTTPException(status_code=400, detail="Root folder path is required")
-
-    root = os.path.abspath(os.path.expanduser(raw_root)).rstrip("/\\") or raw_root
-    # Reject a path that exists but is a file — a project root must be a folder.
-    # A not-yet-existing path is allowed (create_project just records it).
-    if os.path.exists(root) and not os.path.isdir(root):
-        raise HTTPException(status_code=400, detail="Root path is not a directory")
-
-    try:
-        from hermes_cli import projects_db as pdb
-
-        with pdb.connect_closing() as conn:
-            pdb.create_project(conn, name=name, primary_path=root)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
-    except HTTPException:
-        raise
-    except Exception as exc:  # pragma: no cover - unexpected backend failure
-        _log.debug("create project failed", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Create project failed: {exc}")
-
-    return {
-        "id": root,
-        "label": name,
-        "root": root,
-        "session_count": 0,
-    }
-
-
-def _flatten_project_sessions(project: Dict[str, Any]) -> List[Dict[str, Any]]:
-    sessions: List[Dict[str, Any]] = []
-    for repo in project.get("repos") or []:
-        for group in repo.get("groups") or []:
-            for session in group.get("sessions") or []:
-                if isinstance(session, dict):
-                    sessions.append(session)
-    return sessions
-
-
-def _project_sessions_server_fallback(
-    db: Any, project_id: str, session_limit: int
-) -> Dict[str, Any]:
-    """Server-owned sessions/count for a project root the desktop tree missed.
-
-    ``GET /projects`` surfaces repo roots from
-    ``tui_gateway.server._discover_repos_payload`` (session-derived ∪
-    filesystem-discovered). The ``_build_project_tree(... include_discovered=False
-    ...)`` drill-in path only carries projects whose id is either an explicit
-    ``projects_db`` id (Tier 1, which may own a repo root's sessions under a
-    *different* id) or a Tier-2 auto root with unowned sessions. A repo root
-    visible in ``/projects`` can therefore be absent from the tree — this
-    fallback answers it directly from ``SessionDB`` so every ``/projects`` id
-    has a server-owned detail query path.
-
-    Mirrors the desktop lane's filtering (``_project_tree_inputs``): exclude
-    cron, exclude non-listable children, require non-empty human sessions,
-    order by recent activity. ``total`` comes from
-    ``session_count(... exclude_children=True ...)`` so it is authoritative and
-    may exceed the returned rows when ``session_limit`` caps the page. Rows are
-    projected through ``_project_tree_row`` to match the hydrated desktop-lane
-    session shape exactly.
-    """
-    empty: Dict[str, Any] = {"project_id": project_id, "sessions": [], "total": 0}
-    if db is None:
-        return empty
-    try:
-        from tui_gateway.server import (
-            _PROJECT_TREE_EXCLUDED_SOURCES,
-            _project_tree_row,
-        )
-
-        rows = db.list_sessions_rich(
-            cwd_prefix=project_id,
-            limit=session_limit,
-            offset=0,
-            order_by_last_active=True,
-            min_message_count=1,
-            include_children=False,
-            exclude_sources=_PROJECT_TREE_EXCLUDED_SOURCES,
-            include_archived=False,
-        )
-        total = db.session_count(
-            cwd_prefix=project_id,
-            exclude_children=True,
-            exclude_sources=_PROJECT_TREE_EXCLUDED_SOURCES,
-            min_message_count=1,
-            include_archived=False,
-        )
-    except Exception as exc:
-        _log.debug("project sessions: server fallback unavailable: %s", exc)
-        return empty
-
-    sessions = [_project_tree_row(r) for r in rows or []]
-    return {
-        "project_id": project_id,
-        "sessions": sessions,
-        "total": int(total or 0),
-    }
-
-
-@router.get("/project-sessions")
-async def project_sessions(
-    request: Request,
-    project_id: Annotated[str, Query(min_length=1)],
-    session_limit: Annotated[int, Query(ge=1, le=20000)] = 5000,
-) -> Dict[str, Any]:
-    """Hydrated sessions for one project, with server-owned parity for every
-    ``/projects``-visible root.
-
-    Primary path: delegate membership, counts, lane ordering, worktree folding,
-    child filtering, and cron exclusion to the same
-    ``tui_gateway.server._build_project_tree(... hydrate=True ...)`` machinery
-    used by the desktop ``projects.project_sessions`` RPC, then flatten the
-    hydrated lanes into a compact REST shape.
-
-    Parity fallback: ``GET /projects`` can surface a repo root whose sessions
-    the ``include_discovered=False`` tree does not carry under that id (e.g. a
-    root whose sessions are owned by an explicit ``projects_db`` project). When
-    the tree lookup misses, fall back to a direct ``SessionDB`` query scoped to
-    the root so the root is never returned empty/truncated just because it is
-    not an explicit project. ``total`` is the authoritative server count and
-    may exceed the returned rows.
-    """
-    if not _has_dashboard_api_auth(request):
-        raise HTTPException(status_code=401, detail="Unauthorized")
-
-    db = None
-    tree: Dict[str, Any] = {"projects": []}
-    try:
-        from hermes_state import SessionDB
-        from tui_gateway.server import _build_project_tree
-
-        db = SessionDB(read_only=True)
-        tree, _active = _build_project_tree(
-            db,
-            preview_limit=0,
-            hydrate=True,
-            session_limit=session_limit,
-            include_discovered=False,
-        )
-    except Exception as exc:
-        _log.debug("project sessions: gateway tree unavailable: %s", exc)
-
-    project = next(
-        (p for p in tree.get("projects", []) if p.get("id") == project_id),
-        None,
-    )
-    if project is not None:
-        sessions = _flatten_project_sessions(project)
-        return {
-            "project_id": project_id,
-            "sessions": sessions,
-            "total": int(project.get("sessionCount") or len(sessions)),
-        }
-
-    return _project_sessions_server_fallback(db, project_id, session_limit)
 
 
 # ---------------------------------------------------------------------------

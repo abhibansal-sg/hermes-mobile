@@ -3,9 +3,8 @@ import Foundation
 /// A request handed from an App Intent (or Siri shortcut) to the running app.
 ///
 /// App Intents run in a separate process and never open a gateway connection.
-/// Current invocations enqueue independent rows in ``WorkRepository`` before
-/// foregrounding the app. The property-list encoding below is retained only as
-/// a one-release migration bridge for requests written by the previous version.
+/// Invocations enqueue independent rows in ``WorkRepository`` before
+/// foregrounding the app.
 enum PendingIntent: Equatable, Sendable {
     /// Open the app to a brand-new session with `prompt` prefilled and sent.
     case ask(prompt: String)
@@ -43,82 +42,6 @@ enum PendingIntent: Equatable, Sendable {
         )
     }
 
-    // MARK: - Legacy UserDefaults contract
-
-    private static let kindKey = "kind"
-    private static let promptKey = "prompt"
-
-    private static let kindAsk = "ask"
-    private static let kindOpenSessions = "openSessions"
-    private static let kindNewSession = "newSession"
-
-    /// The dictionary persisted to `UserDefaults`. Plain property-list types only
-    /// (`String`), so it round-trips through `UserDefaults` and an App Group with
-    /// no transformer.
-    var storageValue: [String: String] {
-        switch self {
-        case .ask(let prompt):
-            return [Self.kindKey: Self.kindAsk, Self.promptKey: prompt]
-        case .openSessions:
-            return [Self.kindKey: Self.kindOpenSessions]
-        case .newSession:
-            return [Self.kindKey: Self.kindNewSession]
-        }
-    }
-
-    /// Reconstruct a request from the persisted dictionary, or `nil` if the blob
-    /// is absent/malformed. An `ask` with an empty prompt is treated as malformed
-    /// (there is nothing to send) and yields `nil`.
-    init?(storageValue: [String: String]) {
-        guard let kind = storageValue[Self.kindKey] else { return nil }
-        switch kind {
-        case Self.kindAsk:
-            let prompt = (storageValue[Self.promptKey] ?? "")
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !prompt.isEmpty else { return nil }
-            self = .ask(prompt: prompt)
-        case Self.kindOpenSessions:
-            self = .openSessions
-        case Self.kindNewSession:
-            self = .newSession
-        default:
-            return nil
-        }
-    }
-
-    // MARK: - Persistence
-
-    /// Park a request in the previous version's single-slot handoff.
-    ///
-    /// New App Intent code must use ``enqueue(in:scope:now:)``. This overwrite-only
-    /// API remains solely for retrying/migrating requests created by the old app.
-    func park(in defaults: UserDefaults = .standard) {
-        defaults.set(storageValue, forKey: DefaultsKeys.pendingIntentPrompt)
-    }
-
-    /// Read and clear the parked request atomically (best-effort: `UserDefaults`
-    /// has no transaction, but the app drains on the main actor so there is no
-    /// concurrent reader). Returns `nil` when nothing is pending.
-    static func takePending(from defaults: UserDefaults = .standard) -> PendingIntent? {
-        guard let raw = defaults.dictionary(forKey: DefaultsKeys.pendingIntentPrompt) as? [String: String] else {
-            // A stale value of the wrong type should not wedge the slot.
-            if defaults.object(forKey: DefaultsKeys.pendingIntentPrompt) != nil {
-                defaults.removeObject(forKey: DefaultsKeys.pendingIntentPrompt)
-            }
-            return nil
-        }
-        defaults.removeObject(forKey: DefaultsKeys.pendingIntentPrompt)
-        return PendingIntent(storageValue: raw)
-    }
-
-
-    static func clearPending(from defaults: UserDefaults = .standard) {
-        defaults.removeObject(forKey: DefaultsKeys.pendingIntentPrompt)
-    }
-
-    static func flushPendingStorage(from defaults: UserDefaults = .standard) {
-        _ = defaults.synchronize()
-    }
 }
 
 struct GatewayCleanupTombstone: Codable, Equatable, Sendable {

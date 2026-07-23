@@ -199,9 +199,6 @@ final class AppEnvironment {
         )
         queueStore.installProcessor(outboxProcessor)
         Task {
-            try? await workRepository.importLegacyWork(
-                from: LegacyWorkImportSource(scope: sessionStore.durableWorkScope)
-            )
             _ = try? await workRepository.cleanupShareWork()
             if let scope = sessionStore.durableWorkScope {
                 try? await workRepository.bindPendingShares(to: scope)
@@ -209,7 +206,7 @@ final class AppEnvironment {
             await queueStore.refresh()
             queueStore.wake()
         }
-        // ABH-351: ProjectsStore needs REST access (the /projects route) —
+        // ProjectsStore uses the stock project RPCs on the gateway connection —
         // injected after ConnectionStore is built, same pattern as the others.
         projectsStore.attach(connection: connectionStore)
         // Offline-first cache (P3): build the ONE CacheStore actor and inject it
@@ -399,9 +396,6 @@ final class AppEnvironment {
             suspendOutbox: { [weak queueStore] in
                 await queueStore?.suspendForBackground()
             },
-            flushSyncCursor: { [weak sessionStore] in
-                sessionStore?.flushSessionListDeltaCursors()
-            },
             flushWidgetSnapshot: { [weak connectionStore] in
                 var patch = WidgetSnapshotWriter.Patch()
                 if case .connected = connectionStore?.phase {
@@ -414,7 +408,6 @@ final class AppEnvironment {
                 WidgetSnapshotWriter.flush()
             },
             flushPendingNavigation: { [weak workRepository] in
-                PendingIntent.flushPendingStorage()
                 try? await workRepository?.flushForBackground()
             }
         ))

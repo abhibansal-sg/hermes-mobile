@@ -326,55 +326,6 @@ final class ProviderKeyRestTests: XCTestCase {
         XCTAssertEqual(disconnected.apiMode, .anthropicMessages, "apiMode must survive disconnect")
     }
 
-    func testProviderListDisconnectUsesProviderRowCopy() throws {
-        let providerListURL = URL(fileURLWithPath: #filePath)
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
-            .appendingPathComponent("HermesMobile/Views/Settings/ProviderListView.swift")
-        let source = try String(contentsOf: providerListURL, encoding: .utf8)
-
-        guard let signature = source.range(of: "private func disconnect(_ provider: ProviderRow) async") else {
-            return XCTFail("ProviderListView.disconnect(_:) not found")
-        }
-        guard let bodyStart = source[signature.upperBound...].firstIndex(of: "{") else {
-            return XCTFail("ProviderListView.disconnect(_:) body not found")
-        }
-
-        var depth = 0
-        var bodyEnd: String.Index?
-        var index = bodyStart
-        while index < source.endIndex {
-            switch source[index] {
-            case "{":
-                depth += 1
-            case "}":
-                depth -= 1
-                if depth == 0 {
-                    bodyEnd = index
-                    index = source.endIndex
-                    continue
-                }
-            default:
-                break
-            }
-            index = source.index(after: index)
-        }
-
-        guard let bodyEnd else {
-            return XCTFail("ProviderListView.disconnect(_:) body end not found")
-        }
-
-        let body = String(source[bodyStart...bodyEnd])
-        XCTAssertTrue(
-            body.contains("rows[index] = existing.copy(isCurrent: false, authenticated: false)"),
-            "disconnect must preserve ProviderRow metadata through ProviderRow.copy"
-        )
-        XCTAssertFalse(
-            body.contains("ProviderRow("),
-            "disconnect must not manually rebuild ProviderRow and drop custom metadata"
-        )
-    }
-
     func testProviderRowCopyWithNilOverrides() {
         let row = ProviderRow(
             slug: "x", name: "X", authType: .apiKey, isCurrent: true,
