@@ -416,6 +416,46 @@ final class ChatFlowUITests: XCTestCase {
         add(attachment)
     }
 
+    func testProjectsTabLoadsAndNewProjectSheetOpens() throws {
+        let env = ProcessInfo.processInfo.environment
+        guard let url = env["HERMES_URL"], let token = env["HERMES_TOKEN"],
+              !url.isEmpty, !token.isEmpty else {
+            throw XCTSkip("HERMES_URL/HERMES_TOKEN not provided; skipping live test")
+        }
+
+        let app = XCUIApplication()
+        app.launchEnvironment["HERMES_URL"] = url
+        app.launchEnvironment["HERMES_TOKEN"] = token
+        if let relayURL = env["HERMES_RELAY_URL"], !relayURL.isEmpty {
+            app.launchEnvironment["HERMES_RELAY_URL"] = relayURL
+        }
+        app.launchArguments += ["--uitest-mute-audio"]
+        app.launch()
+
+        let drawerToggle = app.buttons["drawerToggle"]
+        XCTAssertTrue(drawerToggle.waitForExistence(timeout: 30))
+        drawerToggle.tap()
+
+        let tabs = app.segmentedControls["drawerTabToggle"]
+        XCTAssertTrue(tabs.waitForExistence(timeout: 15), "Drawer section control missing")
+        tabs.buttons["Projects"].tap()
+
+        let projectRow = app.buttons["projectRow"].firstMatch
+        let emptyState = app.staticTexts["No projects found"]
+        XCTAssertTrue(
+            projectRow.waitForExistence(timeout: 15) || emptyState.waitForExistence(timeout: 5),
+            "Projects route produced neither content nor its honest empty state"
+        )
+        XCTAssertFalse(app.staticTexts["Couldn't load projects"].exists)
+
+        let newProject = app.buttons["drawerNewProject"]
+        XCTAssertTrue(newProject.waitForExistence(timeout: 10))
+        newProject.tap()
+        XCTAssertTrue(app.textFields["newProjectName"].waitForExistence(timeout: 10))
+        XCTAssertTrue(app.textFields["newProjectRoot"].exists)
+        app.buttons["newProjectCancel"].tap()
+    }
+
     /// BUG 2 (hotfix): the open-drawer swipe works from mid-screen with
     /// horizontal-dominance activation (the open-start zone now spans the leading
     /// 50% of the width). Drive a horizontal XCUICoordinate drag starting at
