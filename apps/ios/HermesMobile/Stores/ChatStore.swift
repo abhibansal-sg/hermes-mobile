@@ -2322,8 +2322,12 @@ final class ChatStore {
               messages[index].role == .user else { return }
         let text = messages[index].text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else { return }
-        let ordinal = userOrdinal(at: index)
-        await submitTruncating(text: text, truncateBeforeUserOrdinal: ordinal, truncateFromIndex: index)
+        guard let target = await truncationTarget(for: messageId) else { return }
+        await submitTruncating(
+            text: text,
+            truncateBeforeUserOrdinal: target.ordinal,
+            truncateFromIndex: target.index
+        )
     }
 
     /// Build the `messages[]` seed for a branch-in-new-chat from the transcript
@@ -2961,8 +2965,12 @@ final class ChatStore {
         }
         guard let index = messages.firstIndex(where: { $0.id == messageId }),
               messages[index].role == .user else { return }
-        let ordinal = userOrdinal(at: index)
-        await submitTruncating(text: trimmed, truncateBeforeUserOrdinal: ordinal, truncateFromIndex: index)
+        guard let target = await truncationTarget(for: messageId) else { return }
+        await submitTruncating(
+            text: trimmed,
+            truncateBeforeUserOrdinal: target.ordinal,
+            truncateFromIndex: target.index
+        )
     }
 
     /// Re-run the turn that produced `assistantId`: find the user message that
@@ -2978,8 +2986,39 @@ final class ChatStore {
         guard let userIndex = messages[..<assistantIndex].lastIndex(where: { $0.role == .user }) else { return }
         let text = messages[userIndex].text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else { return }
-        let ordinal = userOrdinal(at: userIndex)
-        await submitTruncating(text: text, truncateBeforeUserOrdinal: ordinal, truncateFromIndex: userIndex)
+        let userMessageId = messages[userIndex].id
+        guard let target = await truncationTarget(for: userMessageId) else { return }
+        await submitTruncating(
+            text: text,
+            truncateBeforeUserOrdinal: target.ordinal,
+            truncateFromIndex: target.index
+        )
+    }
+
+    /// Resolve a destructive edit/retry target against a complete, contiguous
+    /// transcript. The visible array is intentionally a lazy tail, so its
+    /// positional user count is not safe to send as the gateway's absolute
+    /// `truncate_before_user_ordinal` until every earlier page is present.
+    ///
+    /// This runs only after the user explicitly chooses edit/retry/restore.
+    /// Normal session opens stay lazy. If an older page cannot be fetched (or a
+    /// sparse jump window has no contiguous paging cursor), fail closed instead
+    /// of truncating the wrong server turn.
+    func truncationTarget(for messageId: UUID) async -> (index: Int, ordinal: Int)? {
+        while transcriptHasMoreBefore {
+            let previousCount = messages.count
+            await loadEarlierTranscript()
+            guard messages.count > previousCount else {
+                lastError = "Couldn’t load the complete history. Try again."
+                return nil
+            }
+        }
+        guard let index = messages.firstIndex(where: { $0.id == messageId }),
+              messages[index].role == .user else {
+            lastError = "That message is no longer available."
+            return nil
+        }
+        return (index, userOrdinal(at: index))
     }
 
     /// Zero-based ordinal of the user message at `index`: its cached value if
@@ -3576,7 +3615,11 @@ final class ChatStore {
         guard limit > 0 else { return }
         isLoadingEarlierTranscript = true
         defer { isLoadingEarlierTranscript = false }
-        guard let page = await fetch(storedId, limit, pageCursor) else { return }
+        lastError = nil
+        guard let page = await fetch(storedId, limit, pageCursor) else {
+            lastError = "Couldn’t load earlier messages."
+            return
+        }
         if !page.messages.isEmpty {
             let older = Self.toChatMessages(page.messages)
             let existing = Set(messages.map(\.id))

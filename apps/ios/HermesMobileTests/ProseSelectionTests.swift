@@ -28,6 +28,68 @@ final class ProseSelectionTests: XCTestCase {
 
     // MARK: - Runtime hierarchy contract (fail-before / pass-after)
 
+    /// Physical-device ABH-519 regression. The phone and gateway held these
+    /// exact 4,034 characters, but the first mounted TextKit 2 viewport stopped
+    /// drawing after the "10" list marker. Switching sessions remounted the
+    /// same bytes and then drew the tail. Long prose is externally scrolled by
+    /// SwiftUI, so its TextKit manager must lay out the complete document rather
+    /// than treating the embedded non-scrolling text view as a lazy viewport.
+    func testDeviceLongProseUsesCompleteDocumentLayout() throws {
+        struct Fixture: Decodable {
+            let assistantContentLength: Int
+            let expectedVisibleTail: String
+            let assistantContent: String
+        }
+
+        let url = try XCTUnwrap(
+            Bundle(for: Self.self).url(
+                forResource: "ios_fix_long_prose",
+                withExtension: "json"
+            )
+        )
+        let decoder = JSONDecoder()
+        decoder.keyDecodingStrategy = .convertFromSnakeCase
+        let fixture = try decoder.decode(
+            Fixture.self,
+            from: Data(contentsOf: url)
+        )
+        XCTAssertEqual(fixture.assistantContent.count, fixture.assistantContentLength)
+
+        let message = ChatMessage(
+            role: .assistant,
+            text: fixture.assistantContent,
+            isStreaming: false
+        )
+        let textView = try XCTUnwrap(hostedTextViews(bubble(message)).first)
+
+        let proseView = try XCTUnwrap(textView as? ProseTextView)
+        XCTAssertTrue(
+            proseView.didEnsureCompleteDocumentLayout,
+            "a non-scrolling long prose document nested in SwiftUI ScrollView must lay out its complete TextKit document range"
+        )
+        let layoutManager = try XCTUnwrap(proseView.textLayoutManager)
+        let contentManager = try XCTUnwrap(layoutManager.textContentManager)
+        let tailLocation = try XCTUnwrap(
+            contentManager.location(
+                contentManager.documentRange.endLocation,
+                offsetBy: -1
+            )
+        )
+        XCTAssertNotNil(
+            layoutManager.textLayoutFragment(for: tailLocation),
+            "the physical-device fixture's final character must have a realized TextKit layout fragment on first mount"
+        )
+        XCTAssertTrue(
+            textView.attributedText.string.hasSuffix(fixture.expectedVisibleTail),
+            "the mounted selection surface must retain the physical-device fixture's final sentence"
+        )
+        XCTAssertGreaterThan(
+            textView.bounds.height,
+            0,
+            "the complete long document must receive a non-zero measured height"
+        )
+    }
+
     /// A settled assistant message of TWO paragraphs must mount exactly ONE
     /// selectable `UITextView` whose text spans BOTH paragraphs — the single
     /// container per contiguous prose run. Non-editable (no keyboard), no

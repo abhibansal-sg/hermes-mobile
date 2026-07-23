@@ -231,6 +231,7 @@
 		8EA9EE46C6796932679FF1D7 /* QueueStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3ED8C5C9867E5770A7BE5BA2 /* QueueStore.swift */; };
 		8EF5ECFC16F335BF13EB132A /* ProtocolParityTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5834A91685C20F3A359E2CF1 /* ProtocolParityTests.swift */; };
 		8F948252F8F65492AD03E459 /* TranscriptChromeGlowTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 84BCD0ACAA2DF1945EF3B846 /* TranscriptChromeGlowTests.swift */; };
+		8FF2DE2A228F022AE4D1C9C0 /* ios_fix_long_prose.json in Resources */ = {isa = PBXBuildFile; fileRef = BF2DED54169133EB1CBE30D2 /* ios_fix_long_prose.json */; };
 		903A90AEE635376F613D0A73 /* ContextMeterTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 185C959B33CC2105062209B4 /* ContextMeterTests.swift */; };
 		914145DC9364B6A6DCE4637E /* HermesThemeModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7A440B23055D8590A1DC6298 /* HermesThemeModel.swift */; };
 		94F54EF1B5D59DB39E52B790 /* StreamingSegmentCacheTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = C399B5E914C956C1196D775B /* StreamingSegmentCacheTests.swift */; };
@@ -745,6 +746,7 @@
 		BE595B3D5BD7CE915E2E2112 /* AnsiText.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AnsiText.swift; sourceTree = "<group>"; };
 		BEA13DA84E89F452A0733139 /* RelayStatusStoreTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RelayStatusStoreTests.swift; sourceTree = "<group>"; };
 		BF23BF6299D648E0914BCBE7 /* ViewA11yTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ViewA11yTests.swift; sourceTree = "<group>"; };
+		BF2DED54169133EB1CBE30D2 /* ios_fix_long_prose.json */ = {isa = PBXFileReference; lastKnownFileType = text.json; path = ios_fix_long_prose.json; sourceTree = "<group>"; };
 		BFE558700DB8518ADA1A5A99 /* PushTokenPosterEnvTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PushTokenPosterEnvTests.swift; sourceTree = "<group>"; };
 		C1FB569D5769A91CF083E0B6 /* CacheLayerTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CacheLayerTests.swift; sourceTree = "<group>"; };
 		C254D8F13880E6ABC572CEE5 /* SyncCoordinatorTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SyncCoordinatorTests.swift; sourceTree = "<group>"; };
@@ -1454,6 +1456,7 @@
 				ED6761AF4D3C165A3D28513A /* WSLivenessTests.swift */,
 				1EA589DB54CA6475862B95FC /* WSURLBuilderTests.swift */,
 				DE1359EE308487FDB787DD9E /* ZoomableImageViewTests.swift */,
+				E486D38214418539A7B10D1B /* Fixtures */,
 			);
 			path = HermesMobileTests;
 			sourceTree = "<group>";
@@ -1498,6 +1501,14 @@
 				94D65E57EDBF086BDC8091D2 /* WorkingDirPicker.swift */,
 			);
 			path = Files;
+			sourceTree = "<group>";
+		};
+		E486D38214418539A7B10D1B /* Fixtures */ = {
+			isa = PBXGroup;
+			children = (
+				BF2DED54169133EB1CBE30D2 /* ios_fix_long_prose.json */,
+			);
+			path = Fixtures;
 			sourceTree = "<group>";
 		};
 		E653982BA48CD058386F3136 /* Drawer */ = {
@@ -1870,6 +1881,7 @@
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				8FF2DE2A228F022AE4D1C9C0 /* ios_fix_long_prose.json in Resources */,
 				0A645777886887CB6E8B7278 /* session_status_responses.json in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
