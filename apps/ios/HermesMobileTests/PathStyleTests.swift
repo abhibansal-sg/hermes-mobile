@@ -132,6 +132,12 @@ final class PathStyleTests: XCTestCase {
             _ = await client.respondToApproval(sessionId: "s", approve: true, all: false)
             XCTAssertEqual(recordedPaths, ["\(prefix)/approvals/respond"])
 
+            client = makeClient(style: style, script: [(ok, 200)])
+            _ = await client.respondToClarification(
+                sessionId: "s", requestId: "r", answer: "Left"
+            )
+            XCTAssertEqual(recordedPaths, ["\(prefix)/approvals/reply"])
+
             client = makeClient(style: style, script: [(fsList, 200)])
             _ = try await client.fsList(sessionId: "s", path: "")
             XCTAssertEqual(recordedPaths, ["\(prefix)/fs/list"])
@@ -198,6 +204,21 @@ final class PathStyleTests: XCTestCase {
         let outcome = await client.respondToApproval(sessionId: "s", approve: false, all: false)
         XCTAssertEqual(outcome, .alreadyHandled)
         XCTAssertEqual(RecordingProtocol.requests.count, 2)
+    }
+
+    func testRespondToClarificationRetriesAlternateFamilyOnRouteMiss() async {
+        let client = makeClient(style: .plugin, script: [
+            (Data(), 404),
+            (Data(#"{"resolved":true}"#.utf8), 200),
+        ])
+        let outcome = await client.respondToClarification(
+            sessionId: "s", requestId: "r", answer: "Left"
+        )
+        XCTAssertEqual(outcome, .resolved)
+        XCTAssertEqual(recordedPaths, [
+            "/api/plugins/hermes-mobile/approvals/reply",
+            "/api/approvals/reply",
+        ])
     }
 
     func testRespondToApprovalDoesNotRetryOnSuccessOrHardFailure() async {

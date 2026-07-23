@@ -131,6 +131,10 @@ func fetchTranscriptAround(
 /// bridge-readable counters) so a future REST-error mirror drop is not invisible.
 private let chatLog = Logger(subsystem: "ai.hermes.HermesMobile", category: "ChatStore")
 
+private struct GateResponseDeliveryError: LocalizedError {
+    var errorDescription: String? { "Couldn't send that response. Try again." }
+}
+
 #if DEBUG
 /// DEBUG-only telemetry for the foreign-mirror adoption gate (F3-H). Counts the
 /// decisions the gate makes so a live DEBUG build can prove, via the UI-G
@@ -531,6 +535,7 @@ final class ChatStore {
     var pushAlertAuthorityOverride: Bool?
     var notificationDeviceScopeOverride: String?
     var notificationForegroundOverride: Bool?
+    var gateResponseRPC: ((_ method: String, _ params: JSONValue) async throws -> Void)?
     #endif
 
     init() {
@@ -3237,29 +3242,53 @@ final class ChatStore {
         }
     }
 
-    /// Answer a pending approval (`approval.respond`) and clear it.
+    private func sendGateResponse(
+        method: String,
+        params: JSONValue,
+        overREST: (RestClient) async -> RestClient.ApprovalRespondOutcome
+    ) async throws {
+        #if DEBUG
+        if let gateResponseRPC {
+            try await gateResponseRPC(method, params)
+            return
+        }
+        #endif
+        guard let rest = connection?.rest else { throw GatewayError.notConnected }
+        guard await overREST(rest) != .failed else { throw GateResponseDeliveryError() }
+    }
+
+    /// Answer a pending approval (`approval.respond`) and clear it after ACK.
     func respondApproval(approve: Bool, all: Bool) async {
         // Answer against the session the approval came from — for mirrored
         // approvals (broadcast from another client's turn) that is a foreign
         // runtime id, not our own.
-        let approvalSession = pendingApproval?.sessionId
-        let requestId = pendingApproval?.id ?? ""
-        guard let client,
-              let sessionId = (approvalSession?.isEmpty == false ? approvalSession : activeSessionId)
-        else { return }
+        guard let pending = pendingApproval else { return }
+        let owner = pendingGateOwnerSessionID
+        let sessionId = pending.sessionId.isEmpty ? activeSessionId : pending.sessionId
+        guard let sessionId else { return }
         let choice = approve ? "approve" : "deny"
-        pendingApproval = nil
-        onApprovalChange?(false)
-        markGateResolved(requestId)
         do {
-            _ = try await client.requestRaw(
-                "approval.respond",
+            try await sendGateResponse(
+                method: "approval.respond",
                 params: .object([
                     "session_id": .string(sessionId),
                     "choice": .string(choice),
                     "all": .bool(all),
-                ])
+                ]),
+                overREST: { rest in
+                    await rest.respondToApproval(
+                        sessionId: sessionId, approve: approve, all: all
+                    )
+                }
             )
+            if pendingApproval == pending {
+                pendingApproval = nil
+                onApprovalChange?(false)
+            }
+            if let owner, parkedApprovals[owner] == pending {
+                parkedApprovals.removeValue(forKey: owner)
+            }
+            markGateResolved(pending.id)
         } catch {
             lastError = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
         }
@@ -3272,43 +3301,40 @@ final class ChatStore {
     /// `tui_gateway/server.py:5059`) — a reply without it 4009s ("no pending
     /// clarify request") and the agent stays blocked on the prompt forever.
     func respondClarification(_ answer: String) async {
-        let pending = pendingClarification
-        let clarifySession = pending?.sessionId
-        // QA-2 R8 / N3: echo the user's answer as a local user row BEFORE the
-        // card clears, so the transcript shows what the user picked. The
-        // pre-QA-2 path cleared the card + emitted the RPC but appended nothing,
-        // so the card vanished with no answer bubble (IMG_2535/2540,
-        // docs/qa2-root-causes.md N3). An untagged local user row is preserved
-        // by live gateway events and reconciliation. Guarded on
-        // `pending != nil` so a re-entrant call after the card cleared (the
-        // view's isResponding guard is best-effort) cannot duplicate the row.
-        if pending != nil {
-            appendClarifyAnswerEcho(answer)
-            // The card is consumed the moment the user answers — clear it here
-            // on EVERY path, not only inside the transport branches (qa2 fix
-            // round: both branches already cleared before their RPC, so wired
-            // behavior is unchanged; the unwired/unit path previously left the
-            // card up forever and re-entry re-echoed — ClarifyCardNativeTests
-            // testRespondClarificationEchoesAnswerAsUserMessage /
-            // EchoIsSingleRowEvenIfCalledTwice).
-            pendingClarification = nil
-            if let requestId = pending?.request.requestId {
-                markGateResolved(requestId)
-            }
-        }
-        guard let client,
-              let sessionId = (clarifySession?.isEmpty == false ? clarifySession : activeSessionId)
-        else { return }
-        // (pendingClarification already cleared at the echo site above.)
+        guard let pending = pendingClarification else { return }
+        let owner = pendingGateOwnerSessionID
+        let sessionId = pending.sessionId.isEmpty ? activeSessionId : pending.sessionId
+        guard let sessionId, let requestId = pending.request.requestId else { return }
         var params: [String: JSONValue] = [
             "session_id": .string(sessionId),
             "answer": .string(answer),
         ]
-        if let rid = pending?.request.requestId {
-            params["request_id"] = .string(rid)
-        }
+        params["request_id"] = .string(requestId)
         do {
-            _ = try await client.requestRaw("clarify.respond", params: .object(params))
+            try await sendGateResponse(
+                method: "clarify.respond",
+                params: .object(params),
+                overREST: { rest in
+                    await rest.respondToClarification(
+                        sessionId: sessionId,
+                        requestId: requestId,
+                        answer: answer
+                    )
+                }
+            )
+            // Echo only while the same gate is still visible in its owning
+            // transcript. If the user switched during the await, consuming the
+            // parked gate is safe but appending here would bleed into the new chat.
+            if pendingGateOwnerSessionID == owner, pendingClarification == pending {
+                appendClarifyAnswerEcho(answer)
+                pendingClarification = nil
+            }
+            if let owner, parkedClarifications[owner] == pending {
+                parkedClarifications.removeValue(forKey: owner)
+            }
+            if let requestId = pending.request.requestId {
+                markGateResolved(requestId)
+            }
         } catch {
             lastError = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
         }

@@ -262,10 +262,7 @@ final class ConnectionStore {
     /// session's hot-swap (or the global default) until the picker was opened
     /// (build-27 QA).
     func applyRuntimeInfo(_ info: SessionRuntimeInfo) {
-        if let model = info.model, !model.isEmpty {
-            sessionModel = Self.shortModelName(provider: nil, model: model)
-            sessionModelRaw = model
-        }
+        applySessionModel(info.model)
         if let provider = info.provider, !provider.isEmpty {
             sessionProvider = provider
         }
@@ -285,10 +282,7 @@ final class ConnectionStore {
     func applySessionInfo(_ payload: JSONValue) {
         // Only update when the event belongs to the active runtime session.
         // The payload is the `_session_info()` dict from server.py.
-        if let model = payload["model"]?.stringValue, !model.isEmpty {
-            sessionModel = Self.shortModelName(provider: nil, model: model)
-            sessionModelRaw = model
-        }
+        applySessionModel(payload["model"]?.stringValue)
         if let provider = payload["provider"]?.stringValue, !provider.isEmpty {
             sessionProvider = provider
         }
@@ -301,6 +295,12 @@ final class ConnectionStore {
         if let yolo = payload["yolo"]?.boolValue {
             sessionYolo = yolo
         }
+    }
+
+    func applySessionModel(_ model: String?) {
+        guard let model, !model.isEmpty else { return }
+        sessionModel = Self.shortModelName(provider: nil, model: model)
+        sessionModelRaw = model
     }
 
     /// Reset active session hot-swap state when a session is torn down or

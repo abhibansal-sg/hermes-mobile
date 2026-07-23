@@ -172,6 +172,36 @@ def _device_owns_session(request: Request, session_id: str) -> bool:
     return isinstance(owner, dict) and owner.get("device_id") == device_id
 
 
+def _device_may_manage_attention(request: Request, session_id: str) -> bool:
+    """Allow paired phones to handle shared-desktop prompts, not another phone's.
+
+    A watched desktop session intentionally has no mobile device owner.  S13 is
+    the response path for that case because stock WS response ownership must
+    remain strict.  Ownership is live-socket-scoped: a session is restricted to
+    its owning device only while that device's WS socket is registered.  A
+    session with no live device socket (desktop/TUI, or a transiently
+    disconnected phone) is shared and resolvable by any paired device.  Unknown
+    sessions still fail closed.
+    """
+    device_id = _request_device_id(request)
+    if device_id is None:
+        return True
+    try:
+        from tui_gateway.server import _sessions, _sessions_lock
+
+        device_tokens = _plugin_module("device_tokens")
+        with _sessions_lock:
+            session = _sessions.get(session_id)
+            transport = session.get("transport") if isinstance(session, dict) else None
+        if transport is None:
+            return False
+        ws = getattr(transport, "_ws", None)
+        owners = device_tokens._device_ids_for_ws_socket(ws)
+    except Exception:
+        return False
+    return not owners or (len(owners) == 1 and owners[0] == device_id)
+
+
 def _device_owns_stored_session(request: Request, stored_session_id: str) -> bool:
     """Resolve persisted identity through live runtime correlations, fail closed.
 
@@ -496,7 +526,7 @@ async def pending_attention(
     device_id = _request_device_id(request)
     visibility = f"device:{device_id}" if device_id else "shared"
     visibility_check = (
-        (lambda session_id: _device_owns_session(request, session_id))
+        (lambda session_id: _device_may_manage_attention(request, session_id))
         if device_id
         else (lambda _session_id: True)
     )
@@ -538,7 +568,7 @@ async def respond_to_approval(body: ApprovalRespondBody, request: Request):
     session_key = (identity or {}).get("stored_session_id")
     if identity is None or not session_key:
         raise HTTPException(status_code=404, detail="Unknown session")
-    if not _device_owns_session(request, body.session_id):
+    if not _device_may_manage_attention(request, body.session_id):
         raise HTTPException(status_code=403, detail="Device token does not own session")
 
     # W3a: build the audit context from the resolver's auth identity. A device
@@ -588,7 +618,7 @@ async def reply_to_clarify_approval(body: ApprovalReplyBody, request: Request):
     session_key = (identity or {}).get("stored_session_id")
     if identity is None or not session_key:
         raise HTTPException(status_code=404, detail="Unknown session")
-    if not _device_owns_session(request, body.session_id):
+    if not _device_may_manage_attention(request, body.session_id):
         raise HTTPException(status_code=403, detail="Device token does not own session")
 
     audit = _build_resolve_audit(request, body.session_id, session_key)

@@ -4178,6 +4178,7 @@ final class SessionStore {
                         mode: .watch,
                         generation: nil
                     )
+                    self.connection?.applySessionModel(live.model)
                     await seedTask.value
                     guard self.openToken == token,
                           self.activeStoredId == summary.id,

@@ -108,7 +108,8 @@ def test_coding_context_git_hides_git_windows(monkeypatch):
     monkeypatch.setattr(coding_context.subprocess, "run", fake_run)
 
     assert coding_context._git(Path("C:/repo"), "status", "--short") == "clean"
-    assert captured[0][1]["creationflags"] == _CREATE_NO_WINDOW
+    git_calls = _spawns(captured, "status", "--short")
+    assert git_calls[0][1]["creationflags"] == _CREATE_NO_WINDOW
 
 
 def test_context_reference_git_and_rg_hide_windows(monkeypatch):
