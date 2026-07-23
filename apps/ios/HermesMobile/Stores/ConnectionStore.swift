@@ -506,22 +506,40 @@ final class ConnectionStore {
     /// Base address for the transparent stock-protocol lane. The existing relay
     /// override selects the proxy host; without one, direct gateway behavior is
     /// preserved during the Phase 2 rollout.
-    func stockProxyURL(forGateway gatewayURL: URL) -> URL {
+    private func stockProxyOverrideURL() -> URL? {
         let rawOverride: String?
         #if DEBUG
-        rawOverride = ProcessInfo.processInfo.environment["HERMES_RELAY_URL"]
-            ?? DefaultsKeys.relayURLOverrideValue()
+        let environmentOverride = ProcessInfo.processInfo.environment["HERMES_RELAY_URL"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        rawOverride = environmentOverride?.isEmpty == false
+            ? environmentOverride
+            : DefaultsKeys.relayURLOverrideValue()
         #else
         rawOverride = DefaultsKeys.relayURLOverrideValue()
         #endif
         guard let rawOverride,
               let override = URL(string: rawOverride),
               var components = URLComponents(url: override, resolvingAgainstBaseURL: false)
-        else { return gatewayURL }
-        components.scheme = override.scheme == "wss" ? "https" : "http"
+        else { return nil }
+        switch override.scheme?.lowercased() {
+        case "https", "wss": components.scheme = "https"
+        case "http", "ws": components.scheme = "http"
+        default: return nil
+        }
         components.path = ""
         components.queryItems = nil
-        return components.url ?? gatewayURL
+        return components.url
+    }
+
+    func stockProxyURL(forGateway gatewayURL: URL) -> URL {
+        stockProxyOverrideURL() ?? gatewayURL
+    }
+
+    /// A relay URL is the public WebSocket endpoint, so its real Host header
+    /// must survive the upgrade. Direct gateway connections keep their configured
+    /// mode (including the shared-dashboard loopback override).
+    func stockProxyWebSocketMode(forGateway gatewayURL: URL) -> ConnectionMode {
+        stockProxyOverrideURL() == nil ? connectionMode : .remoteURL
     }
 
     /// The accepted transport generation. Runtime bindings use this value to
@@ -1365,6 +1383,7 @@ final class ConnectionStore {
             return "A session token is required."
         }
         let stockTransportURL = stockProxyURL(forGateway: url)
+        let stockTransportMode = stockProxyWebSocketMode(forGateway: url)
 
         // Cancel any reconnect loop tied to a previous configuration.
         reconnectTask?.cancel()
@@ -1425,12 +1444,12 @@ final class ConnectionStore {
         do {
             beginTransportAttempt()
             if let connectRPC {
-                try await connectRPC(stockTransportURL, trimmedToken, connectionMode)
+                try await connectRPC(stockTransportURL, trimmedToken, stockTransportMode)
             } else {
                 try await client.connect(
                     baseURL: stockTransportURL,
                     token: trimmedToken,
-                    mode: connectionMode
+                    mode: stockTransportMode
                 )
             }
         } catch {
@@ -2469,16 +2488,17 @@ final class ConnectionStore {
                     return
                 }
                 let stockTransportURL = self.stockProxyURL(forGateway: url)
+                let stockTransportMode = self.stockProxyWebSocketMode(forGateway: url)
 
                 do {
                     self.beginTransportAttempt()
                     if let hook = self.connectRPC {
-                        try await hook(stockTransportURL, token, self.connectionMode)
+                        try await hook(stockTransportURL, token, stockTransportMode)
                     } else {
                         try await self.client.connect(
                             baseURL: stockTransportURL,
                             token: token,
-                            mode: self.connectionMode
+                            mode: stockTransportMode
                         )
                     }
                     guard !Task.isCancelled,

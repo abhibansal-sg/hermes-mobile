@@ -44,6 +44,44 @@ final class ConnectionPhaseTests: XCTestCase {
         XCTAssertEqual(connection.phase, .connecting)
     }
 
+    func testRelayWebSocketUsesItsPublicHost() {
+        let defaults = UserDefaults.standard
+        let prior = defaults.object(forKey: DefaultsKeys.relayURLOverride)
+        defer {
+            if let prior {
+                defaults.set(prior, forKey: DefaultsKeys.relayURLOverride)
+            } else {
+                defaults.removeObject(forKey: DefaultsKeys.relayURLOverride)
+            }
+        }
+
+        let (connection, _, _) = makeStore()
+        connection.connectionMode = .sharedDashboard
+        let gateway = URL(string: "https://gateway.tailnet.ts.net:9443")!
+
+        defaults.set(
+            "https://gateway.tailnet.ts.net:9445",
+            forKey: DefaultsKeys.relayURLOverride
+        )
+        XCTAssertEqual(
+            connection.stockProxyURL(forGateway: gateway).absoluteString,
+            "https://gateway.tailnet.ts.net:9445",
+            "an HTTPS relay override must never be downgraded to plain HTTP"
+        )
+        XCTAssertEqual(
+            connection.stockProxyWebSocketMode(forGateway: gateway),
+            .remoteURL,
+            "the transparent relay must receive its real Host during WebSocket upgrade"
+        )
+
+        defaults.removeObject(forKey: DefaultsKeys.relayURLOverride)
+        XCTAssertEqual(
+            connection.stockProxyWebSocketMode(forGateway: gateway),
+            .sharedDashboard,
+            "direct stock-gateway connections keep the configured loopback Host rule"
+        )
+    }
+
     #if DEBUG
     func testHydratingPhaseLabel() {
         // The DEBUG snapshot mirror (gstack bridge, UI-G) must carry a stable
