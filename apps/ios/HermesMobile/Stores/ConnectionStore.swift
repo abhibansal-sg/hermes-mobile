@@ -262,10 +262,7 @@ final class ConnectionStore {
     /// session's hot-swap (or the global default) until the picker was opened
     /// (build-27 QA).
     func applyRuntimeInfo(_ info: SessionRuntimeInfo) {
-        if let model = info.model, !model.isEmpty {
-            sessionModel = Self.shortModelName(provider: nil, model: model)
-            sessionModelRaw = model
-        }
+        applySessionModel(info.model)
         if let provider = info.provider, !provider.isEmpty {
             sessionProvider = provider
         }
@@ -285,10 +282,7 @@ final class ConnectionStore {
     func applySessionInfo(_ payload: JSONValue) {
         // Only update when the event belongs to the active runtime session.
         // The payload is the `_session_info()` dict from server.py.
-        if let model = payload["model"]?.stringValue, !model.isEmpty {
-            sessionModel = Self.shortModelName(provider: nil, model: model)
-            sessionModelRaw = model
-        }
+        applySessionModel(payload["model"]?.stringValue)
         if let provider = payload["provider"]?.stringValue, !provider.isEmpty {
             sessionProvider = provider
         }
@@ -301,6 +295,12 @@ final class ConnectionStore {
         if let yolo = payload["yolo"]?.boolValue {
             sessionYolo = yolo
         }
+    }
+
+    func applySessionModel(_ model: String?) {
+        guard let model, !model.isEmpty else { return }
+        sessionModel = Self.shortModelName(provider: nil, model: model)
+        sessionModelRaw = model
     }
 
     /// Reset active session hot-swap state when a session is torn down or
@@ -329,20 +329,6 @@ final class ConnectionStore {
             timeout: .seconds(30)
         )
         return ModelOptions(json: result)
-    }
-
-    /// Refresh the composer model chip from an already-live session without
-    /// claiming it. `session.active_list` is identity/status only, so a watch
-    /// bind has no `SessionRuntimeInfo` payload to apply.
-    func refreshSessionModel(sessionId: String) async {
-        guard let options = try? await sessionModelOptions(sessionId: sessionId),
-              sessionStore.activeRuntimeId == sessionId,
-              !options.currentModel.isEmpty else { return }
-        sessionModelRaw = options.currentModel
-        sessionModel = Self.shortModelName(provider: nil, model: options.currentModel)
-        if !options.currentProvider.isEmpty {
-            sessionProvider = options.currentProvider
-        }
     }
 
     /// Send `config.set` with `key="model"` and the active `session_id` so the

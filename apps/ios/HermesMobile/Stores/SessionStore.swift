@@ -4178,11 +4178,11 @@ final class SessionStore {
                         mode: .watch,
                         generation: nil
                     )
+                    self.connection?.applySessionModel(live.model)
                     await seedTask.value
                     guard self.openToken == token,
                           self.activeStoredId == summary.id,
                           self.activeRuntimeId == live.id else { return }
-                    await self.connection?.refreshSessionModel(sessionId: live.id)
                     self.ensureRuntimeAttempts = 0
                     self.onActiveRuntimeBound?()
                     self.lastError = nil
@@ -4243,9 +4243,6 @@ final class SessionStore {
                 // the pill showed the previous session's model until the
                 // picker was opened).
                 if let info = result.info { self.connection?.applyRuntimeInfo(info) }
-                if self.connection?.sessionModel == nil {
-                    await self.connection?.refreshSessionModel(sessionId: result.sessionId)
-                }
                 // Compression-chain projection: the gateway may resume a
                 // newer continuation of this conversation — follow it.
                 let boundStoredId = result.storedSessionId ?? summary.id
