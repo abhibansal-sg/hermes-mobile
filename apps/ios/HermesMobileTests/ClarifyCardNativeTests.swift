@@ -45,6 +45,7 @@ final class ClarifyCardNativeTests: XCTestCase {
     /// (IMG_2535/2540, ledger N3).
     func testRespondClarificationEchoesAnswerAsUserMessage() async throws {
         let chat = ChatStore()
+        chat.gateResponseRPC = { _, _ in }
         chat.pendingClarification = PendingClarification(
             sessionId: "s",
             request: ClarifyRequestPayload(payload: .object([
@@ -68,6 +69,7 @@ final class ClarifyCardNativeTests: XCTestCase {
     /// Free-text answers echo too — the free-text path is the same responder.
     func testRespondClarificationFreeTextEchoesAnswer() async throws {
         let chat = ChatStore()
+        chat.gateResponseRPC = { _, _ in }
         chat.pendingClarification = PendingClarification(
             sessionId: "s",
             request: ClarifyRequestPayload(payload: .object([
@@ -87,6 +89,7 @@ final class ClarifyCardNativeTests: XCTestCase {
     /// twice (re-entry guard). Only ONE user row is appended.
     func testRespondClarificationEchoIsSingleRowEvenIfCalledTwice() async throws {
         let chat = ChatStore()
+        chat.gateResponseRPC = { _, _ in }
         chat.pendingClarification = PendingClarification(
             sessionId: "s",
             request: ClarifyRequestPayload(payload: .object([
@@ -103,6 +106,95 @@ final class ClarifyCardNativeTests: XCTestCase {
         }
         XCTAssertEqual(userAnswers.count, 1, "re-entry must not duplicate the echo")
         XCTAssertEqual(userAnswers.first?.text, "first")
+    }
+
+    func testClarificationOwnershipFailureRetainsCardWithoutEcho() async {
+        let chat = ChatStore()
+        let pending = PendingClarification(
+            sessionId: "watched-runtime",
+            request: ClarifyRequestPayload(payload: .object([
+                "question": .string("Choose?"),
+                "request_id": .string("clarify-owned-elsewhere"),
+            ]))
+        )
+        chat.pendingClarification = pending
+        chat.gateResponseRPC = { _, _ in
+            throw GatewayError.rpc(code: 4030, message: "not the owning client")
+        }
+        let baseline = chat.messages
+
+        await chat.respondClarification("Left")
+
+        XCTAssertEqual(chat.pendingClarification, pending)
+        XCTAssertEqual(chat.messages, baseline, "an unacknowledged answer must not enter the transcript")
+    }
+
+    func testApprovalOwnershipFailureRetainsCard() async {
+        let chat = ChatStore()
+        let pending = PendingApproval(
+            id: "approval-owned-elsewhere",
+            sessionId: "watched-runtime",
+            request: ApprovalRequestPayload(payload: .object([
+                "approval_id": .string("approval-owned-elsewhere"),
+                "command": .string("dangerous command"),
+            ]))
+        )
+        chat.pendingApproval = pending
+        chat.gateResponseRPC = { _, _ in
+            throw GatewayError.rpc(code: 4030, message: "not the owning client")
+        }
+
+        await chat.respondApproval(approve: true, all: false)
+
+        XCTAssertEqual(chat.pendingApproval, pending)
+    }
+
+    func testApprovalRemainsVisibleUntilGatewayAcknowledges() async throws {
+        let chat = ChatStore()
+        let pending = PendingApproval(
+            id: "approval-awaiting-ack",
+            sessionId: "owned-runtime",
+            request: ApprovalRequestPayload(payload: .object([
+                "approval_id": .string("approval-awaiting-ack"),
+                "command": .string("review command"),
+            ]))
+        )
+        chat.pendingApproval = pending
+        chat.gateResponseRPC = { _, _ in
+            try await Task.sleep(for: .milliseconds(120))
+        }
+
+        let response = Task { await chat.respondApproval(approve: true, all: false) }
+        try await Task.sleep(for: .milliseconds(20))
+        XCTAssertEqual(chat.pendingApproval, pending, "the tap is not success before the ACK")
+        await response.value
+        XCTAssertNil(chat.pendingApproval)
+    }
+
+    func testClarificationAckAfterSwitchNeverEchoesIntoOtherSession() async throws {
+        let chat = ChatStore()
+        chat.pendingGateOwnerMoved(toStoredSession: "stored-a")
+        let pending = PendingClarification(
+            sessionId: "runtime-a",
+            request: ClarifyRequestPayload(payload: .object([
+                "question": .string("Choose?"),
+                "request_id": .string("clarify-switch-during-ack"),
+            ]))
+        )
+        chat.pendingClarification = pending
+        chat.gateResponseRPC = { _, _ in
+            try await Task.sleep(for: .milliseconds(120))
+        }
+
+        let response = Task { await chat.respondClarification("Left") }
+        try await Task.sleep(for: .milliseconds(20))
+        chat.pendingGateOwnerMoved(toStoredSession: "stored-b")
+        await response.value
+
+        XCTAssertTrue(chat.messages.isEmpty, "A's answer must not bleed into B's transcript")
+        chat.pendingGateOwnerMoved(toStoredSession: "stored-a")
+        XCTAssertNil(chat.pendingClarification, "the acknowledged parked gate must stay consumed")
+        XCTAssertTrue(chat.messages.isEmpty, "a parked ACK must not synthesize an answer in B")
     }
 
     // MARK: - R10 — long choice text wraps inside the card (no hard clip)
