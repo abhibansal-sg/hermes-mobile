@@ -197,13 +197,22 @@ def test_pending_attention_device_scope_and_redaction(
 
     ws = object()
     transport = Transport(ws)
+    desktop_transport = Transport(object())
     device_tokens.register_ws_socket(owner["device_id"], ws)
     gateway._sessions["owned"] = {"session_key": "stored-owned", "transport": transport}
+    gateway._sessions["desktop"] = {
+        "session_key": "stored-desktop",
+        "transport": desktop_transport,
+    }
     device_tokens.record_session_transport("owned", transport)
     monkeypatch.setattr(
         attention,
         "capture_pending_attention",
-        lambda: [_record("mine", "owned"), _record("theirs", "foreign")],
+        lambda: [
+            _record("mine", "owned"),
+            _record("desktop", "desktop"),
+            _record("theirs", "foreign"),
+        ],
     )
     try:
         response = client.get(
@@ -212,7 +221,7 @@ def test_pending_attention_device_scope_and_redaction(
         )
         assert response.status_code == 200
         body = response.json()
-        assert [item["request_id"] for item in body["upserts"]] == ["mine"]
+        assert {item["request_id"] for item in body["upserts"]} == {"mine", "desktop"}
         serialized = json.dumps(body)
         assert "foreign" not in serialized
         assert "RAW_COMMAND_MUST_NOT_LEAK" not in serialized
@@ -224,7 +233,8 @@ def test_pending_attention_device_scope_and_redaction(
             headers={"X-Hermes-Session-Token": other["token"]},
         )
         assert denied.status_code == 200
-        assert denied.json()["upserts"] == []
+        assert [item["request_id"] for item in denied.json()["upserts"]] == ["desktop"]
     finally:
         gateway._sessions.pop("owned", None)
+        gateway._sessions.pop("desktop", None)
         device_tokens._reset_for_tests()

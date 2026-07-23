@@ -890,6 +890,35 @@ final class ChatStoreBatchBTests: XCTestCase {
         XCTAssertNil(chat.pendingClarification, "the gate must leave with its owner")
     }
 
+    /// The real New Chat path is a draft (no stored-session owner), so it must
+    /// park A's gate and restore that exact gate when A is opened again.
+    func testStartDraftParksAndReopenRestoresOwningClarification() async {
+        let (chat, sessions) = makeStore()
+        let requestID = "clarify-\(UUID().uuidString)"
+        chat.handle(event: frame(
+            type: "clarify.request",
+            runtime: activeRuntime,
+            stored: storedId,
+            payload: .object([
+                "request_id": .string(requestID),
+                "question": .string("Left or right?"),
+                "choices": .array([.string("Left"), .string("Right")]),
+            ])
+        ))
+        XCTAssertEqual(chat.pendingClarification?.request.requestId, requestID)
+
+        sessions.startDraft()
+        XCTAssertNil(chat.pendingClarification, "a draft must not render A's gate")
+
+        sessions.transcriptFetch = { _ in [] }
+        sessions.open(summary(storedId), bindRuntime: false)
+        #if DEBUG
+        await sessions.waitForPendingOpenForTesting()
+        #endif
+        XCTAssertEqual(chat.pendingClarification?.request.requestId, requestID)
+        XCTAssertEqual(chat.pendingClarification?.sessionId, activeRuntime)
+    }
+
     /// A fresh session must never render the previous session's seed failure.
     func testResetClearsStaleBackfillError() async {
         let (chat, sessions) = makeStore()

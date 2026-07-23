@@ -515,74 +515,21 @@ enum NotificationService {
         }
     }
 
-    private enum ClarifyReplyAttempt {
-        case outcome(RestClient.ApprovalRespondOutcome)
-        case routeMiss
-
-        var outcome: RestClient.ApprovalRespondOutcome {
-            switch self {
-            case .outcome(let value): return value
-            case .routeMiss: return .alreadyHandled
-            }
-        }
-    }
-
     private static func sendClarifyReply(
         endpoint: ActionEndpoint,
         action: ClarifyReplyActionPayload,
         answer: String
     ) async -> RestClient.ApprovalRespondOutcome {
-        let first = await sendClarifyReplyAttempt(
-            endpoint: endpoint, style: endpoint.pathStyle, action: action, answer: answer
-        )
-        guard case .routeMiss = first else { return first.outcome }
-        let second = await sendClarifyReplyAttempt(
-            endpoint: endpoint, style: endpoint.pathStyle.alternate, action: action, answer: answer
-        )
-        return second.outcome
-    }
-
-    private static func sendClarifyReplyAttempt(
-        endpoint: ActionEndpoint,
-        style: APIPathStyle,
-        action: ClarifyReplyActionPayload,
-        answer: String
-    ) async -> ClarifyReplyAttempt {
         let rest = RestClient(
             baseURL: endpoint.baseURL,
             token: endpoint.token,
-            pathStyle: style
+            pathStyle: endpoint.pathStyle
         )
-        var request = rest.makeRequest(path: "\(style.mobileAPIPrefix)/approvals/reply", method: "POST")
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        let body: JSONValue = .object([
-            "session_id": .string(action.sessionId),
-            "approval_id": .string(action.approvalId),
-            "answer": .string(answer),
-        ])
-        guard let payload = try? rest.encodeBody(body, context: "approvals/reply") else {
-            return .outcome(.failed)
-        }
-        request.httpBody = payload
-
-        let data: Data
-        let response: URLResponse
-        do {
-            (data, response) = try await rest.session.data(for: request)
-        } catch {
-            return .outcome(.failed)
-        }
-        guard let http = response as? HTTPURLResponse else { return .outcome(.failed) }
-        switch http.statusCode {
-        case 200, 201:
-            let root = try? rest.decodeJSONValue(from: data, context: "approvals/reply")
-            let resolved = root?["resolved"]?.boolValue ?? false
-            return .outcome(resolved ? .resolved : .alreadyHandled)
-        case 404:
-            return .routeMiss
-        default:
-            return .outcome(.failed)
-        }
+        return await rest.respondToClarification(
+            sessionId: action.sessionId,
+            requestId: action.approvalId,
+            answer: answer
+        )
     }
 
     /// Body line for the "already handled" feedback, naming the target when known.
