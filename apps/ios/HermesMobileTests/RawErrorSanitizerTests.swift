@@ -65,37 +65,19 @@ final class RawErrorSanitizerTests: XCTestCase {
         XCTAssertNil(RawErrorSanitizer.humanizeIfRawError("   \n  "))
     }
 
-    // MARK: - Consumer seams (C3 audit of the relay-flow alert paths)
+    // MARK: - Consumer seams
 
-    func testRelayErrorRPCRawMessageHumanized() {
-        // The relay's RPC error frames interpolate str(exc) (downstream.py) —
-        // a provider failure rides the message into lastError banners.
-        let error = RelayError.rpc(code: -32000, message: Self.rawAuth403)
+    func testGatewayErrorRPCRawMessageHumanized() {
+        let error = GatewayError.rpc(code: -32000, message: Self.rawAuth403)
         XCTAssertEqual(error.errorDescription, RawErrorSanitizer.authLine)
     }
 
-    func testRelayErrorRPCNumericCodeNeverSurfaces() {
+    func testGatewayErrorRPCNumericCodeNeverSurfaces() {
         // Non-raw messages keep their text but drop the raw JSON-RPC code.
-        let error = RelayError.rpc(code: -32000, message: "session is busy")
+        let error = GatewayError.rpc(code: -32000, message: "session is busy")
         let desc = error.errorDescription ?? ""
         XCTAssertTrue(desc.contains("session is busy"))
         XCTAssertFalse(desc.contains("-32000"), "C3: no raw error codes to the user")
     }
 
-    func testErrorItemViewShowsHumanLineNotRawPayload() {
-        let item = ChatItem(
-            itemID: "e1", type: .error, status: .failed, ord: 0,
-            body: .object(["text": .string(Self.rawAuth403)])
-        )
-        let shown = ErrorItemView.displayMessage(for: item)
-        XCTAssertEqual(shown, RawErrorSanitizer.authLine)
-        XCTAssertFalse(shown.contains("HTTP 403"))
-        XCTAssertFalse(shown.contains("{"))
-        // an honest error message is untouched
-        let human = ChatItem(
-            itemID: "e2", type: .error, status: .failed, ord: 1,
-            summary: "Build failed", body: ["text": "2 errors in parser.swift"]
-        )
-        XCTAssertEqual(ErrorItemView.displayMessage(for: human), "2 errors in parser.swift")
-    }
 }

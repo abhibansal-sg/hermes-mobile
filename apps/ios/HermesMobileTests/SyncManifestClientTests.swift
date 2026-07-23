@@ -36,19 +36,4 @@ final class SyncManifestClientTests: XCTestCase {
         catch { XCTFail("unexpected \(error)") }
     }
 
-
-    func testRelayControlRouteDoesNotRequirePluginStyle() async throws {
-        let config = URLSessionConfiguration.ephemeral; config.protocolClasses = [Stub.self]
-        Stub.handler = { request in
-            XCTAssertEqual(request.url?.path, "/sync/manifest")
-            XCTAssertEqual(request.value(forHTTPHeaderField: "Authorization"), "Bearer secret")
-            return (200, Data(#"{"revision":0,"cursor":"sm1.relay.0","has_more":false}"#.utf8))
-        }
-        let client = RestClient(
-            baseURL: URL(string: "https://gateway.test")!, token: "secret",
-            session: URLSession(configuration: config), pathStyle: .legacy,
-            relayControlBaseURL: URL(string: "https://relay.test")!
-        )
-        _ = try await client.syncManifest(scope: CacheScope(serverId: "s", profileId: "all"), cursor: nil)
-    }
 }

@@ -233,6 +233,24 @@ final class CacheFirstLaunchTests: XCTestCase {
         XCTAssertTrue(sessions.sessions.isEmpty)
     }
 
+    func testUnavailableCacheFetchesHistoryOnceAndCannotPaintPriorSession() async {
+        let (_, sessions, chat) = makeGraph() // deliberately no CacheStore
+        chat.seed(from: [stubStored("SESSION A")])
+        var fetched: [String] = []
+        sessions.transcriptFetch = { sessionID in
+            fetched.append(sessionID)
+            return [stubStored("SESSION B")]
+        }
+
+        sessions.open(makeSummary(id: "stored-B"), bindRuntime: false)
+        await sessions.waitForPendingOpenForTesting()
+
+        XCTAssertEqual(fetched, ["stored-B"], "a cold cache miss gets one authoritative read")
+        XCTAssertEqual(chat.messages.map(\.text), ["SESSION B"])
+        XCTAssertFalse(chat.messages.contains { $0.text == "SESSION A" },
+                       "the miss reset must not retain another session's rows")
+    }
+
     func testCachePaintRetriesAfterPreBootstrapCallGetsNoScope() async throws {
         let (connection, sessions, _) = makeGraph()
         let cache = try makeInMemoryCache()

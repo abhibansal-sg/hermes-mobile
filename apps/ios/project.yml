@@ -177,48 +177,6 @@ targets:
           - WorkRepositoryTestSupport.swift
       - path: ../../tests/fixtures/session_status_responses.json
         buildPhase: resources
-      # A2/N1 wire conformance: the SAME shared contract fixture the pytest side
-      # (tests/conformance/) asserts against — the XCTest consumer decodes it so
-      # a phone/relay field mismatch fails both test stacks.
-      - path: ../../tests/conformance/wire_contract.json
-        buildPhase: resources
-      # QA-1 A9 render conformance: relay frame streams RECORDED by the E2E
-      # harness (tests/e2e_daily_driver/test_z_record_render_fixtures.py) that
-      # RenderConformanceTests replays through RelayItemStore -> ChatStore to
-      # assert render-model invariants — the render half of the gate that runs
-      # together with the wire half (tests/e2e_daily_driver/run_gate.sh).
-      - path: ../../tests/render_conformance/fixtures/render_submit_stream.json
-        buildPhase: resources
-      - path: ../../tests/render_conformance/fixtures/render_approval_gate.json
-        buildPhase: resources
-      - path: ../../tests/render_conformance/fixtures/render_clarify_gate.json
-        buildPhase: resources
-      - path: ../../tests/render_conformance/fixtures/render_tasklist.json
-        buildPhase: resources
-      # QA-2 R5/R6/A3 live-fold fixture (reasoning + raw-name tool turn);
-      # hand-authored to the recorded wire format (see its recorded_by note).
-      - path: ../../tests/render_conformance/fixtures/render_live_fold.json
-        buildPhase: resources
-      # QA-3 round-3 incident fixtures (S2/S4/S6/S8/S11), recorded by the E2E
-      # harness's phone driver with the additive t_ms/script/extra_sessions
-      # extensions (backward-compatible with the QA-1/QA-2 format). Consumed
-      # by the renderjury lane's S2/A1 tests now and by the ordering
-      # (S4/S6), liveness (S8) and S11 lanes' replays.
-      - path: ../../tests/render_conformance/fixtures/render_qa3_delayed_start.json
-        buildPhase: resources
-      - path: ../../tests/render_conformance/fixtures/render_qa3_reconnect_reorder.json
-        buildPhase: resources
-      - path: ../../tests/render_conformance/fixtures/render_qa3_session_switch.json
-        buildPhase: resources
-      - path: ../../tests/render_conformance/fixtures/render_qa3_dead_turn.json
-        buildPhase: resources
-      - path: ../../tests/render_conformance/fixtures/render_qa3_draft_interleave.json
-        buildPhase: resources
-      # QA-3 S8/A4 liveness fixture (dead turn 1 + live turn 2 — the IMG_2591
-      # eternal double-working set piece); hand-authored from the forensics
-      # chronology to the recorded wire format (see its recorded_by note).
-      - path: ../../tests/render_conformance/fixtures/render_dead_turn_liveness.json
-        buildPhase: resources
     dependencies:
       - target: HermesMobile
       # GRDB direct link so CacheLayerTests can call DatabaseQueue(configuration:)
@@ -346,6 +304,9 @@ schemes:
           isEnabled: true
         - variable: HERMES_TOKEN
           value: $(TEST_RUNNER_HERMES_TOKEN)
+          isEnabled: true
+        - variable: HERMES_RELAY_URL
+          value: $(TEST_RUNNER_HERMES_RELAY_URL)
           isEnabled: true
         - variable: HERMES_LIVE_FOLLOW_MARKER
           value: $(TEST_RUNNER_HERMES_LIVE_FOLLOW_MARKER)

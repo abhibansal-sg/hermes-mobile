@@ -36,8 +36,8 @@ import SwiftUI
 // `.item` work items AND the classic `.tools` clusters), and interim narration
 // `.text` segments — folds under ONE working section. The FINAL answer text (the
 // trailing `.text` run after the last work part) renders as the body. This applies
-// to the CLASSIC `ChatMessagePart` path too (old / non-relay sessions), not only
-// the item-layer path — the owner sees old sessions daily and the old anatomy
+// to the `ChatMessagePart` path too, so older stored sessions retain the same
+// anatomy — the owner sees old sessions daily and the old anatomy
 // (repeating italic "Thinking ›" rows + boxed tool cards alternating with interim
 // prose) is exactly what this collapses.
 
@@ -50,9 +50,8 @@ import SwiftUI
 ///
 /// QA-3 S1: the pulse is a PURE FUNCTION OF WALL-CLOCK TIME, not a `@State`
 /// kicked by `onAppear` + `withAnimation(.repeatForever)`. That old pattern
-/// stranded the cursor STATIC whenever the row remounted mid-turn (the
-/// optimistic caret bubble is re-derived on every `applyRelayItems` pass, and
-/// an animation-nil transaction or a view-identity change resets `@State`
+/// stranded the cursor STATIC whenever the row remounted mid-turn (an
+/// animation-nil transaction or a view-identity change resets `@State`
 /// without re-firing `onAppear`) — the motionless blue bar the owner
 /// photographed (IMG_2577/2585/2587). A time-driven pulse has no state to
 /// strand: any remount renders the correct phase for "now" and keeps
@@ -153,8 +152,7 @@ enum WorkingSectionModel {
 
     /// Whether a part represents WORK — the parts whose LAST occurrence marks the
     /// fold boundary (everything up to and including it collapses). Streamed
-    /// `.reasoning`, the classic `.tools` cluster, and an item-backed work render
-    /// (tool / file change / browser / image / error) all count. `.text` is NOT
+    /// `.reasoning` and the `.tools` cluster count. `.text` is NOT
     /// work — a trailing `.text` run is the final answer body; interim `.text`
     /// still folds because it sits BEFORE the last work part, not because it is
     /// eligible itself. `.usage` / `.warning` are footers and never work.
@@ -162,21 +160,7 @@ enum WorkingSectionModel {
         switch part {
         case .reasoning, .tools:
             return true
-        case .item(_, let item):
-            return isWorkingItem(item)
         case .text, .warning, .usage:
-            return false
-        }
-    }
-
-    /// Item types that render inside a working section. `agentMessage` / `usage` /
-    /// `userMessage` project onto legacy parts and never arrive as `.item`, but
-    /// are excluded defensively so only real work folds.
-    nonisolated static func isWorkingItem(_ item: ChatItem) -> Bool {
-        switch item.type {
-        case .toolCall, .taskList, .fileChange, .browser, .image, .error, .reasoning:
-            return true
-        case .agentMessage, .usage, .userMessage:
             return false
         }
     }
@@ -241,14 +225,6 @@ enum WorkingSectionModel {
         return nodes
     }
 
-    /// The item parts of a run, in order.
-    nonisolated static func items(in parts: [ChatMessagePart]) -> [ChatItem] {
-        parts.compactMap { part in
-            if case .item(_, let item) = part { return item }
-            return nil
-        }
-    }
-
     /// Whether any tool in the run failed — a failed status OR an `error` item, in
     /// EITHER the item-layer parts or the classic `.tools` clusters. Drives the
     /// collapsed section's failure badge so a fold never hides a failure (§2).
@@ -256,20 +232,12 @@ enum WorkingSectionModel {
         toolUnits(in: parts).contains(where: \.isFailure)
     }
 
-    /// A single item is a failure iff its status is `.failed` or its type is
-    /// `.error` (a failed tool surfaces as either on the wire).
-    nonisolated static func isFailure(_ item: ChatItem) -> Bool {
-        item.status == .failed || item.type == .error
-    }
+    // MARK: - Tool units
 
-    // MARK: - Unified tool units (item-layer + classic `.tools`)
-
-    /// A single tool-ish work unit flattened from either an item-layer work `.item`
-    /// or one activity of a classic `.tools` cluster, so the live current-tool line
-    /// and the failure badge treat both paths identically.
+    /// A single tool activity used by the live current-tool line and failure badge.
     struct WorkUnit: Equatable, Sendable {
         let summary: String
-        let status: ChatItemStatus
+        let status: ToolActivity.State
         let isFailure: Bool
         /// Whether the unit's identity is still a RAW wire state token (QA-2
         /// N2: `tool.generating` / `review.summary` — the relay's pre-resolution
@@ -279,25 +247,16 @@ enum WorkingSectionModel {
         let raw: Bool
     }
 
-    /// Flatten a run's tool work (NOT reasoning, NOT narration) into ordered units,
-    /// spanning both the item-layer and the classic `.tools` clusters.
+    /// Flatten a run's tool work (not reasoning or narration) into ordered units.
     nonisolated static func toolUnits(in parts: [ChatMessagePart]) -> [WorkUnit] {
         var out: [WorkUnit] = []
         for part in parts {
             switch part {
-            case .item(_, let item) where isWorkingItem(item):
-                out.append(WorkUnit(
-                    summary: stepSummary(for: item),
-                    status: item.status,
-                    isFailure: isFailure(item),
-                    raw: isRawStateName(item.toolName)
-                        && (item.summary.map(isRawStateName) ?? true)
-                ))
             case .tools(_, let tools, _, _):
                 for tool in tools {
                     out.append(WorkUnit(
                         summary: legacyToolSummary(tool),
-                        status: legacyStatus(tool.state),
+                        status: tool.state,
                         isFailure: tool.state == .failed,
                         raw: isRawStateName(tool.name)
                     ))
@@ -314,17 +273,7 @@ enum WorkingSectionModel {
     /// tool work at all (a pure-reasoning fold).
     nonisolated static func currentWork(in parts: [ChatMessagePart]) -> WorkUnit? {
         let units = toolUnits(in: parts)
-        return units.last(where: { $0.status == .inProgress }) ?? units.last
-    }
-
-    /// Map a classic `ToolActivity.State` onto the item-layer status vocabulary so
-    /// the live status glyph is shared across both paths.
-    nonisolated static func legacyStatus(_ state: ToolActivity.State) -> ChatItemStatus {
-        switch state {
-        case .running: return .inProgress
-        case .done: return .completed
-        case .failed: return .failed
-        }
+        return units.last(where: { $0.status == .running }) ?? units.last
     }
 
     /// Humanized one-liner for a classic `.tools` activity — prefers the tool's own
@@ -337,11 +286,6 @@ enum WorkingSectionModel {
         return humanize(name: tool.name, target: target.isEmpty ? nil : target)
     }
 
-    /// The tool `body.duration_s` for an item, if present.
-    nonisolated static func duration(of item: ChatItem) -> TimeInterval? {
-        item.body["duration_s"]?.doubleValue
-    }
-
     /// Wall-clock seconds a settled working section took: the turn's stamped
     /// duration when known, else the sum of the items' own `duration_s`, else nil
     /// (the label then omits the time tail).
@@ -350,10 +294,7 @@ enum WorkingSectionModel {
         settled: TimeInterval?
     ) -> TimeInterval? {
         if let settled, settled > 0 { return settled }
-        var summed = items(in: parts).reduce(into: 0.0) { acc, item in
-            if let d = duration(of: item), d > 0 { acc += d }
-        }
-        // Classic `.tools` clusters carry their own per-activity `durationMs`.
+        var summed = 0.0
         for part in parts {
             if case .tools(_, let tools, _, let turnElapsed) = part {
                 if let turnElapsed, turnElapsed > 0 {
@@ -366,13 +307,6 @@ enum WorkingSectionModel {
             }
         }
         return summed > 0 ? summed : nil
-    }
-
-    /// The current (most recent) tool line shown while the turn is live: the last
-    /// still-in-progress item, else simply the last item in the run.
-    nonisolated static func currentWorkingItem(in parts: [ChatMessagePart]) -> ChatItem? {
-        let its = items(in: parts)
-        return its.last(where: { $0.status == .inProgress }) ?? its.last
     }
 
     /// "Worked for 12s" / "Worked for 2m 3s" / "Worked" (no known duration).
@@ -409,36 +343,6 @@ enum WorkingSectionModel {
     }
 
     // MARK: - Step humanizer (deterministic, no LLM)
-
-    /// The monochrome SF-symbol glyph for a step of the given item type.
-    nonisolated static func glyph(for type: ChatItemType) -> String {
-        switch type {
-        case .fileChange: return "pencil"
-        case .image: return "photo"
-        case .browser: return "safari"
-        case .error: return "exclamationmark.triangle"
-        case .reasoning: return "bubble.left"
-        case .taskList: return "checklist"
-        case .toolCall, .agentMessage, .usage, .userMessage: return "terminal"
-        }
-    }
-
-    /// The single most descriptive argument value for a tool item — the target a
-    /// natural-language summary reads against (path / pattern / command / url).
-    nonisolated static func primaryTarget(of item: ChatItem) -> String? {
-        let args = item.body["args"]
-        // NB: the tool's own `name` is its identity, not a target — never read it
-        // here, or a nameless-arg tool would echo its name twice ("Foo foo").
-        let keys = ["path", "file", "filename", "file_path", "pattern",
-                    "query", "q", "command", "cmd", "url", "target"]
-        for key in keys {
-            if let value = args?[key]?.stringValue ?? item.body[key]?.stringValue {
-                let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
-                if !trimmed.isEmpty { return trimmed }
-            }
-        }
-        return nil
-    }
 
     /// Whether a wire tool name / relay-supplied summary is a RAW internal state
     /// token rather than a human label — the dotted lowercase event names the
@@ -481,35 +385,6 @@ enum WorkingSectionModel {
             .trimmingCharacters(in: .whitespaces)
         guard let first = spaced.first else { return name }
         return first.uppercased() + spaced.dropFirst()
-    }
-
-    /// A muted natural-language one-liner for a tool item ("Ran alembic upgrade
-    /// head", "Read auth.py", "Grepped for node_loop"). Prefers the relay-supplied
-    /// `summary`; otherwise derives a verb from the tool name + primary target.
-    /// Deterministic — no model calls.
-    nonisolated static func stepSummary(for item: ChatItem) -> String {
-        // A relay `summary` that is still a raw state token (`tool.generating`)
-        // is NOT a label — fall through to the humanizer (QA-2 N2).
-        if let s = item.summary?.trimmingCharacters(in: .whitespacesAndNewlines),
-           !s.isEmpty, !isRawStateName(s) {
-            return shortTarget(s)
-        }
-        let target = primaryTarget(of: item)
-
-        func verb(_ v: String, _ fallback: String) -> String {
-            if let target { return "\(v) \(shortTarget(target))" }
-            return fallback
-        }
-
-        switch item.type {
-        case .fileChange: return verb("Edited", "Edited a file")
-        case .browser: return verb("Opened", "Browsed a page")
-        case .image: return "Generated an image"
-        case .error: return target.map { "Error: \(shortTarget($0))" } ?? "Hit an error"
-        default: break
-        }
-
-        return humanize(name: item.toolName, target: target)
     }
 
     /// Verb-from-name humanizer shared by the item-layer (`stepSummary`) and the
@@ -557,29 +432,6 @@ enum WorkingSectionModel {
         return pretty
     }
 
-    /// The command/arguments code-card body for a tool item's Thinking-sheet
-    /// entry: an explicit `command`/`cmd` arg, else the compact args preview.
-    nonisolated static func commandText(of item: ChatItem) -> String? {
-        let args = item.body["args"]
-        if let cmd = (args?["command"]?.stringValue ?? args?["cmd"]?.stringValue
-                      ?? item.body["command"]?.stringValue),
-           !cmd.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            return cmd
-        }
-        let summary = item.argsSummary
-        return summary.isEmpty ? nil : summary
-    }
-
-    /// The language hint for a command code card — "bash" for a real shell
-    /// command, nil for a `key: value` args preview.
-    nonisolated static func commandLanguage(of item: ChatItem) -> String? {
-        let args = item.body["args"]
-        if args?["command"] != nil || args?["cmd"] != nil || item.body["command"] != nil {
-            return "bash"
-        }
-        return nil
-    }
-
     /// The bold Thinking-sheet title for a reasoning first line — capped short.
     nonisolated static func reasoningTitle(_ firstLine: String) -> String {
         shortTarget(firstLine, limit: 60)
@@ -611,21 +463,6 @@ enum WorkingSectionModel {
                     commandLanguage: nil,
                     output: nil,
                     isFailure: false
-                ))
-            case .item(let id, let item):
-                let summary = stepSummary(for: item)
-                let output = item.resultPreview.isEmpty ? nil : item.resultPreview
-                out.append(WorkingStep(
-                    id: id,
-                    kind: .tool,
-                    glyph: glyph(for: item.type),
-                    summary: summary,
-                    title: summary,
-                    body: nil,
-                    command: commandText(of: item),
-                    commandLanguage: commandLanguage(of: item),
-                    output: output,
-                    isFailure: isFailure(item)
                 ))
             case .tools(_, let tools, _, _):
                 for tool in tools {
