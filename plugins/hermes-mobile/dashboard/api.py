@@ -248,43 +248,6 @@ def _device_owns_live_activity_session(
     return False
 
 
-def _manifest_error(exc: Any) -> JSONResponse:
-    return JSONResponse(
-        status_code=exc.status,
-        content={"error": {
-            "code": exc.code,
-            "message": exc.message,
-            "reset_required": bool(exc.reset),
-            "retry_after_seconds": None,
-        }},
-    )
-
-
-@router.get("/sync/manifest")
-async def sync_manifest(request: Request, scope: str = Query(...), cursor: Optional[str] = None):
-    """Return one immutable page of the plugin-owned mobile sync manifest."""
-    if not _has_dashboard_api_auth(request):
-        return JSONResponse(status_code=401, content={"detail": "Unauthorized"})
-    if _is_device_auth(request) and not _device_has_scope(request, "chat"):
-        sync = _plugin_module("sync_manifest")
-        return _manifest_error(sync.ManifestError(403, "insufficient_scope", "Device token lacks chat scope"))
-    sync = _plugin_module("sync_manifest")
-    device_id = _request_device_id(request)
-    visibility = f"device:{device_id}" if device_id else "shared"
-    engine = _plugin_module("push_engine")
-    try:
-        return sync.build_manifest(
-            scope=scope, cursor=cursor, visibility=visibility,
-            visibility_check=lambda session_id: _device_owns_stored_session(request, session_id),
-            device_registered=sync.device_is_registered(device_id, engine.registry_entries()),
-        )
-    except sync.ManifestError as exc:
-        return _manifest_error(exc)
-    except Exception:
-        _log.exception("sync manifest failed")
-        return _manifest_error(sync.ManifestError(503, "state_unavailable", "Authoritative state could not be snapshotted"))
-
-
 # ---------------------------------------------------------------------------
 # Attachment upload — bridge for remote clients (mobile/desktop-remote).
 #

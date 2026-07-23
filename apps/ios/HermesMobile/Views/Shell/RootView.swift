@@ -323,7 +323,7 @@ struct RootView: View {
 
     private var hasCachedContent: Bool {
         !sessions.sessions.isEmpty || sessions.activeStoredId != nil
-            || !chat.messages.isEmpty || sessions.manifestRevision > 0
+            || !chat.messages.isEmpty
     }
 
     /// `hermesapp://debug/open-settings` opens the same root-owned Settings
@@ -372,7 +372,7 @@ enum RootContentPolicy {
 /// visual punctuation being pronounced consistently by VoiceOver.
 struct FreshnessPresentation: Equatable, Sendable {
     enum Kind: Equatable, Sendable {
-        case connecting, syncing, fresh, offline, failedCached, partial
+        case connecting, syncing, fresh, offline, failedCached
     }
 
     let kind: Kind
@@ -387,12 +387,7 @@ struct FreshnessPresentation: Equatable, Sendable {
         "Available after synchronization establishes a fresh connection."
     }
 
-    static func resolve(
-        phase: ConnectionStore.Phase,
-        manifestFreshness: ManifestFreshness,
-        lastSyncedAt: Date?,
-        now: Date = Date()
-    ) -> Self {
+    static func resolve(phase: ConnectionStore.Phase) -> Self {
         switch phase {
         case .connecting:
             return .init(kind: .connecting, text: "Connecting", accessibilityLabel: "Connecting to server")
@@ -403,29 +398,14 @@ struct FreshnessPresentation: Equatable, Sendable {
             if reason.localizedCaseInsensitiveContains("sync") && reason.localizedCaseInsensitiveContains("fail") {
                 return .init(kind: .failedCached, text: "Sync failed · Cached data shown", accessibilityLabel: "Synchronization failed. Cached data is shown")
             }
-            let suffix = lastSyncedAt.map { " · Last synced " + relative($0, now: now) } ?? ""
-            return .init(kind: .offline, text: "Offline" + suffix, accessibilityLabel: "Offline" + suffix.replacingOccurrences(of: " · ", with: ". "))
+            return .init(kind: .offline, text: "Offline", accessibilityLabel: "Offline")
         case .connected:
-            // A completed verified hydration establishes live authority even on
-            // a legacy gateway without the manifest capability. Explicit
-            // `.partial` remains honest about that capability fallback.
-            if manifestFreshness != .partial {
-                return .init(kind: .fresh, text: "Fresh", accessibilityLabel: "Content is fresh")
-            }
-            return .init(kind: .partial, text: "Partial result", accessibilityLabel: "Partial synchronization result")
+            return .init(kind: .fresh, text: "Fresh", accessibilityLabel: "Content is fresh")
         case .needsSetup:
             return .init(kind: .connecting, text: "Connecting", accessibilityLabel: "Connection setup required")
         }
     }
 
-    private static func relative(_ date: Date, now: Date) -> String {
-        let seconds = max(0, Int(now.timeIntervalSince(date)))
-        if seconds >= 604_800 { return "\(seconds / 604_800)w ago" }
-        if seconds >= 86_400 { return "\(seconds / 86_400)d ago" }
-        if seconds >= 3_600 { return "\(seconds / 3_600)h ago" }
-        if seconds >= 60 { return "\(seconds / 60)m ago" }
-        return "just now"
-    }
 }
 
 // The top FreshnessBanner view was removed on owner order (2026-07-18). The

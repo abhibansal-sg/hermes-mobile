@@ -107,7 +107,6 @@ final class GatewayForgetCoordinatorTests: XCTestCase {
         XCTAssertNil(sessions.activeStoredId)
         XCTAssertNil(sessions.activeRuntimeId)
         XCTAssertTrue(chat.messages.isEmpty)
-        XCTAssertEqual(sessions.manifestRevision, 0)
         XCTAssertEqual(connection.phase, .needsSetup)
     }
 }

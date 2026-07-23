@@ -84,8 +84,6 @@ final class ConnectionPhaseTests: XCTestCase {
     }
 
     func testFreshnessStatesHaveDistinctVoiceOverTextAndAuthority() {
-        let now = Date(timeIntervalSince1970: 2_000_000)
-        let weekAgo = now.addingTimeInterval(-7 * 86_400)
         // #203 contract: every phase still resolves to a distinct VoiceOver
         // label and honest mutation authority. The `showsBanner` column was
         // dropped when the top status strip was removed completely on owner
@@ -93,20 +91,16 @@ final class ConnectionPhaseTests: XCTestCase {
         // banner, so there is no banner-visibility contract left to pin. The
         // underlying kind/label/authority state machinery is retained for the
         // surviving consumers (DrawerView, InboxView).
-        let cases: [(ConnectionStore.Phase, ManifestFreshness, FreshnessPresentation.Kind, String)] = [
-            (.connecting, .cached, .connecting, "Connecting to server"),
-            (.hydrating, .cached, .syncing, "Synchronizing cached content"),
-            (.connected, .fresh, .fresh, "Content is fresh"),
-            (.offline("network unavailable"), .cached, .offline, "Offline. Last synced 1w ago"),
-            (.offline("sync failed"), .cached, .failedCached, "Synchronization failed. Cached data is shown"),
-            (.connected, .partial, .partial, "Partial synchronization result"),
+        let cases: [(ConnectionStore.Phase, FreshnessPresentation.Kind, String)] = [
+            (.connecting, .connecting, "Connecting to server"),
+            (.hydrating, .syncing, "Synchronizing cached content"),
+            (.connected, .fresh, "Content is fresh"),
+            (.offline("network unavailable"), .offline, "Offline"),
+            (.offline("sync failed"), .failedCached, "Synchronization failed. Cached data is shown"),
         ]
         var labels = Set<String>()
-        for (phase, freshness, kind, label) in cases {
-            let value = FreshnessPresentation.resolve(
-                phase: phase, manifestFreshness: freshness,
-                lastSyncedAt: weekAgo, now: now
-            )
+        for (phase, kind, label) in cases {
+            let value = FreshnessPresentation.resolve(phase: phase)
             XCTAssertEqual(value.kind, kind)
             XCTAssertEqual(value.accessibilityLabel, label)
             labels.insert(value.accessibilityLabel)
@@ -116,9 +110,7 @@ final class ConnectionPhaseTests: XCTestCase {
     }
 
     func testCompactAndSplitLayoutsShareFreshnessValue() {
-        let value = FreshnessPresentation.resolve(
-            phase: .hydrating, manifestFreshness: .cached, lastSyncedAt: nil
-        )
+        let value = FreshnessPresentation.resolve(phase: .hydrating)
         // RootView computes this before its size-class branch, so both layouts
         // receive the same immutable presentation without changing selection.
         XCTAssertEqual(value.text, "Syncing")

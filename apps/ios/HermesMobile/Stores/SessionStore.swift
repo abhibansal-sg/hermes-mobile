@@ -326,9 +326,6 @@ final class SessionStore {
         lastActivityStampAt.removeAll()
         turnsInProgress.removeAll()
 
-        manifestFreshness = .cached
-        manifestLastSyncedAt = nil
-        manifestRevision = 0
         coldReadCacheScope = nil
         lastColdReadServerId = nil
 
@@ -1454,12 +1451,6 @@ final class SessionStore {
     /// Wired once by `AppEnvironment.attachCache(_:)`.
     private var cacheStore: CacheStore?
 
-    /// The last atomically committed manifest state, restored with the drawer.
-    /// It is the shared freshness source for compact and split shells.
-    private(set) var manifestFreshness: ManifestFreshness = .cached
-    private(set) var manifestLastSyncedAt: Date?
-    private(set) var manifestRevision: Int64 = 0
-
     /// Latches `true` after the first `refresh()` has run the cold-launch cache
     /// read. The read only fires when `sessions` is still empty (cold launch),
     /// so a warm in-memory list is never overwritten by a (possibly older) disk
@@ -2258,11 +2249,6 @@ final class SessionStore {
         }
         do {
             lastColdReadServerId = scope.serverId
-            if let manifest = try? await cacheStore.loadManifestProjection(scope: scope) {
-                manifestFreshness = manifest.freshness
-                manifestLastSyncedAt = manifest.lastSyncedAt
-                manifestRevision = manifest.revision
-            }
             var cached = Self.filterCachedSessions(
                 try await cacheStore.loadSessionList(scope: scope),
                 activeProfile: activeProfile,

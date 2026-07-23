@@ -1692,9 +1692,7 @@ struct DrawerView: View {
     @ViewBuilder
     private func rowContextMenu(for summary: SessionSummary, pinned: Bool) -> some View {
         let freshness = FreshnessPresentation.resolve(
-            phase: connection.phase,
-            manifestFreshness: sessions.manifestFreshness,
-            lastSyncedAt: sessions.manifestLastSyncedAt
+            phase: connection.phase
         )
         Button {
             pinFeedbackTrigger = UUID()   // DC-01: pin haptic (fires at row level)
