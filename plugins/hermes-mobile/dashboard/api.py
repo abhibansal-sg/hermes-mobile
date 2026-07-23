@@ -177,8 +177,11 @@ def _device_may_manage_attention(request: Request, session_id: str) -> bool:
 
     A watched desktop session intentionally has no mobile device owner.  S13 is
     the response path for that case because stock WS response ownership must
-    remain strict.  Unknown sessions still fail closed, and a device-owned
-    session remains restricted to that one device.
+    remain strict.  Ownership is live-socket-scoped: a session is restricted to
+    its owning device only while that device's WS socket is registered.  A
+    session with no live device socket (desktop/TUI, or a transiently
+    disconnected phone) is shared and resolvable by any paired device.  Unknown
+    sessions still fail closed.
     """
     device_id = _request_device_id(request)
     if device_id is None:
