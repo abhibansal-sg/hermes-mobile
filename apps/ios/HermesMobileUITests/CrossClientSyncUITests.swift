@@ -17,6 +17,9 @@ final class CrossClientSyncUITests: XCTestCase {
         let app = XCUIApplication()
         app.launchEnvironment["HERMES_URL"] = base
         app.launchEnvironment["HERMES_TOKEN"] = token
+        if let relayURL = env["HERMES_RELAY_URL"], !relayURL.isEmpty {
+            app.launchEnvironment["HERMES_RELAY_URL"] = relayURL
+        }
         app.launchEnvironment["HERMES_TRANSPORT"] = "gatewayDirect"
         app.launchArguments += ["-hermes.transportPath", "gatewayDirect"]
         app.launchArguments += ["-hermes.connectionMode", "remoteURL"]
@@ -33,12 +36,12 @@ final class CrossClientSyncUITests: XCTestCase {
         ownedSession.tap()
 
         XCTAssertTrue(
-            app.staticTexts.containing(
+            app.descendants(matching: .any).matching(
                 NSPredicate(format: "label CONTAINS %@", marker + "-FIRST")
             ).firstMatch.waitForExistence(timeout: 60),
             "Externally owned session did not paint its first turn"
         )
-        let secondReply = app.staticTexts.containing(
+        let secondReply = app.descendants(matching: .any).matching(
             NSPredicate(format: "label CONTAINS %@", marker + "-SECOND")
         ).firstMatch
         let springboard = XCUIApplication(bundleIdentifier: "com.apple.springboard")
@@ -199,6 +202,9 @@ final class CrossClientSyncUITests: XCTestCase {
         let app = XCUIApplication()
         app.launchEnvironment["HERMES_URL"] = base
         app.launchEnvironment["HERMES_TOKEN"] = token
+        if let relayURL = env["HERMES_RELAY_URL"], !relayURL.isEmpty {
+            app.launchEnvironment["HERMES_RELAY_URL"] = relayURL
+        }
         app.launchArguments += ["--uitest-mute-audio"]
         app.launch()
         XCTAssertTrue(app.buttons["drawerToggle"].waitForExistence(timeout: 30))
@@ -363,7 +369,7 @@ final class CrossClientSyncUITests: XCTestCase {
         firstRow.tap()
         // Resume finished once the prior transcript is visible.
         XCTAssertTrue(
-            app.staticTexts.containing(
+            app.descendants(matching: .any).matching(
                 NSPredicate(format: "label CONTAINS %@", "HELLO-FROM-DESKTOP")
             ).firstMatch.waitForExistence(timeout: 60),
             "Resumed transcript did not load"
@@ -413,7 +419,7 @@ final class CrossClientSyncUITests: XCTestCase {
         //     short budget is therefore sufficient; if MIRRORTEST is still
         //     absent the turn DID finish but the app dropped it — a genuine
         //     app/server mirror bug, not a slow model.
-        let mirrored = app.staticTexts.containing(
+        let mirrored = app.descendants(matching: .any).matching(
             NSPredicate(format: "label CONTAINS[c] %@", "MIRRORTEST")
         ).firstMatch
         let mirrorRendered = mirrored.waitForExistence(timeout: 15)
