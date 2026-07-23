@@ -166,12 +166,16 @@ final class ProtocolParityTests: XCTestCase {
                     "id": .string("runtime-watch"),
                     "session_key": .string("stored-watch"),
                     "status": .string("working"),
+                    "model": .string("review-model"),
                 ]),
             ]),
         ])
         let result = try XCTUnwrap(json.decoded(as: SessionActiveListResult.self))
         XCTAssertEqual(result.sessions, [
-            SessionActiveItem(id: "runtime-watch", sessionKey: "stored-watch", status: .working)
+            SessionActiveItem(
+                id: "runtime-watch", sessionKey: "stored-watch", status: .working,
+                model: "review-model"
+            )
         ])
     }
 
@@ -184,7 +188,10 @@ final class ProtocolParityTests: XCTestCase {
         sessions.transcriptFetch = { _ in [] }
         sessions.activeListRPC = {
             SessionActiveListResult(sessions: [
-                SessionActiveItem(id: "runtime-desktop", sessionKey: "stored-desktop", status: .working)
+                SessionActiveItem(
+                    id: "runtime-desktop", sessionKey: "stored-desktop", status: .working,
+                    model: "watch-model"
+                )
             ])
         }
         var resumeCalls = 0
@@ -207,6 +214,7 @@ final class ProtocolParityTests: XCTestCase {
         XCTAssertEqual(sessions.sessionBinding?.storedID, "stored-desktop")
         XCTAssertEqual(sessions.sessionBinding?.runtimeID, "runtime-desktop")
         XCTAssertEqual(sessions.sessionBinding?.mode, .watch)
+        XCTAssertEqual(connection.sessionModelRaw, "watch-model")
 
         chat.handle(event: GatewayEvent(params: .object([
             "type": .string("message.start"),

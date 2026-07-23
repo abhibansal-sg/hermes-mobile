@@ -271,6 +271,7 @@ struct SessionActiveItem: Decodable, Sendable, Equatable {
     let id: String
     let sessionKey: String
     let status: Status
+    let model: String?
 
     enum Status: String, Decodable, Sendable {
         case idle

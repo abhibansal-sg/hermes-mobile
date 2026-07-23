@@ -8,6 +8,26 @@ import XCTest
 ///   invocation (surfaced here as HERMES_URL / HERMES_TOKEN).
 /// Skips (rather than fails) when credentials are absent so the suite
 /// stays green in CI without a backend.
+@MainActor
+func dismissDeviceConnectionBannerIfPresent() {
+    let springboard = XCUIApplication(bundleIdentifier: "com.apple.springboard")
+    let banner = springboard.staticTexts["Connected"]
+    guard banner.waitForExistence(timeout: 2) else { return }
+    banner.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5))
+        .press(
+            forDuration: 0.05,
+            thenDragTo: springboard.coordinate(
+                withNormalizedOffset: CGVector(dx: 0.25, dy: -0.05)
+            ),
+            withVelocity: .fast,
+            thenHoldForDuration: 0
+        )
+    XCTAssertTrue(
+        banner.waitForNonExistence(timeout: 5),
+        "The iPhone connection banner still covers the app"
+    )
+}
+
 final class ChatFlowUITests: XCTestCase {
 
     override func setUpWithError() throws {
@@ -24,6 +44,11 @@ final class ChatFlowUITests: XCTestCase {
         let app = XCUIApplication()
         app.launchEnvironment["HERMES_URL"] = url
         app.launchEnvironment["HERMES_TOKEN"] = token
+        if let relayURL = env["HERMES_RELAY_URL"], !relayURL.isEmpty {
+            app.launchEnvironment["HERMES_RELAY_URL"] = relayURL
+        }
+        app.launchArguments += ["-hermes.connectionOffline", "false"]
+        app.launchArguments += ["-hermes.connectionMode", "remoteURL"]
         app.launchArguments += ["--uitest-mute-audio"]
         app.launch()
 
@@ -37,15 +62,10 @@ final class ChatFlowUITests: XCTestCase {
             "Connected chat shell (draft home) did not appear"
         )
 
-        // 2. The draft chat's composer is present from launch. Target it by its
-        //    placeholder ("Message Hermes…") rather than `firstMatch`: with the
-        //    F1 push-card drawer the drawer's "Search" TextField also lives in the
-        //    tree (beneath the chat card), and a bare `firstMatch` would type into
-        //    it instead of the composer. A vertical-axis SwiftUI TextField is
-        //    exposed as either a textField or a textView, so we accept both.
-        let composerPlaceholder = "Message Hermes…"
-        let composerField = app.textFields[composerPlaceholder]
-        let composerTextView = app.textViews[composerPlaceholder]
+        // 2. A physical device preserves per-session drafts between launches,
+        //    so the placeholder is not a stable query. Use the field's identity.
+        let composerField = app.textFields["composerInput"]
+        let composerTextView = app.textViews["composerInput"]
         XCTAssertTrue(
             composerField.waitForExistence(timeout: 20)
                 || composerTextView.waitForExistence(timeout: 5),
@@ -63,7 +83,7 @@ final class ChatFlowUITests: XCTestCase {
         send.tap()
 
         // 4. The streamed assistant reply lands in the transcript.
-        let reply = app.staticTexts.containing(
+        let reply = app.textViews.matching(
             NSPredicate(format: "label CONTAINS[c] %@", "Paris")
         ).firstMatch
         XCTAssertTrue(
@@ -178,6 +198,7 @@ final class ChatFlowUITests: XCTestCase {
     /// its STORED session across a cache/reset navigation, while its runtime id
     /// remains the response target. This is deliberately one narrow workflow,
     /// matching the device failure instead of replaying the full UI suite.
+    @MainActor
     func testClarificationStaysWithOwningSessionAcrossSwitch() throws {
         let env = ProcessInfo.processInfo.environment
         guard let url = env["HERMES_URL"], let token = env["HERMES_TOKEN"],
@@ -188,24 +209,31 @@ final class ChatFlowUITests: XCTestCase {
         let app = XCUIApplication()
         app.launchEnvironment["HERMES_URL"] = url
         app.launchEnvironment["HERMES_TOKEN"] = token
+        if let relayURL = env["HERMES_RELAY_URL"], !relayURL.isEmpty {
+            app.launchEnvironment["HERMES_RELAY_URL"] = relayURL
+        }
+        app.launchArguments += ["-hermes.connectionOffline", "false"]
+        app.launchArguments += ["-hermes.connectionMode", "remoteURL"]
         app.launchArguments += ["--uitest-mute-audio"]
         app.launch()
 
         let drawerToggle = app.buttons["drawerToggle"]
         XCTAssertTrue(drawerToggle.waitForExistence(timeout: 30))
-        drawerToggle.tap()
-        let initialNewChat = app.buttons["drawerNewChat"]
-        XCTAssertTrue(initialNewChat.waitForExistence(timeout: 15))
-        initialNewChat.tap()
-        let field = app.textFields["Message Hermes…"]
-        let textView = app.textViews["Message Hermes…"]
+        dismissDeviceConnectionBannerIfPresent()
+        let newChat = app.buttons["newChatButton"]
+        XCTAssertTrue(newChat.waitForExistence(timeout: 15))
+        XCTAssertTrue(newChat.isHittable, "Toolbar New Chat action is not hittable")
+        newChat.tap()
+        let field = app.textFields["composerInput"]
+        let textView = app.textViews["composerInput"]
         XCTAssertTrue(field.waitForExistence(timeout: 20) || textView.waitForExistence(timeout: 5))
         let composer = field.exists ? field : textView
         composer.tap()
         composer.typeText(
             "ABH519 physical owner check. Use the clarify tool now to ask exactly "
                 + "'ABH519 owner check?' with choices Left and Right. After I answer, reply "
-                + "with exactly 'ABH519 owner answered'."
+                + "with the uppercase form of the words 'abh five one nine owner answered' "
+                + "and nothing else."
         )
         app.buttons["Send"].tap()
 
@@ -217,15 +245,27 @@ final class ChatFlowUITests: XCTestCase {
             "The owning session never rendered its clarification card"
         )
 
-        drawerToggle.tap()
-        let newChat = app.buttons["drawerNewChat"]
+        dismissDeviceConnectionBannerIfPresent()
         XCTAssertTrue(newChat.waitForExistence(timeout: 15))
+        XCTAssertTrue(newChat.isHittable, "Toolbar New Chat action is not hittable")
         newChat.tap()
-        XCTAssertFalse(
-            clarifyCard.waitForExistence(timeout: 3),
+        let clarificationClearedOnDraft = clarifyCard.waitForNonExistence(timeout: 5)
+        if !clarificationClearedOnDraft {
+            let attachment = XCTAttachment(screenshot: app.screenshot())
+            attachment.name = "abh519-clarification-after-new-chat"
+            attachment.lifetime = .keepAlways
+            add(attachment)
+            print(
+                "ABH519_AFTER_NEW_CHAT exists=\(clarifyCard.exists) "
+                    + "hittable=\(clarifyCard.isHittable) frame=\(clarifyCard.frame)"
+            )
+        }
+        XCTAssertTrue(
+            clarificationClearedOnDraft,
             "Session A's clarification rendered inline on the draft/B surface"
         )
 
+        dismissDeviceConnectionBannerIfPresent()
         drawerToggle.tap()
         let newestSession = app.buttons["sessionRow"].firstMatch
         XCTAssertTrue(newestSession.waitForExistence(timeout: 20))
@@ -238,13 +278,13 @@ final class ChatFlowUITests: XCTestCase {
         let answer = app.buttons["Left"]
         XCTAssertTrue(answer.waitForExistence(timeout: 10))
         answer.tap()
-        XCTAssertFalse(
-            clarifyCard.waitForExistence(timeout: 20),
+        XCTAssertTrue(
+            clarifyCard.waitForNonExistence(timeout: 20),
             "The answered clarification card did not clear"
         )
         XCTAssertTrue(
-            app.staticTexts.containing(
-                NSPredicate(format: "label CONTAINS %@", "ABH519 owner answered")
+            app.textViews.matching(
+                NSPredicate(format: "label CONTAINS %@", "ABH FIVE ONE NINE OWNER ANSWERED")
             ).firstMatch.waitForExistence(timeout: 180),
             "The clarification answer did not resume and complete the owning turn"
         )
@@ -259,45 +299,42 @@ final class ChatFlowUITests: XCTestCase {
     func testApprovalPushOpensOwningGateAndResumesTurn() throws {
         let env = ProcessInfo.processInfo.environment
         guard let url = env["HERMES_URL"], let token = env["HERMES_TOKEN"],
-              !url.isEmpty, !token.isEmpty else {
-            throw XCTSkip("HERMES_URL/HERMES_TOKEN not provided; skipping live test")
+              let marker = env["HERMES_LIVE_FOLLOW_MARKER"],
+              !url.isEmpty, !token.isEmpty, !marker.isEmpty else {
+            throw XCTSkip("live gateway credentials/marker not provided; skipping live test")
         }
 
         let app = XCUIApplication()
         app.launchEnvironment["HERMES_URL"] = url
         app.launchEnvironment["HERMES_TOKEN"] = token
+        if let relayURL = env["HERMES_RELAY_URL"], !relayURL.isEmpty {
+            app.launchEnvironment["HERMES_RELAY_URL"] = relayURL
+        }
         app.launchEnvironment["HERMES_TRANSPORT"] = "gatewayDirect"
         app.launchArguments += ["-hermes.transportPath", "gatewayDirect"]
         app.launchArguments += ["-hermes.connectionMode", "remoteURL"]
+        app.launchArguments += ["-hermes.connectionOffline", "false"]
         app.launchArguments += ["--uitest-mute-audio"]
         app.launch()
 
         let drawerToggle = app.buttons["drawerToggle"]
         XCTAssertTrue(drawerToggle.waitForExistence(timeout: 30))
-        drawerToggle.tap()
-        let newChat = app.buttons["drawerNewChat"]
-        XCTAssertTrue(newChat.waitForExistence(timeout: 15))
-        newChat.tap()
+        dismissDeviceConnectionBannerIfPresent()
 
-        let field = app.textFields["Message Hermes…"]
-        let textView = app.textViews["Message Hermes…"]
-        XCTAssertTrue(field.waitForExistence(timeout: 20) || textView.waitForExistence(timeout: 5))
-        let composer = field.exists ? field : textView
-        composer.tap()
-        composer.typeText(
-            "Use the terminal exactly once to run: rm -f /private/tmp/abh519-approval-gate-physical. "
-                + "After it succeeds, reply with the uppercase form of 'abh519 approval resumed' "
-                + "and nothing else."
-        )
-        app.buttons["Send"].tap()
-        XCTAssertTrue(app.buttons["Interrupt"].waitForExistence(timeout: 30))
-
-        XCUIDevice.shared.press(.home)
         let springboard = XCUIApplication(bundleIdentifier: "com.apple.springboard")
-        let notification = springboard.buttons.containing(
-            NSPredicate(format: "label CONTAINS[c] %@", "approval")
-        ).firstMatch
-        if !notification.waitForExistence(timeout: 15) {
+        XCUIDevice.shared.press(.home)
+        RunLoop.current.run(until: Date().addingTimeInterval(2))
+        let approvalNotifications = springboard.buttons.containing(
+            NSPredicate(format: "label CONTAINS %@", "Approval required")
+        )
+        let baselineNotificationCount = approvalNotifications.count
+        print("ABH519_APPROVAL_PUSH_READY")
+        let notification = approvalNotifications.firstMatch
+        let bannerDeadline = Date().addingTimeInterval(15)
+        while approvalNotifications.count <= baselineNotificationCount, Date() < bannerDeadline {
+            RunLoop.current.run(until: Date().addingTimeInterval(0.25))
+        }
+        if approvalNotifications.count <= baselineNotificationCount {
             springboard.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.01))
                 .press(
                     forDuration: 0.1,
@@ -306,13 +343,22 @@ final class ChatFlowUITests: XCTestCase {
                     )
                 )
             let focusGroup = springboard.buttons.containing(
-                NSPredicate(format: "label CONTAINS[c] %@", "While in Do Not Disturb, Hermes Agent")
+                NSPredicate(format: "label CONTAINS[c] %@", "While in Do Not Disturb")
             ).firstMatch
             if focusGroup.waitForExistence(timeout: 5) {
                 focusGroup.tap()
             }
         }
-        XCTAssertTrue(notification.waitForExistence(timeout: 20), "stock approval hook sent no push")
+        let notificationDeadline = Date().addingTimeInterval(20)
+        while approvalNotifications.count <= baselineNotificationCount,
+              Date() < notificationDeadline {
+            RunLoop.current.run(until: Date().addingTimeInterval(0.25))
+        }
+        XCTAssertGreaterThan(
+            approvalNotifications.count,
+            baselineNotificationCount,
+            "stock approval hook sent no new push"
+        )
         notification.tap()
         app.activate()
 
@@ -322,7 +368,7 @@ final class ChatFlowUITests: XCTestCase {
         XCTAssertTrue(approvalCard.waitForExistence(timeout: 30), "approval push opened no gate")
         XCTAssertTrue(
             app.staticTexts.containing(
-                NSPredicate(format: "label CONTAINS %@", "abh519-approval-gate-physical")
+                NSPredicate(format: "label CONTAINS %@", marker + "-COMMAND")
             ).firstMatch.waitForExistence(timeout: 10),
             "approval push opened a foreign gate"
         )
@@ -330,7 +376,7 @@ final class ChatFlowUITests: XCTestCase {
         XCTAssertTrue(approvalCard.waitForNonExistence(timeout: 30), "approved gate did not clear")
         XCTAssertTrue(
             app.textViews.containing(
-                NSPredicate(format: "label CONTAINS %@", "ABH519 APPROVAL RESUMED")
+                NSPredicate(format: "label CONTAINS %@", marker + "-ANSWERED")
             ).firstMatch.waitForExistence(timeout: 180),
             "approval response did not resume the blocked turn"
         )
@@ -413,6 +459,149 @@ final class ChatFlowUITests: XCTestCase {
         attachment.name = "appearance-picker"
         attachment.lifetime = .keepAlways
         add(attachment)
+    }
+
+    func testProjectsTabLoadsAndNewProjectSheetOpens() throws {
+        let env = ProcessInfo.processInfo.environment
+        guard let url = env["HERMES_URL"], let token = env["HERMES_TOKEN"],
+              !url.isEmpty, !token.isEmpty else {
+            throw XCTSkip("HERMES_URL/HERMES_TOKEN not provided; skipping live test")
+        }
+
+        let app = XCUIApplication()
+        app.launchEnvironment["HERMES_URL"] = url
+        app.launchEnvironment["HERMES_TOKEN"] = token
+        if let relayURL = env["HERMES_RELAY_URL"], !relayURL.isEmpty {
+            app.launchEnvironment["HERMES_RELAY_URL"] = relayURL
+        }
+        app.launchArguments += ["--uitest-mute-audio"]
+        app.launch()
+
+        let drawerToggle = app.buttons["drawerToggle"]
+        XCTAssertTrue(drawerToggle.waitForExistence(timeout: 30))
+        drawerToggle.tap()
+
+        let tabs = app.segmentedControls["drawerTabToggle"]
+        XCTAssertTrue(tabs.waitForExistence(timeout: 15), "Drawer section control missing")
+        tabs.buttons["Projects"].tap()
+
+        let projectRow = app.buttons["projectRow"].firstMatch
+        let emptyState = app.staticTexts["No projects found"]
+        XCTAssertTrue(
+            projectRow.waitForExistence(timeout: 15) || emptyState.waitForExistence(timeout: 5),
+            "Projects route produced neither content nor its honest empty state"
+        )
+        XCTAssertFalse(app.staticTexts["Couldn't load projects"].exists)
+
+        let newProject = app.buttons["drawerNewProject"]
+        XCTAssertTrue(newProject.waitForExistence(timeout: 10))
+        newProject.tap()
+        XCTAssertTrue(app.textFields["newProjectName"].waitForExistence(timeout: 10))
+        XCTAssertTrue(app.textFields["newProjectRoot"].exists)
+        app.buttons["newProjectCancel"].tap()
+    }
+
+    func testWorkingDirectoryAndFileBrowserRoundTrip() throws {
+        let env = ProcessInfo.processInfo.environment
+        guard let url = env["HERMES_URL"], let token = env["HERMES_TOKEN"],
+              !url.isEmpty, !token.isEmpty else {
+            throw XCTSkip("HERMES_URL/HERMES_TOKEN not provided; skipping live test")
+        }
+
+        let app = XCUIApplication()
+        app.launchEnvironment["HERMES_URL"] = url
+        app.launchEnvironment["HERMES_TOKEN"] = token
+        if let relayURL = env["HERMES_RELAY_URL"], !relayURL.isEmpty {
+            app.launchEnvironment["HERMES_RELAY_URL"] = relayURL
+        }
+        app.launchArguments += ["--uitest-mute-audio"]
+        app.launch()
+
+        let drawerToggle = app.buttons["drawerToggle"]
+        XCTAssertTrue(drawerToggle.waitForExistence(timeout: 30))
+        drawerToggle.tap()
+        let session = app.buttons["sessionRow"].firstMatch
+        XCTAssertTrue(session.waitForExistence(timeout: 20))
+        session.tap()
+
+        let overflow = app.buttons["chatOverflowMenu"]
+        XCTAssertTrue(overflow.waitForExistence(timeout: 20))
+        overflow.tap()
+        let workingDirectory = app.buttons["workingDirMenuItem"]
+        XCTAssertTrue(workingDirectory.waitForExistence(timeout: 15))
+        workingDirectory.tap()
+
+        let useRoot = app.buttons["fileBrowserUseFolder"]
+        XCTAssertTrue(useRoot.waitForExistence(timeout: 20))
+        useRoot.tap()
+        let cwdConfirmation = app.descendants(matching: .any).matching(
+            NSPredicate(format: "label CONTAINS[c] %@", "Working directory set to")
+        ).firstMatch
+        XCTAssertTrue(cwdConfirmation.waitForExistence(timeout: 20))
+
+        let attach = app.buttons["composerAttachButton"]
+        XCTAssertTrue(attach.waitForExistence(timeout: 10))
+        attach.tap()
+        let browse = app.buttons["composerBrowseFiles"]
+        XCTAssertTrue(browse.waitForExistence(timeout: 10))
+        browse.tap()
+        XCTAssertTrue(app.navigationBars["Files"].waitForExistence(timeout: 20))
+        app.navigationBars["Files"].buttons["Done"].firstMatch.tap()
+        XCTAssertTrue(
+            app.textFields["composerInput"].waitForExistence(timeout: 10)
+                || app.textViews["composerInput"].waitForExistence(timeout: 3)
+        )
+    }
+
+    func testSessionModelPickerAndYoloToggleRoundTrip() throws {
+        let env = ProcessInfo.processInfo.environment
+        guard let url = env["HERMES_URL"], let token = env["HERMES_TOKEN"],
+              !url.isEmpty, !token.isEmpty else {
+            throw XCTSkip("HERMES_URL/HERMES_TOKEN not provided; skipping live test")
+        }
+
+        let app = XCUIApplication()
+        app.launchEnvironment["HERMES_URL"] = url
+        app.launchEnvironment["HERMES_TOKEN"] = token
+        if let relayURL = env["HERMES_RELAY_URL"], !relayURL.isEmpty {
+            app.launchEnvironment["HERMES_RELAY_URL"] = relayURL
+        }
+        app.launchArguments += ["--uitest-mute-audio"]
+        app.launch()
+
+        let drawerToggle = app.buttons["drawerToggle"]
+        XCTAssertTrue(drawerToggle.waitForExistence(timeout: 30))
+        drawerToggle.tap()
+        let session = app.buttons["sessionRow"].firstMatch
+        XCTAssertTrue(session.waitForExistence(timeout: 20))
+        session.tap()
+
+        let yolo = app.buttons["composerYoloToggle"]
+        XCTAssertTrue(yolo.waitForExistence(timeout: 10))
+        XCTAssertTrue(yolo.isHittable)
+        let initial = yolo.value as? String
+        XCTAssertTrue(initial == "On" || initial == "Off")
+        yolo.tap()
+        let changed = XCTNSPredicateExpectation(
+            predicate: NSPredicate(format: "value != %@ AND value != %@", initial ?? "", "Updating"),
+            object: yolo
+        )
+        XCTAssertEqual(XCTWaiter.wait(for: [changed], timeout: 15), .completed)
+        yolo.tap()
+        let restored = XCTNSPredicateExpectation(
+            predicate: NSPredicate(format: "value == %@", initial ?? ""),
+            object: yolo
+        )
+        XCTAssertEqual(XCTWaiter.wait(for: [restored], timeout: 15), .completed)
+
+        let model = app.buttons["composerModelChip"]
+        XCTAssertTrue(model.waitForExistence(timeout: 20))
+        model.tap()
+        let modelSheet = app.navigationBars["This Chat"]
+        XCTAssertTrue(modelSheet.waitForExistence(timeout: 15))
+        XCTAssertTrue(app.searchFields["Filter models"].waitForExistence(timeout: 20))
+        modelSheet.buttons["Done"].firstMatch.tap()
+        XCTAssertTrue(modelSheet.waitForNonExistence(timeout: 10))
     }
 
     /// BUG 2 (hotfix): the open-drawer swipe works from mid-screen with
