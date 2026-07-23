@@ -63,7 +63,6 @@ class _FakeRelayClient:
         register_exc: Exception | None = None,
     ) -> None:
         self.configured = configured
-        self.events = []
         self.device_registrations = []
         self.device_unregistrations = []
         self.register_exc = register_exc
@@ -76,9 +75,6 @@ class _FakeRelayClient:
 
     def map_push_kind(self, kind: str) -> str:
         return self._KIND_MAP.get(kind, "proactive")
-
-    async def send_event(self, **kwargs):
-        self.events.append(kwargs)
 
     async def register_device(self, **kwargs):
         if self.register_exc is not None:
@@ -106,39 +102,6 @@ def _push_test_client(monkeypatch, relay_client):
     app = fastapi.FastAPI()
     app.include_router(api.router)
     return testclient.TestClient(app)
-
-
-def test_relay_test_push_reports_no_push_configured_without_transport(monkeypatch):
-    relay = _FakeRelayClient(configured=False)
-    client = _push_test_client(monkeypatch, relay)
-
-    resp = client.post("/relay/test-push")
-
-    assert resp.status_code == 200
-    body = resp.json()
-    assert body == {
-        "ok": False,
-        "transport": "none",
-        "detail": "no push configured",
-    }
-    assert "relay URL is not configured" not in body["detail"]
-    assert relay.events == []
-
-
-def test_relay_test_push_keeps_relay_path_when_relay_configured(monkeypatch):
-    relay = _FakeRelayClient(configured=True)
-    client = _push_test_client(monkeypatch, relay)
-
-    resp = client.post("/relay/test-push")
-
-    assert resp.status_code == 200
-    assert resp.json() == {
-        "ok": True,
-        "transport": "relay",
-        "detail": "sent via relay",
-    }
-    assert len(relay.events) == 1
-    assert relay.events[0]["source"] == "relay_test_push"
 
 
 def test_push_register_forwards_device_token_to_configured_relay(monkeypatch):

@@ -43,8 +43,8 @@ import secrets
 import stat
 import sys
 import time
-import urllib.error
 import urllib.parse
+import urllib.error
 import urllib.request
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -1262,23 +1262,18 @@ async def fs_diff(request: Request, session_id: str = "", path: str = ""):
 
 
 # ---------------------------------------------------------------------------
-# APNs push registration (formerly ``hermes_cli.push_notify.router`` mounted
-# at /api/push/*; now plugin-owned at .../push/*). The engine lives in this
-# plugin's ``push_engine.py``; sending stays dormant until HERMES_PUSH_ENABLED
-# + key file (see push_engine module docstring).
+# Push registration. Alert tokens and delivery are relay-owned; the plugin
+# retains only the gateway-event adapter and ActivityKit-specific token path.
 # ---------------------------------------------------------------------------
 
 
 class PushRegisterBody(BaseModel):
     token: str
     platform: str = "ios"
-    env: str = ""  # "sandbox" | "production"; empty → server default
-    # Per-event opt-in subset of ["approval","clarify","turn_complete"].
-    # None/absent → all events (legacy entries keep working).
+    env: str = ""  # "sandbox" | "production"; empty → production
+    # Per-event opt-in subset. None/absent enables all relay push kinds.
     events: Optional[List[str]] = None
-    # Stable per-install device identity (QA-2 R1c): lets the registry keep
-    # ONE token per device (a re-register with a rotated token replaces the
-    # device's old entry). Absent → legacy token-string-only dedup.
+    # Retained for request compatibility; relay registration is token-owned.
     device_id: Optional[str] = None
 
 
@@ -1307,122 +1302,9 @@ class LiveActivityBody(BaseModel):
     env: str = ""  # "sandbox" | "production"; empty → server default
 
 
-class RelayConfigBody(BaseModel):
-    relay_url: Optional[str] = None
-    registration_token: Optional[str] = None
-
-
-def _relay_config_payload() -> Dict[str, Any]:
-    relay = _plugin_module("relay_client")
-    token = relay.relay_registration_token()
-    return {
-        "relay_url": relay.relay_url(),
-        "registration_token_set": bool(token),
-        "registration_token_prefix": token[:8] if token else None,
-        "push_kinds": list(relay.RELAY_PUSH_KINDS),
-    }
-
-
-async def _relay_status_payload(relay: Any) -> Dict[str, Any]:
-    """Return a truthful coarse relay health payload from real local signals."""
-    failure_count = relay.relay_delivery_failure_count()
-    try:
-        tunnel_status = await relay.relay_client().tunnel_status()
-    except Exception as exc:
-        tunnel_status = {"ok": False, "reason": type(exc).__name__}
-        detail = str(exc).strip()
-        if detail:
-            tunnel_status["detail"] = detail
-
-    if failure_count > 0:
-        health = "failing"
-    elif tunnel_status.get("reason") == "tunnel_status_unimplemented":
-        health = "unknown"
-    elif bool(tunnel_status.get("ok") or tunnel_status.get("agent_online")):
-        health = "ok"
-    else:
-        health = "failing"
-
-    return {
-        "configured": True,
-        "health": health,
-        "delivery_failure_count": failure_count,
-        "tunnel_status": tunnel_status,
-    }
-
-
-def _validate_relay_url(raw_url: Optional[str]) -> str | None:
-    value = (raw_url or "").strip().rstrip("/")
-    if not value:
-        return None
-    parsed = urllib.parse.urlparse(value)
-    if parsed.scheme != "https":
-        raise ValueError("relay_url must use https")
-    if not parsed.netloc:
-        raise ValueError("relay_url must include a host")
-    return value
-
-
-@router.get("/relay/config")
-async def get_relay_config(request: Request) -> Dict[str, Any]:
-    """Return relay push configuration without revealing the registration token."""
-    if not _has_dashboard_api_auth(request):
-        raise HTTPException(status_code=401, detail="Unauthorized")
-    if not _device_has_scope(request, "approve"):
-        raise HTTPException(status_code=403, detail="Device token lacks approve scope")
-    return _relay_config_payload()
-
-
-@router.get("/relay/status")
-async def get_relay_status(request: Request) -> Any:
-    """Return the relay's truthful coarse health without probing fake signals."""
-    if not _has_dashboard_api_auth(request):
-        raise HTTPException(status_code=401, detail="Unauthorized")
-    if not _device_has_scope(request, "approve"):
-        raise HTTPException(status_code=403, detail="Device token lacks approve scope")
-
-    relay = _plugin_module("relay_client")
-    if not relay.relay_url_configured():
-        return JSONResponse(
-            status_code=400,
-            content={
-                "configured": False,
-                "health": "unconfigured",
-                "delivery_failure_count": relay.relay_delivery_failure_count(),
-                "detail": "relay URL is not configured",
-            },
-        )
-
-    return await _relay_status_payload(relay)
-
-
-@router.put("/relay/config")
-async def set_relay_config(body: RelayConfigBody, request: Request) -> Any:
-    """Set or clear relay push configuration via relay_client's env storage."""
-    if not _has_dashboard_api_auth(request):
-        raise HTTPException(status_code=401, detail="Unauthorized")
-    if not _device_has_scope(request, "approve"):
-        raise HTTPException(status_code=403, detail="Device token lacks approve scope")
-
-    try:
-        relay_url = _validate_relay_url(body.relay_url)
-    except ValueError as exc:
-        return JSONResponse(status_code=400, content={"error": str(exc), "code": 4001})
-
-    relay = _plugin_module("relay_client")
-    try:
-        relay.set_relay_config(
-            relay_url=relay_url,
-            registration_token=body.registration_token,
-        )
-    except ValueError as exc:
-        return JSONResponse(status_code=400, content={"error": str(exc), "code": 4001})
-    return _relay_config_payload()
-
-
 @router.post("/relay/pair")
 async def pair_relay_device(request: Request) -> Any:
-    """Mint a relay pairing tuple without revealing the agent secret."""
+    """Mint the one mobile pairing link; never expose the agent secret."""
     if not _has_dashboard_api_auth(request):
         raise HTTPException(status_code=401, detail="Unauthorized")
     if not _device_has_scope(request, "approve"):
@@ -1442,20 +1324,13 @@ async def pair_relay_device(request: Request) -> Any:
     except relay.RelayConfigurationError as exc:
         return JSONResponse(status_code=400, content={"error": str(exc), "code": 4001})
 
-    return {
-        "kind": "relay",
+    query = urllib.parse.urlencode({
         "relay": relay_url_value,
         "agent": agent_id,
         "pairing": pairing_secret,
-    }
-
-
-def _relay_test_push_error_detail(exc: Exception) -> str:
-    """Return a user-visible relay delivery error with the real failure class."""
-    message = str(exc).strip()
-    if message:
-        return f"{type(exc).__name__}: {message}"
-    return type(exc).__name__
+        "kind": "relay",
+    })
+    return {"url": f"hermesapp://pair?{query}"}
 
 
 def _relay_device_environment(requested_env: str) -> str:
@@ -1499,38 +1374,6 @@ async def _unregister_relay_device(body: PushUnregisterBody) -> None:
     except Exception as exc:
         _log.warning("Hermes relay device unenrollment failed: %s", exc, exc_info=True)
         raise HTTPException(status_code=503, detail="Push relay unenrollment failed") from exc
-
-
-@router.post("/relay/test-push")
-async def test_relay_push(request: Request) -> Any:
-    """Synchronously test the configured push transport and report truthfully."""
-    if not _has_dashboard_api_auth(request):
-        raise HTTPException(status_code=401, detail="Unauthorized")
-    if not _device_has_scope(request, "approve"):
-        raise HTTPException(status_code=403, detail="Device token lacks approve scope")
-
-    relay = _plugin_module("relay_client")
-    if not relay.relay_url_configured():
-        return {"ok": False, "transport": "none", "detail": "no push configured"}
-
-    try:
-        await relay.relay_client().send_event(
-            kind="attention",
-            session_id=None,
-            title="Hermes test push",
-            body="Relay push delivery test from Hermes Mobile settings.",
-            source="relay_test_push",
-        )
-    except relay.RelayConfigurationError:
-        return {"ok": False, "transport": "none", "detail": "no push configured"}
-    except Exception as exc:
-        return {
-            "ok": False,
-            "transport": "relay",
-            "detail": _relay_test_push_error_detail(exc),
-        }
-
-    return {"ok": True, "transport": "relay", "detail": "sent via relay"}
 
 
 @router.post("/push/register")
