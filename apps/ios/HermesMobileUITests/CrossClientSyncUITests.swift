@@ -86,6 +86,9 @@ final class CrossClientSyncUITests: XCTestCase {
         let app = XCUIApplication()
         app.launchEnvironment["HERMES_URL"] = base
         app.launchEnvironment["HERMES_TOKEN"] = token
+        if let relayURL = env["HERMES_RELAY_URL"], !relayURL.isEmpty {
+            app.launchEnvironment["HERMES_RELAY_URL"] = relayURL
+        }
         app.launchArguments += ["--uitest-mute-audio"]
 
         func openSeededSession() {
@@ -99,7 +102,7 @@ final class CrossClientSyncUITests: XCTestCase {
             ownedSession.tap()
         }
 
-        let secondMarker = app.staticTexts.containing(
+        let secondMarker = app.descendants(matching: .any).matching(
             NSPredicate(format: "label CONTAINS %@", marker + "-SECOND")
         ).firstMatch
         openSeededSession()
