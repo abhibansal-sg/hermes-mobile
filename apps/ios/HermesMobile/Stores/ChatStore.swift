@@ -131,6 +131,10 @@ func fetchTranscriptAround(
 /// bridge-readable counters) so a future REST-error mirror drop is not invisible.
 private let chatLog = Logger(subsystem: "ai.hermes.HermesMobile", category: "ChatStore")
 
+private struct GateResponseDeliveryError: LocalizedError {
+    var errorDescription: String? { "Couldn't send that response. Try again." }
+}
+
 #if DEBUG
 /// DEBUG-only telemetry for the foreign-mirror adoption gate (F3-H). Counts the
 /// decisions the gate makes so a live DEBUG build can prove, via the UI-G
@@ -3238,15 +3242,19 @@ final class ChatStore {
         }
     }
 
-    private func sendGateResponse(method: String, params: JSONValue) async throws {
+    private func sendGateResponse(
+        method: String,
+        params: JSONValue,
+        overREST: (RestClient) async -> RestClient.ApprovalRespondOutcome
+    ) async throws {
         #if DEBUG
         if let gateResponseRPC {
             try await gateResponseRPC(method, params)
             return
         }
         #endif
-        guard let client else { throw GatewayError.notConnected }
-        _ = try await client.requestRaw(method, params: params)
+        guard let rest = connection?.rest else { throw GatewayError.notConnected }
+        guard await overREST(rest) != .failed else { throw GateResponseDeliveryError() }
     }
 
     /// Answer a pending approval (`approval.respond`) and clear it after ACK.
@@ -3266,7 +3274,12 @@ final class ChatStore {
                     "session_id": .string(sessionId),
                     "choice": .string(choice),
                     "all": .bool(all),
-                ])
+                ]),
+                overREST: { rest in
+                    await rest.respondToApproval(
+                        sessionId: sessionId, approve: approve, all: all
+                    )
+                }
             )
             if pendingApproval == pending {
                 pendingApproval = nil
@@ -3291,16 +3304,24 @@ final class ChatStore {
         guard let pending = pendingClarification else { return }
         let owner = pendingGateOwnerSessionID
         let sessionId = pending.sessionId.isEmpty ? activeSessionId : pending.sessionId
-        guard let sessionId else { return }
+        guard let sessionId, let requestId = pending.request.requestId else { return }
         var params: [String: JSONValue] = [
             "session_id": .string(sessionId),
             "answer": .string(answer),
         ]
-        if let rid = pending.request.requestId {
-            params["request_id"] = .string(rid)
-        }
+        params["request_id"] = .string(requestId)
         do {
-            try await sendGateResponse(method: "clarify.respond", params: .object(params))
+            try await sendGateResponse(
+                method: "clarify.respond",
+                params: .object(params),
+                overREST: { rest in
+                    await rest.respondToClarification(
+                        sessionId: sessionId,
+                        requestId: requestId,
+                        answer: answer
+                    )
+                }
+            )
             // Echo only while the same gate is still visible in its owning
             // transcript. If the user switched during the await, consuming the
             // parked gate is safe but appending here would bleed into the new chat.

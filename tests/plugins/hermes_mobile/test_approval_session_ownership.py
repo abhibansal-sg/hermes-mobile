@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import threading
+
 import pytest
 from fastapi.testclient import TestClient
 
@@ -75,6 +77,14 @@ def _own_session(session_id: str, device_id: str, clean_gateway_sessions) -> Non
     device_tokens.record_session_transport(session_id, transport)
 
 
+def _share_session(session_id: str, clean_gateway_sessions) -> None:
+    gateway._sessions[session_id] = {
+        "session_key": f"stored-{session_id}",
+        "transport": _Transport(object()),
+    }
+    clean_gateway_sessions.append(session_id)
+
+
 def _patch_resolver(monkeypatch):
     import tools.approval as approval
 
@@ -125,6 +135,47 @@ def test_approval_respond_requires_device_to_own_session(
     assert [call["choice"] for call in captured] == ["once", "deny"]
     assert captured[0]["audit"]["device_id"] == owner["device_id"]
     assert captured[1]["audit"]["credential"] == "shared"
+
+
+def test_paired_phone_can_resolve_shared_desktop_attention(
+    client, devices, clean_gateway_sessions, monkeypatch
+):
+    owner, _intruder = devices
+    _share_session("desktop-session", clean_gateway_sessions)
+    captured = _patch_resolver(monkeypatch)
+
+    approval = client.post(
+        f"{_PREFIX}/approvals/respond",
+        json={"session_id": "desktop-session", "choice": "approve"},
+        headers={"X-Hermes-Session-Token": owner["token"]},
+    )
+    assert approval.status_code == 200
+    assert approval.json() == {"resolved": True}
+    assert captured[0]["audit"]["device_id"] == owner["device_id"]
+
+    event = threading.Event()
+    gateway._pending["desktop-clarify"] = ("desktop-session", event)
+    gateway._pending_prompt_payloads["desktop-clarify"] = (
+        "clarify.request", {"question": "Left or right?"}
+    )
+    try:
+        clarify = client.post(
+            f"{_PREFIX}/approvals/reply",
+            json={
+                "session_id": "desktop-session",
+                "approval_id": "desktop-clarify",
+                "answer": "Left",
+            },
+            headers={"X-Hermes-Session-Token": owner["token"]},
+        )
+        assert clarify.status_code == 200
+        assert clarify.json() == {"resolved": True}
+        assert gateway._answers["desktop-clarify"] == "Left"
+        assert event.is_set()
+    finally:
+        gateway._pending.pop("desktop-clarify", None)
+        gateway._pending_prompt_payloads.pop("desktop-clarify", None)
+        gateway._answers.pop("desktop-clarify", None)
 
 
 def test_live_activity_register_requires_device_to_own_session(

@@ -161,8 +161,6 @@ final class InboxStore {
         self.cache = cache
     }
 
-    private var client: HermesGatewayClient? { connection?.client }
-
     private var currentScope: CacheScope? {
         let connected = connection?.serverURLString.trimmingCharacters(in: .whitespacesAndNewlines)
         let saved = UserDefaults.standard.string(forKey: DefaultsKeys.serverURL)?
@@ -358,27 +356,21 @@ final class InboxStore {
     ///   - all: approve/deny all remaining requests in that turn.
     func respondApproval(_ item: Item, approve: Bool, all: Bool) async {
         guard case .approval = item.payload else { return }
-        let choice = approve ? "approve" : "deny"
         await commitState(id: item.id, state: .responding)
-        guard let client else {
+        guard let rest = connection?.rest else {
             await commitState(id: item.id, state: .failedRetryable)
             return
         }
-        do {
-            _ = try await client.requestRaw(
-                "approval.respond",
-                params: .object([
-                    "session_id": .string(item.sessionId),
-                    "choice": .string(choice),
-                    "all": .bool(all),
-                ])
-            )
+        switch await rest.respondToApproval(
+            sessionId: item.sessionId, approve: approve, all: all
+        ) {
+        case .resolved, .alreadyHandled:
             // The RPC response is authoritative server confirmation. Keep a
             // terminal row on disk so an older broadcast/snapshot cannot re-arm
             // it; the next delta tombstone advances the durable revision.
             await commitState(id: item.id, state: .resolvedElsewhere)
             await refresh()
-        } catch {
+        case .failed:
             await commitState(id: item.id, state: .failedRetryable)
         }
     }
@@ -395,32 +387,20 @@ final class InboxStore {
         let trimmed = answer.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
         await commitState(id: item.id, state: .responding)
-        guard let client else {
+        guard let rest = connection?.rest, let requestId = request.requestId else {
             await commitState(id: item.id, state: .failedRetryable)
             return
         }
-        var params: [String: JSONValue] = [
-            "session_id": .string(item.sessionId),
-            "answer": .string(trimmed),
-        ]
-        if let rid = request.requestId {
-            params["request_id"] = .string(rid)
-        }
-        do {
-            _ = try await client.requestRaw("clarify.respond", params: .object(params))
+        switch await rest.respondToClarification(
+            sessionId: item.sessionId,
+            requestId: requestId,
+            answer: trimmed
+        ) {
+        case .resolved, .alreadyHandled:
             await commitState(id: item.id, state: .resolvedElsewhere)
             await refresh()
-        } catch {
-            // STR-291: RPC 4009 "no pending clarify request" means the prompt
-            // was already resolved elsewhere (push-notification text-reply
-            // REST path, another client, or a duplicate answer). Re-arming
-            // would resurrect a phantom pending card that can never succeed.
-            // Only rearm on genuine transport / transient failures.
-            await commitState(
-                id: item.id,
-                state: isAlreadyResolvedError(error) ? .resolvedElsewhere : .failedRetryable
-            )
-            if isAlreadyResolvedError(error) { await refresh() }
+        case .failed:
+            await commitState(id: item.id, state: .failedRetryable)
         }
     }
 

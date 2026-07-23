@@ -130,6 +130,70 @@ extension RestClient {
         }
     }
 
+    /// Resolve a pending `clarify.request` through the retained S13 plugin
+    /// resolver. Unlike stock `clarify.respond`, this works for a phone that is
+    /// passively watching a desktop-owned session without stealing its transport.
+    func respondToClarification(
+        sessionId: String,
+        requestId: String,
+        answer: String
+    ) async -> ApprovalRespondOutcome {
+        let first = await respondToClarificationAttempt(
+            style: pathStyle,
+            sessionId: sessionId,
+            requestId: requestId,
+            answer: answer
+        )
+        guard case .routeMiss = first else { return first.outcome }
+        let second = await respondToClarificationAttempt(
+            style: pathStyle.alternate,
+            sessionId: sessionId,
+            requestId: requestId,
+            answer: answer
+        )
+        return second.outcome
+    }
+
+    private func respondToClarificationAttempt(
+        style: APIPathStyle,
+        sessionId: String,
+        requestId: String,
+        answer: String
+    ) async -> RespondAttempt {
+        var request = makeRequest(
+            path: "\(style.mobileAPIPrefix)/approvals/reply", method: "POST"
+        )
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        let body: JSONValue = .object([
+            "session_id": .string(sessionId),
+            "approval_id": .string(requestId),
+            "answer": .string(answer),
+        ])
+        guard let payload = try? encodeBody(body, context: "approvals/reply") else {
+            return .outcome(.failed)
+        }
+        request.httpBody = payload
+
+        let data: Data
+        let response: URLResponse
+        do {
+            (data, response) = try await session.data(for: request)
+        } catch {
+            return .outcome(.failed)
+        }
+        guard let http = response as? HTTPURLResponse else { return .outcome(.failed) }
+        switch http.statusCode {
+        case 200, 201:
+            let root = try? decodeJSONValue(from: data, context: "approvals/reply")
+            let resolved = root?["resolved"]?.boolValue ?? false
+            return .outcome(resolved ? .resolved : .alreadyHandled)
+        case 404:
+            return .routeMiss
+        default:
+            return .outcome(.failed)
+        }
+    }
+
     // MARK: - Live Activity token registration (A3)
 
     /// Result of a Live-Activity token register/unregister call. Soft, never a
