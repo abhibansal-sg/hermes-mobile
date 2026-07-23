@@ -209,7 +209,7 @@ final class AppEnvironment {
             await queueStore.refresh()
             queueStore.wake()
         }
-        // ABH-351: ProjectsStore needs REST access (the /projects route) —
+        // ProjectsStore uses the stock project RPCs on the gateway connection —
         // injected after ConnectionStore is built, same pattern as the others.
         projectsStore.attach(connection: connectionStore)
         // Offline-first cache (P3): build the ONE CacheStore actor and inject it

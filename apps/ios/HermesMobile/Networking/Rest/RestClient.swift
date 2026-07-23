@@ -245,61 +245,6 @@ struct RestClient: Sendable {
         return (wrapper.sessions, wrapper.total)
     }
 
-    /// `GET {mobileAPIPrefix}/project-sessions?project_id=<root>` — the plugin's
-    /// hydrated per-project session list, and the CORRECT data source for Project
-    /// detail.
-    ///
-    /// The plugin route folds worktree cwds under the git-common repo root with
-    /// the exact same machinery the `/projects` overview COUNT uses, so the
-    /// returned list matches that count. The stock `GET /api/sessions?cwd_prefix=`
-    /// path (``sessionsWithTotal(cwdPrefix:)``) cannot: a project's `root` is the
-    /// folded git-common repo root, while its sessions run in WORKTREES whose cwds
-    /// are siblings of that root — the `cwd_prefix` LIKE never matches, so the
-    /// detail list comes back empty even though the count is > 0.
-    ///
-    /// Throws `RestError.badStatus(404, …)` on an older gateway that predates the
-    /// plugin route; the caller (``ProjectsStore/refreshSessions(for:)``) then
-    /// falls back to the legacy `cwd_prefix` path.
-    ///
-    /// The wire response is `{"project_id": …, "sessions": [...], "total": N}`.
-    /// A project `root` is arbitrary user-filesystem text, so it is encoded via
-    /// `URLQueryItem`/`URLComponents` with the same literal-`+` hardening as
-    /// ``sessionsWithTotal`` (FastAPI/Starlette decode a raw `+` as a space).
-    func projectSessions(
-        projectId: String
-    ) async throws -> (sessions: [SessionSummary], total: Int?) {
-        var components = URLComponents()
-        components.queryItems = [URLQueryItem(name: "project_id", value: projectId)]
-        let rawQuery = (components.percentEncodedQuery ?? "")
-            .replacingOccurrences(of: "+", with: "%2B")
-        let path = "\(mobileAPIPrefix)/project-sessions?\(rawQuery)"
-        let data = try await get(path: path)
-        struct Wrapper: Decodable {
-            let sessions: [SessionSummary]
-            let total: Int?
-        }
-        let wrapper = try decode(Wrapper.self, from: data, context: "projectSessions")
-        return (wrapper.sessions, wrapper.total)
-    }
-
-    /// `POST {mobileAPIPrefix}/projects` — create a project (name + root path).
-    ///
-    /// The plugin route validates the input and delegates to the stock
-    /// `hermes_cli.projects_db.create_project` (ZERO core patch — the plugin
-    /// imports and calls it). The response is a single ``Project`` entry in the
-    /// same `{id, label, root, session_count}` contract as the overview list, so
-    /// the caller can open the new project immediately.
-    func createProject(name: String, root: String) async throws -> Project {
-        var request = makeRequest(path: "\(mobileAPIPrefix)/projects", method: "POST")
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.httpBody = try encodeBody(
-            .object(["name": .string(name), "root": .string(root)]),
-            context: "createProject"
-        )
-        let data = try await perform(request)
-        return try decode(Project.self, from: data, context: "createProject", strategy: .useDefaultKeys)
-    }
-
     /// `GET /api/plugins/hermes-mobile/sessions?...&updated_since=cursor` —
     /// cursor-based session-list delta for the global Recents rail.
     ///

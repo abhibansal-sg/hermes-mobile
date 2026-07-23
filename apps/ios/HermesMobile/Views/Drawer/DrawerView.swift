@@ -2523,7 +2523,7 @@ struct ProjectDetailView: View {
         .navigationBarTitleDisplayMode(.inline)
         .hermesThemed(themeStore)
         .task(id: project.id) {
-            // ABH-407: server-scoped fetch (`cwd_prefix=project.root`), not a
+            // Server-owned project membership, not a
             // client-side scan of the global Recents list. `.task(id:)` re-fires
             // if the pushed project changes identity within the same navigation
             // stack slot.
@@ -2577,7 +2577,7 @@ struct ProjectDetailView: View {
 
     @ViewBuilder
     private var sessionsSection: some View {
-        // ABH-407: server-scoped list (`cwd_prefix=project.root`), fetched by
+        // Server-scoped list fetched by
         // the `.task(id:)` in `body`. Not derived from the global `sessions`
         // (SessionStore) Recents list.
         let projectSessions = projectsStore.sessions(for: project)
@@ -2632,6 +2632,7 @@ struct ProjectDetailView: View {
             )
         }
         .buttonStyle(.plain)
+        .accessibilityIdentifier("projectSessionRow")
         .sensoryFeedback(.selection, trigger: rowTapFeedbackTrigger)
         .listRowSeparator(.hidden)
         .listRowBackground(Color.clear)
