@@ -508,6 +508,57 @@ final class ChatFlowUITests: XCTestCase {
         )
     }
 
+    func testSessionModelPickerAndYoloToggleRoundTrip() throws {
+        let env = ProcessInfo.processInfo.environment
+        guard let url = env["HERMES_URL"], let token = env["HERMES_TOKEN"],
+              !url.isEmpty, !token.isEmpty else {
+            throw XCTSkip("HERMES_URL/HERMES_TOKEN not provided; skipping live test")
+        }
+
+        let app = XCUIApplication()
+        app.launchEnvironment["HERMES_URL"] = url
+        app.launchEnvironment["HERMES_TOKEN"] = token
+        if let relayURL = env["HERMES_RELAY_URL"], !relayURL.isEmpty {
+            app.launchEnvironment["HERMES_RELAY_URL"] = relayURL
+        }
+        app.launchArguments += ["--uitest-mute-audio"]
+        app.launch()
+
+        let drawerToggle = app.buttons["drawerToggle"]
+        XCTAssertTrue(drawerToggle.waitForExistence(timeout: 30))
+        drawerToggle.tap()
+        let session = app.buttons["sessionRow"].firstMatch
+        XCTAssertTrue(session.waitForExistence(timeout: 20))
+        session.tap()
+
+        let yolo = app.buttons["composerYoloToggle"]
+        XCTAssertTrue(yolo.waitForExistence(timeout: 10))
+        XCTAssertTrue(yolo.isHittable)
+        let initial = yolo.value as? String
+        XCTAssertTrue(initial == "On" || initial == "Off")
+        yolo.tap()
+        let changed = XCTNSPredicateExpectation(
+            predicate: NSPredicate(format: "value != %@ AND value != %@", initial ?? "", "Updating"),
+            object: yolo
+        )
+        XCTAssertEqual(XCTWaiter.wait(for: [changed], timeout: 15), .completed)
+        yolo.tap()
+        let restored = XCTNSPredicateExpectation(
+            predicate: NSPredicate(format: "value == %@", initial ?? ""),
+            object: yolo
+        )
+        XCTAssertEqual(XCTWaiter.wait(for: [restored], timeout: 15), .completed)
+
+        let model = app.buttons["composerModelChip"]
+        XCTAssertTrue(model.waitForExistence(timeout: 20))
+        model.tap()
+        let modelSheet = app.navigationBars["This Chat"]
+        XCTAssertTrue(modelSheet.waitForExistence(timeout: 15))
+        XCTAssertTrue(app.searchFields["Filter models"].waitForExistence(timeout: 20))
+        modelSheet.buttons["Done"].firstMatch.tap()
+        XCTAssertTrue(modelSheet.waitForNonExistence(timeout: 10))
+    }
+
     /// BUG 2 (hotfix): the open-drawer swipe works from mid-screen with
     /// horizontal-dominance activation (the open-start zone now spans the leading
     /// 50% of the width). Drive a horizontal XCUICoordinate drag starting at
