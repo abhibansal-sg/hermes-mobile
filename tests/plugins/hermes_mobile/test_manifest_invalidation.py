@@ -5,7 +5,7 @@ import json
 from .conftest import load_plugin_module
 
 
-def test_frozen_payload_and_headers_are_data_free(push_engine):
+def test_frozen_payload_is_data_free(push_engine):
     payload = push_engine.build_manifest_invalidation_payload("all", 1843, "attention")
     assert payload == {
         "aps": {"content-available": 1},
@@ -16,16 +16,6 @@ def test_frozen_payload_and_headers_are_data_free(push_engine):
         '"revision":1843,"reason":"attention"}}'
     )
     assert not ({"alert", "badge", "sound"} & payload["aps"].keys())
-    assert push_engine.build_manifest_invalidation_headers(
-        provider_jwt="jwt", topic="ai.hermes.app", scope="all"
-    ) == {
-        "authorization": "bearer jwt",
-        "apns-topic": "ai.hermes.app",
-        "apns-push-type": "background",
-        "apns-priority": "5",
-        "apns-expiration": "0",
-        "apns-collapse-id": "hermes-sync:all",
-    }
 
 
 def test_scope_coalescing_high_water_and_restart(tmp_path):
@@ -77,33 +67,6 @@ def test_event_reason_mapping_and_no_content_leak(tmp_path, monkeypatch):
         assert publisher.revision("all") == start + len(reasons)
         assert sent[-1][2] == (next(iter(reasons)) if len(reasons) == 1 else "coalesced")
         assert "secret" not in repr(sent[-1])
-
-
-def test_direct_background_prunes_410_and_ignores_alert_preferences(
-    monkeypatch, push_engine
-):
-    class Config:
-        topic = "ai.hermes.app"
-        host = "host"
-        def is_armed(self): return True
-    class Response:
-        text = ""
-    class Client:
-        def __init__(self, **_kw): pass
-        def __enter__(self): return self
-        def __exit__(self, *_args): pass
-    sent, dropped = [], []
-    monkeypatch.setattr(push_engine.APNsConfig, "from_env", classmethod(lambda cls: Config()))
-    monkeypatch.setattr(push_engine, "registered_tokens_by_env", lambda: {"production": ["a", "b"]})
-    monkeypatch.setattr(push_engine, "recipients_for_event", lambda _event: {})
-    monkeypatch.setattr(push_engine, "_get_provider_jwt", lambda _config: "jwt")
-    monkeypatch.setattr(push_engine, "_send_one", lambda _c, **kw: (sent.append(kw) or (410 if kw["device_token"] == "a" else 200), ""))
-    monkeypatch.setattr(push_engine, "_drop_tokens", lambda tokens: dropped.extend(tokens))
-    import httpx
-    monkeypatch.setattr(httpx, "Client", Client)
-    assert push_engine._notify_direct_manifest_invalidation("all", 7, "sessions") == 1
-    assert dropped == ["a"]
-    assert all(x["headers"]["apns-push-type"] == "background" for x in sent)
 
 
 def test_relay_preserves_same_payload_and_background_headers(monkeypatch, push_engine):

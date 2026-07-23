@@ -1458,17 +1458,11 @@ def _relay_test_push_error_detail(exc: Exception) -> str:
     return type(exc).__name__
 
 
-def _relay_device_environment(push_engine: Any, requested_env: str) -> str:
+def _relay_device_environment(requested_env: str) -> str:
     """Resolve the APNs environment for relay device enrollment."""
     if requested_env in ("sandbox", "production"):
         return requested_env
-    config = push_engine.APNsConfig.from_env()
-    return "sandbox" if config.use_sandbox else "production"
-
-
-def _relay_device_bundle_id(push_engine: Any) -> str:
-    """Resolve the APNs bundle id/topic used by direct APNs sends."""
-    return str(push_engine.APNsConfig.from_env().topic)
+    return "production"
 
 
 def _relay_device_preferences(relay: Any, events: Optional[List[str]]) -> Dict[str, bool]:
@@ -1479,42 +1473,32 @@ def _relay_device_preferences(relay: Any, events: Optional[List[str]]) -> Dict[s
     return {kind: kind in wanted for kind in relay.RELAY_PUSH_KINDS}
 
 
-def _record_relay_enrollment_failure(relay: Any) -> None:
-    record = getattr(relay, "_record_delivery_failure", None)
-    if callable(record):
-        record()
-
-
-def _register_relay_device_if_configured(body: PushRegisterBody, push_engine: Any) -> None:
-    relay = None
+async def _register_relay_device(body: PushRegisterBody) -> None:
+    relay = _plugin_module("relay_client")
+    if not relay.relay_url_configured():
+        raise HTTPException(status_code=503, detail="Push relay is not configured")
     try:
-        relay = _plugin_module("relay_client")
-        if not relay.relay_url_configured():
-            return
-        relay.register_device_background(
+        await relay.relay_client().register_device(
             token=body.token,
             platform=body.platform,
-            environment=_relay_device_environment(push_engine, body.env),
-            bundle_id=_relay_device_bundle_id(push_engine),
+            environment=_relay_device_environment(body.env),
+            bundle_id="ai.hermes.app",
             preferences=_relay_device_preferences(relay, body.events),
         )
     except Exception as exc:
-        if relay is not None:
-            _record_relay_enrollment_failure(relay)
         _log.warning("Hermes relay device enrollment failed: %s", exc, exc_info=True)
+        raise HTTPException(status_code=503, detail="Push relay enrollment failed") from exc
 
 
-def _unregister_relay_device_if_configured(body: PushUnregisterBody) -> None:
-    relay = None
+async def _unregister_relay_device(body: PushUnregisterBody) -> None:
+    relay = _plugin_module("relay_client")
+    if not relay.relay_url_configured():
+        raise HTTPException(status_code=503, detail="Push relay is not configured")
     try:
-        relay = _plugin_module("relay_client")
-        if not relay.relay_url_configured():
-            return
-        relay.unregister_device_background(token=body.token)
+        await relay.relay_client().unregister_device(token=body.token)
     except Exception as exc:
-        if relay is not None:
-            _record_relay_enrollment_failure(relay)
         _log.warning("Hermes relay device unenrollment failed: %s", exc, exc_info=True)
+        raise HTTPException(status_code=503, detail="Push relay unenrollment failed") from exc
 
 
 @router.post("/relay/test-push")
@@ -1524,21 +1508,6 @@ async def test_relay_push(request: Request) -> Any:
         raise HTTPException(status_code=401, detail="Unauthorized")
     if not _device_has_scope(request, "approve"):
         raise HTTPException(status_code=403, detail="Device token lacks approve scope")
-
-    engine = _plugin_module("push_engine")
-    if engine.direct_apns_test_push_available():
-        accepted = engine.send_direct_apns_test_push()
-        if accepted > 0:
-            return {
-                "ok": True,
-                "transport": "direct_apns",
-                "detail": "sent via direct APNs",
-            }
-        return {
-            "ok": False,
-            "transport": "direct_apns",
-            "detail": "direct APNs test push was not accepted",
-        }
 
     relay = _plugin_module("relay_client")
     if not relay.relay_url_configured():
@@ -1569,21 +1538,7 @@ async def register_push_token(body: PushRegisterBody, request: Request) -> Dict[
     """Register an iOS APNs device token for server push."""
     if not _has_dashboard_api_auth(request):
         raise HTTPException(status_code=401, detail="Unauthorized")
-    engine = _plugin_module("push_engine")
-    # QA-2 R1c: the client's own stable device id wins (it survives re-pair
-    # and is the identity iOS sends over the relay socket too); the
-    # request-state device identity is the legacy fallback.
-    device_id = (body.device_id or "").strip() or _request_device_id(request)
-    if not engine.register_token(
-        body.token, platform=body.platform, env=body.env, events=body.events,
-        device_id=device_id,
-    ):
-        raise HTTPException(status_code=400, detail="Invalid device token")
-    try:
-        _plugin_module("manifest_invalidation").invalidate("all", "push_registry")
-    except Exception:
-        _log.warning("push registration invalidation failed", exc_info=True)
-    _register_relay_device_if_configured(body, engine)
+    await _register_relay_device(body)
     return {"ok": True}
 
 
@@ -1613,15 +1568,8 @@ async def unregister_push_token(body: PushUnregisterBody, request: Request) -> D
     """Unregister a previously-registered device token."""
     if not _has_dashboard_api_auth(request):
         raise HTTPException(status_code=401, detail="Unauthorized")
-    engine = _plugin_module("push_engine")
-    removed = engine.unregister_token(body.token)
-    if removed:
-        try:
-            _plugin_module("manifest_invalidation").invalidate("all", "push_registry")
-        except Exception:
-            _log.warning("push registration invalidation failed", exc_info=True)
-    _unregister_relay_device_if_configured(body)
-    return {"ok": True, "removed": removed}
+    await _unregister_relay_device(body)
+    return {"ok": True, "removed": True}
 
 
 @router.post("/push/live-activity")
