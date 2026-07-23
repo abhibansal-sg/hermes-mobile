@@ -7,7 +7,7 @@ import hmac
 import json
 import logging
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 from . import plugin_bridge
 from .gateway_client import GatewayConfig
@@ -49,20 +49,23 @@ class DownstreamServer:
         self._runner = None
         self._proxy_client = None
         self._stop = asyncio.Event()
+        self._status_extension: Optional[Callable[[], dict[str, Any]]] = None
 
     async def serve(self) -> None:
         from aiohttp import ClientSession, web
 
         self._stop.clear()
         self._proxy_client = ClientSession(auto_decompress=False)
-        app = web.Application(client_max_size=self._cfg.max_message_bytes)
-        app.router.add_route("*", "/{path:.*}", self._serve_request)
-        self._runner = web.AppRunner(app, access_log=None)
-        await self._runner.setup()
-        site = web.TCPSite(self._runner, self._cfg.host, self._cfg.port)
-        await site.start()
-        self._server = site._server
         try:
+            app = web.Application(client_max_size=self._cfg.max_message_bytes)
+            app.router.add_route("*", "/{path:.*}", self._serve_request)
+            self._runner = web.AppRunner(app, access_log=None)
+            await self._runner.setup()
+            site = web.TCPSite(
+                self._runner, self._cfg.host, self._cfg.port
+            )
+            await site.start()
+            self._server = site._server
             await self._stop.wait()
         finally:
             await self.close()
@@ -70,7 +73,9 @@ class DownstreamServer:
     async def _serve_request(self, request: Any) -> Any:
         from aiohttp import web
 
-        upstream_token = self._authorized_upstream_token(request.raw_path, request)
+        upstream_token = self._authorized_upstream_token(
+            request.raw_path, request
+        )
         if self._cfg.auth_token and upstream_token is None:
             return web.Response(status=401, text="Unauthorized\n")
         if self._cfg.health_path and request.path == self._cfg.health_path:
@@ -80,7 +85,9 @@ class DownstreamServer:
         return await self._proxy_stock_http(request, upstream_token)
 
     async def _serve_stock_ws(
-        self, request: Any, upstream_token: Optional[str]
+        self,
+        request: Any,
+        upstream_token: Optional[str],
     ) -> Any:
         """Copy stock WebSocket messages in both directions without decoding."""
         from aiohttp import WSMsgType, web
@@ -163,8 +170,10 @@ class DownstreamServer:
             await response.write_eof()
             return response
 
-    def _authorized_upstream_token(self, raw_path: str, request: Any) -> Optional[str]:
-        """Authenticate locally while preserving validated device identity."""
+    def _authorized_upstream_token(
+        self, raw_path: str, request: Any
+    ) -> Optional[str]:
+        """Authenticate locally and select the matching upstream credential."""
         from urllib.parse import parse_qs, urlsplit
 
         headers = getattr(request, "headers", {}) or {}
@@ -193,12 +202,18 @@ class DownstreamServer:
     def status(self) -> dict[str, Any]:
         from . import __version__
 
-        return {
+        status: dict[str, Any] = {
             "service": "hermes_relay",
             "version": __version__,
             "mode": "transparent_proxy",
             "connections": 0,
         }
+        if self._status_extension is not None:
+            status["notifications"] = self._status_extension()
+        return status
+
+    def extend_status(self, provider: Callable[[], dict[str, Any]]) -> None:
+        self._status_extension = provider
 
     async def close(self) -> None:
         self._stop.set()

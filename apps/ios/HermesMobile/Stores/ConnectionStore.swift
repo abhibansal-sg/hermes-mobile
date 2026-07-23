@@ -497,7 +497,9 @@ final class ConnectionStore {
               let override = URL(string: rawOverride),
               var components = URLComponents(url: override, resolvingAgainstBaseURL: false)
         else { return gatewayURL }
-        components.scheme = override.scheme == "wss" ? "https" : "http"
+        components.scheme =
+            ["https", "wss"].contains(override.scheme?.lowercased())
+            ? "https" : "http"
         components.path = ""
         components.queryItems = nil
         return components.url ?? gatewayURL

@@ -1,8 +1,8 @@
-"""Bridge to the ``plugins/hermes-mobile`` device-token authority.
+"""Bridge to the small ``plugins/hermes-mobile`` gateway adapter.
 
 The transparent proxy reuses the plugin's ``device_tokens`` registry to
-authenticate scoped phone credentials. Push and conversation behavior remain
-inside the gateway/plugin; the relay owns neither.
+authenticate scoped phone credentials and its existing APNs engine to deliver
+stock gateway events. Conversation behavior remains in the stock gateway.
 
 The plugin directory is named ``hermes-mobile`` (a hyphen), so it is NOT
 importable by dotted name; the stock gateway loads it by file path. The relay
@@ -21,6 +21,8 @@ from __future__ import annotations
 
 import os
 import sys
+import importlib
+import importlib.util
 from pathlib import Path
 from typing import Optional
 
@@ -90,3 +92,21 @@ def import_device_tokens():
     import device_tokens  # type: ignore
 
     return device_tokens
+
+
+def import_push_engine():
+    """Import and return the existing APNs implementation."""
+    plugin_dir = ensure_on_path()
+    package_name = "_hermes_mobile_relay_adapter"
+    if package_name not in sys.modules:
+        spec = importlib.util.spec_from_file_location(
+            package_name,
+            plugin_dir / "__init__.py",
+            submodule_search_locations=[str(plugin_dir)],
+        )
+        if spec is None or spec.loader is None:
+            raise ImportError(f"cannot load hermes-mobile plugin from {plugin_dir}")
+        package = importlib.util.module_from_spec(spec)
+        sys.modules[package_name] = package
+        spec.loader.exec_module(package)
+    return importlib.import_module(f"{package_name}.push_engine")

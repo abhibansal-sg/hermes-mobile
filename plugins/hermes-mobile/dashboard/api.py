@@ -1645,6 +1645,33 @@ async def notify_event(body: NotifyBody, request: Request) -> Dict[str, Any]:
     return {"ok": True}
 
 
+class NotificationClaimBody(BaseModel):
+    ttl_seconds: float = 15.0
+
+
+@router.post("/notifications/claim")
+async def claim_relay_notifications(
+    body: NotificationClaimBody, request: Request
+) -> Dict[str, Any]:
+    """Lease APNs alert ownership to the authenticated co-located relay."""
+    if not _has_dashboard_api_auth(request):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    if _is_device_auth(request):
+        raise HTTPException(status_code=403, detail="Host token required")
+    broadcast_ttl = _plugin_module("broadcast").claim_relay_observer(
+        body.ttl_seconds
+    )
+    engine = _plugin_module("push_engine")
+    ttl = engine.claim_relay_notification_ownership(body.ttl_seconds)
+    return {
+        "owner": "relay",
+        "ttl_seconds": min(ttl, broadcast_ttl),
+        "foreground_devices": _plugin_module(
+            "device_tokens"
+        ).foreground_devices_by_session(),
+    }
+
+
 @router.delete("/push/register")
 async def unregister_push_token(body: PushUnregisterBody, request: Request) -> Dict[str, Any]:
     """Unregister a previously-registered device token."""

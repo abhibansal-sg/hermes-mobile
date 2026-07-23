@@ -32,7 +32,7 @@ import pytest
 from tests.plugins.hermes_mobile.conftest import load_plugin_module
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
-_API_MODULE_NAME = "hermes_dashboard_plugin_hermes-mobile"
+_API_MODULE_NAME = "hermes_dashboard_plugin_hermes-mobile_test_source"
 
 
 @pytest.fixture
@@ -203,3 +203,58 @@ async def test_device_foreground_route_uses_authenticated_device(api, monkeypatc
 
     assert calls == [("phone-1", "stored-1")]
     assert result["foreground"] is True
+
+
+@pytest.mark.asyncio
+async def test_relay_notification_claim_activates_existing_seams(
+    api, monkeypatch
+):
+    broadcast_calls = []
+    push_calls = []
+    modules = {
+        "broadcast": types.SimpleNamespace(
+            claim_relay_observer=lambda ttl: broadcast_calls.append(ttl) or ttl
+        ),
+        "push_engine": types.SimpleNamespace(
+            claim_relay_notification_ownership=lambda ttl: push_calls.append(ttl)
+            or ttl
+        ),
+        "device_tokens": types.SimpleNamespace(
+            foreground_devices_by_session=lambda: {
+                "stored-1": ["phone-1"]
+            }
+        ),
+    }
+    monkeypatch.setattr(api, "_plugin_module", modules.__getitem__)
+    req = _make_request(auth_required=True, session={"user": "host"})
+
+    result = await api.claim_relay_notifications(
+        api.NotificationClaimBody(ttl_seconds=15.0),
+        req,
+    )
+
+    assert broadcast_calls == [15.0]
+    assert push_calls == [15.0]
+    assert result == {
+        "owner": "relay",
+        "ttl_seconds": 15.0,
+        "foreground_devices": {"stored-1": ["phone-1"]},
+    }
+
+
+@pytest.mark.asyncio
+async def test_device_cannot_claim_relay_notification_ownership(
+    api, monkeypatch
+):
+    req = _make_request(
+        auth_required=True,
+        device={"device_id": "phone-1", "scopes": ["chat"]},
+    )
+
+    with pytest.raises(api.HTTPException) as error:
+        await api.claim_relay_notifications(
+            api.NotificationClaimBody(ttl_seconds=15.0),
+            req,
+        )
+
+    assert error.value.status_code == 403

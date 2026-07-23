@@ -31,6 +31,7 @@ import json
 import logging
 import os
 import threading
+import time
 import weakref
 from typing import Any
 
@@ -274,15 +275,40 @@ async def _drain_broadcast(transport: Any, state: _BcastState) -> None:
 # Fan-out (former server.py ``_broadcast_enabled`` / ``_broadcast_event``)
 # ---------------------------------------------------------------------------
 
+_relay_observer_lock = threading.Lock()
+_relay_observer_until = 0.0
+
+
+def claim_relay_observer(ttl_seconds: float = 15.0) -> float:
+    """Enable fan-out while the co-located relay renews a short lease."""
+    global _relay_observer_until
+    ttl = min(max(float(ttl_seconds), 1.0), 60.0)
+    with _relay_observer_lock:
+        _relay_observer_until = max(
+            _relay_observer_until,
+            time.monotonic() + ttl,
+        )
+    return ttl
+
+
+def _relay_observer_active() -> bool:
+    with _relay_observer_lock:
+        return time.monotonic() < _relay_observer_until
+
+
 def _broadcast_enabled() -> bool:
-    """Opt-in multi-client event fan-out (hermes-mobile plugin).
+    """Multi-client event fan-out while configured or leased by the relay.
 
     When HERMES_GATEWAY_BROADCAST is truthy, session-scoped event frames are
     mirrored to every connected WS client in addition to the owning
     transport, so a phone and a desktop watching the same backend both see
-    live streaming regardless of which one submitted the prompt.
+    live streaming regardless of which one submitted the prompt. The
+    co-located relay can enable the same existing path with a short lease,
+    avoiding a separate setup toggle and reverting automatically if it exits.
     """
-    return is_truthy_value(os.environ.get("HERMES_GATEWAY_BROADCAST"))
+    return is_truthy_value(
+        os.environ.get("HERMES_GATEWAY_BROADCAST")
+    ) or _relay_observer_active()
 
 
 def _gw_sessions() -> dict:

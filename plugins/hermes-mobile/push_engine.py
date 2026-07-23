@@ -1552,12 +1552,29 @@ _PUSH_WORKER_LOCK = threading.Lock()
 _PUSH_WORKER_STARTED = False
 _PUSH_STOP = threading.Event()
 _PUSH_TEXT_MAX = 180
+_RELAY_OWNER_LOCK = threading.Lock()
+_RELAY_OWNER_UNTIL = 0.0
 _PUSH_SECRET_PATTERNS = (
     re.compile(
         r"(?i)\b(api[_-]?key|token|secret|password|authorization)\b\s*[:=]\s*\S+"
     ),
     re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]{12,}"),
 )
+
+
+def claim_relay_notification_ownership(ttl_seconds: float = 15.0) -> float:
+    """Let the co-located relay own alert delivery while its observer is alive."""
+    global _RELAY_OWNER_UNTIL
+    ttl = min(60.0, max(1.0, float(ttl_seconds)))
+    with _RELAY_OWNER_LOCK:
+        _RELAY_OWNER_UNTIL = time.monotonic() + ttl
+        return ttl
+
+
+def relay_owns_notifications() -> bool:
+    """Return whether a live relay heartbeat currently owns alert delivery."""
+    with _RELAY_OWNER_LOCK:
+        return time.monotonic() < _RELAY_OWNER_UNTIL
 _LA_BLOCKING_STATUS_KINDS = frozenset(
     {"approval", "approve", "blocked", "clarify", "input", "prompt", "waiting"}
 )
@@ -1699,7 +1716,9 @@ def _push_approval_enrichment(sid: str, data: dict) -> dict:
 def _push_route_context(sid: str, data: dict) -> dict:
     """Shared APNs route/correlation context for clarify and turn completion."""
     context: dict = {"session_id": sid}
-    stored = (_gw_sessions().get(sid) or {}).get("session_key")
+    stored = data.get("stored_session_id") or (
+        _gw_sessions().get(sid) or {}
+    ).get("session_key")
     if stored:
         context["stored_session_id"] = stored
     for key in ("event_id", "gateway_scope", "turn_id", "request_id", "approval_id"):
@@ -1848,6 +1867,7 @@ def _live_activity_hook(
     *,
     event_time: float | None = None,
     turn_started: float | None = None,
+    session_override: dict | None = None,
 ) -> None:
     """Drive ActivityKit Live Activity remote updates from gateway events.
 
@@ -1865,7 +1885,11 @@ def _live_activity_hook(
         if live_activity_token_for(sid) is None:
             return
 
-        session = _gw_sessions().get(sid)
+        session = (
+            session_override
+            if session_override is not None
+            else _gw_sessions().get(sid)
+        )
         # Keep the worker safe for direct callers as well as the normal
         # pre_emit_event path.  This is idempotent for already enriched data.
         data = enrich_correlated_event(event, sid, payload) or {}
@@ -2022,6 +2046,8 @@ def _process_push_event(
     *,
     event_time: float | None = None,
     turn_started: float | None = None,
+    session_override: dict | None = None,
+    excluded_devices_override: set[str] | None = None,
 ) -> None:
     """Run APNs work for a queued gateway event."""
     try:
@@ -2034,6 +2060,7 @@ def _process_push_event(
                 payload,
                 event_time=event_time,
                 turn_started=turn_started,
+                session_override=session_override,
             )
 
         if event not in _PUSH_ALERT_EVENTS:
@@ -2042,7 +2069,16 @@ def _process_push_event(
         # Keep the worker safe for direct callers as well as the normal
         # pre_emit_event path. This is idempotent for already enriched data.
         data = enrich_correlated_event(event, sid, payload) or {}
-        excluded_devices = _foreground_phone_devices(sid, _gw_sessions().get(sid))
+        session = (
+            session_override
+            if session_override is not None
+            else _gw_sessions().get(sid)
+        )
+        excluded_devices = (
+            set(excluded_devices_override)
+            if excluded_devices_override is not None
+            else _foreground_phone_devices(sid, session)
+        )
         if event == "approval.request":
             title = _push_safe_text(data.get("title"), "Approval required", max_chars=80)
             body = _push_safe_text(
@@ -2110,7 +2146,6 @@ def _process_push_event(
                 excluding_device_ids=excluded_devices,
             )
         else:  # message.complete — push unless the user is watching live
-            session = _gw_sessions().get(sid)
             # Registry hygiene: clear this turn's start stamp regardless of
             # whether we end up pushing (a foregrounded turn must still drop
             # its stamp). Guarded so we only pop the stamp for this turn.
@@ -2189,6 +2224,11 @@ def handle_gateway_event(event: str, sid: str, payload: dict | None = None) -> N
     if event == "session.deleted":
         end_live_activity_sessions(sid)
         return
+    if event == "session.interrupt":
+        _push_hook(event, sid, payload)
+        return
+    if relay_owns_notifications():
+        return
     # Approval alerts originate at the stock pre_approval_request hook below.
     # The emitted frame still reaches live clients and manifest invalidation,
     # but must not enqueue a second APNs alert.
@@ -2206,6 +2246,8 @@ def handle_approval_request(
     **_kwargs,
 ) -> None:
     """Turn the stock approval hook into one actionable mobile push."""
+    if relay_owns_notifications():
+        return
     if surface != "gateway" or not session_key:
         return
     sid = next(

@@ -7,6 +7,7 @@ from typing import Optional
 
 from .downstream import DownstreamConfig, DownstreamServer
 from .gateway_client import GatewayConfig
+from .notifications import StockEventNotifications
 
 
 @dataclass
@@ -19,14 +20,22 @@ class RelayApp:
     def __init__(self, config: RelayConfig) -> None:
         self._cfg = config
         self.downstream = DownstreamServer(config.downstream, config.gateway)
+        self.notifications = StockEventNotifications(config.gateway)
+        self.downstream.extend_status(self.notifications.status)
 
     async def run(self) -> None:
-        await self.downstream.serve()
+        import asyncio
+
+        await asyncio.gather(
+            self.downstream.serve(),
+            self.notifications.run(),
+        )
 
     def status(self) -> dict:
         return self.downstream.status()
 
     async def close(self) -> None:
+        await self.notifications.close()
         await self.downstream.close()
 
 

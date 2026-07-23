@@ -44,6 +44,19 @@ final class ConnectionPhaseTests: XCTestCase {
         XCTAssertEqual(connection.phase, .connecting)
     }
 
+    func testSecureRelayOverrideStaysSecure() {
+        setenv("HERMES_RELAY_URL", "https://relay.example:9446/path?ignored=yes", 1)
+        defer { unsetenv("HERMES_RELAY_URL") }
+        let (connection, _, _) = makeStore()
+
+        XCTAssertEqual(
+            connection.stockProxyURL(
+                forGateway: URL(string: "https://gateway.example:9443")!
+            ).absoluteString,
+            "https://relay.example:9446"
+        )
+    }
+
     #if DEBUG
     func testHydratingPhaseLabel() {
         // The DEBUG snapshot mirror (gstack bridge, UI-G) must carry a stable
