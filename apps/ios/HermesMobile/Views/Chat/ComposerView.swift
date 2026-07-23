@@ -731,6 +731,7 @@ struct ComposerView: View {
     /// transparent ground; the context-sensitive action lives on Row 2.
     private var composerField: some View {
         TextField("Message Hermes…", text: $text, axis: .vertical)
+            .accessibilityIdentifier("composerInput")
             .lineLimit(1...6)
             .focused($isFocused)
             .padding(.horizontal, 2)

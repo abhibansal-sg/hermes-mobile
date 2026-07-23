@@ -24,6 +24,9 @@ final class ChatFlowUITests: XCTestCase {
         let app = XCUIApplication()
         app.launchEnvironment["HERMES_URL"] = url
         app.launchEnvironment["HERMES_TOKEN"] = token
+        if let relayURL = env["HERMES_RELAY_URL"], !relayURL.isEmpty {
+            app.launchEnvironment["HERMES_RELAY_URL"] = relayURL
+        }
         app.launchArguments += ["--uitest-mute-audio"]
         app.launch()
 
@@ -37,15 +40,10 @@ final class ChatFlowUITests: XCTestCase {
             "Connected chat shell (draft home) did not appear"
         )
 
-        // 2. The draft chat's composer is present from launch. Target it by its
-        //    placeholder ("Message Hermes…") rather than `firstMatch`: with the
-        //    F1 push-card drawer the drawer's "Search" TextField also lives in the
-        //    tree (beneath the chat card), and a bare `firstMatch` would type into
-        //    it instead of the composer. A vertical-axis SwiftUI TextField is
-        //    exposed as either a textField or a textView, so we accept both.
-        let composerPlaceholder = "Message Hermes…"
-        let composerField = app.textFields[composerPlaceholder]
-        let composerTextView = app.textViews[composerPlaceholder]
+        // 2. A physical device preserves per-session drafts between launches,
+        //    so the placeholder is not a stable query. Use the field's identity.
+        let composerField = app.textFields["composerInput"]
+        let composerTextView = app.textViews["composerInput"]
         XCTAssertTrue(
             composerField.waitForExistence(timeout: 20)
                 || composerTextView.waitForExistence(timeout: 5),
@@ -63,7 +61,7 @@ final class ChatFlowUITests: XCTestCase {
         send.tap()
 
         // 4. The streamed assistant reply lands in the transcript.
-        let reply = app.staticTexts.containing(
+        let reply = app.textViews.matching(
             NSPredicate(format: "label CONTAINS[c] %@", "Paris")
         ).firstMatch
         XCTAssertTrue(
@@ -197,8 +195,8 @@ final class ChatFlowUITests: XCTestCase {
         let initialNewChat = app.buttons["drawerNewChat"]
         XCTAssertTrue(initialNewChat.waitForExistence(timeout: 15))
         initialNewChat.tap()
-        let field = app.textFields["Message Hermes…"]
-        let textView = app.textViews["Message Hermes…"]
+        let field = app.textFields["composerInput"]
+        let textView = app.textViews["composerInput"]
         XCTAssertTrue(field.waitForExistence(timeout: 20) || textView.waitForExistence(timeout: 5))
         let composer = field.exists ? field : textView
         composer.tap()
@@ -279,8 +277,8 @@ final class ChatFlowUITests: XCTestCase {
         XCTAssertTrue(newChat.waitForExistence(timeout: 15))
         newChat.tap()
 
-        let field = app.textFields["Message Hermes…"]
-        let textView = app.textViews["Message Hermes…"]
+        let field = app.textFields["composerInput"]
+        let textView = app.textViews["composerInput"]
         XCTAssertTrue(field.waitForExistence(timeout: 20) || textView.waitForExistence(timeout: 5))
         let composer = field.exists ? field : textView
         composer.tap()
