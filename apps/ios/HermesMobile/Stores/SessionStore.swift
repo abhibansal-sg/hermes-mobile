@@ -6317,20 +6317,9 @@ struct SessionActionError: Identifiable, Equatable {
     let message: String
 }
 
-// MARK: - Projects overview (ABH-351 SLICE 2)
+// MARK: - Projects
 
-/// ABH-351 (SLICE 2) — read-only Projects browsing for the drawer's Projects tab.
-///
-/// Fetches the projects overview from the slice-1 REST route
-/// (`GET /api/plugins/hermes-mobile/projects`) — the merged user-created +
-/// auto-discovered git-repo-roots + session-cwds list, junk-filtered, reshaped
-/// to `{id, label, root, session_count}`. The store exposes the fetched list
-/// plus designed loading / empty / error states, and derives per-project
-/// sessions from ``SessionStore`` (a project's sessions are the ones whose
-/// `cwd` matches the project's `root`).
-///
-/// This slice is READ-ONLY browsing + session-start ONLY. Create-project /
-/// attach-folders / set-idea is a FAST-FOLLOW and lives outside this store.
+/// Projects browsing backed by the stock gateway project RPCs.
 ///
 /// The store is `@Observable` + `@MainActor`, mirroring the app's other store
 /// shape (``SessionStore``, ``ConnectionStore``). It owns NO back-references at
@@ -6342,7 +6331,7 @@ final class ProjectsStore {
 
     // MARK: - Published state
 
-    /// The fetched projects overview (slice-1 route payload), or `nil` before
+    /// The fetched projects overview, or `nil` before
     /// the first successful load completes. An empty array IS a valid loaded
     /// state (no projects discovered) and renders a designed empty state, NOT
     /// this `nil` placeholder.
@@ -6359,7 +6348,7 @@ final class ProjectsStore {
     // MARK: - Per-project sessions (ABH-407)
 
     /// Server-scoped session lists for Project detail, keyed by ``Project/id``.
-    /// Populated by ``refreshSessions(for:)`` via `GET /api/sessions?cwd_prefix=…`
+    /// Populated by ``refreshSessions(for:)`` via `projects.project_sessions`
     /// — independent of ``SessionStore/sessions`` (the global drawer Recents list)
     /// so a project fetch can never corrupt Recents or the active session state.
     private(set) var projectSessionsById: [String: [SessionSummary]] = [:]
@@ -6371,15 +6360,12 @@ final class ProjectsStore {
     /// Cleared on the next successful fetch for that project.
     private(set) var projectSessionsErrorById: [String: String] = [:]
 
-    /// Testing seam: when set, ``refreshSessions(for:)`` calls this instead of
-    /// hitting the network via `connection?.rest` — mirrors
-    /// ``SessionStore/sessionsFetch``. Lets tests prove the store renders
-    /// exactly the (stubbed) server-scoped response without a live gateway.
-    var sessionsFetch: ((Project) async throws -> (sessions: [SessionSummary], total: Int?))?
+    /// Narrow test seam for the stock JSON-RPC boundary.
+    var gatewayRequest: ((String, JSONValue) async throws -> JSONValue)?
 
     // MARK: - Back-reference (injected by AppEnvironment)
 
-    /// The connection store, for REST access. `nil` until
+    /// The connection store, for gateway access. `nil` until
     /// ``attach(connection:)`` is called by the composition root.
     private var connection: ConnectionStore?
 
@@ -6398,11 +6384,32 @@ final class ProjectsStore {
 
     init() {}
 
-    /// Inject the connection store (REST access). Called once by
+    /// Inject the connection store. Called once by
     /// ``AppEnvironment`` after the store graph is built — mirrors the
     /// attach-pattern the other stores use (``SessionStore/attach`` etc.).
     func attach(connection: ConnectionStore) {
         self.connection = connection
+    }
+
+    private func request<T: Decodable & Sendable>(
+        _ method: String,
+        params: JSONValue = .object([:])
+    ) async throws -> T {
+        let raw: JSONValue
+        if let gatewayRequest {
+            raw = try await gatewayRequest(method, params)
+        } else if let connection {
+            raw = try await connection.client.requestRaw(method, params: params)
+        } else {
+            throw GatewayError.notConnected
+        }
+        guard let decoded = raw.decoded(as: T.self) else {
+            throw GatewayError.decoding(
+                method: method,
+                underlying: "result did not match \(T.self)"
+            )
+        }
+        return decoded
     }
 
     /// Inject the offline cache + its scope provider, and immediately seed the
@@ -6431,7 +6438,7 @@ final class ProjectsStore {
 
     // MARK: - Fetch
 
-    /// Fetch the projects overview from the slice-1 REST route and update
+    /// Fetch the projects overview from the stock gateway and update
     /// ``projects`` / ``isLoading`` / ``loadError``.
     ///
     /// Safe to call repeatedly (drawer-open refresh, pull-to-refresh). A fetch
@@ -6439,7 +6446,7 @@ final class ProjectsStore {
     /// ``loadError`` and leave the last successful ``projects`` intact so the
     /// UI doesn't flicker on a transient network blip.
     func refresh() async {
-        guard let rest = connection?.rest else {
+        guard connection != nil || gatewayRequest != nil else {
             // Offline: paint from disk so cold launch shows the last-known
             // projects instead of a blank "Not connected" list.
             await seedFromCache()
@@ -6449,15 +6456,11 @@ final class ProjectsStore {
         isLoading = true
         defer { isLoading = false }
         do {
-            let data = try await rest.get(
-                path: "\(rest.mobileAPIPrefix)/projects"
+            let payload: StockProjectTreePayload = try await request(
+                "projects.tree",
+                params: .object(["preview_limit": .number(3)])
             )
-            // The route returns a bare JSON array (see test_projects_route.py);
-            // decode with default keys (no snake_case conversion needed — the
-            // keys are already lowercase with underscores).
-            let decoded = try JSONDecoder().decode(
-                [Project].self, from: data
-            )
+            let decoded = payload.projects.map(\.project)
             projects = decoded
             loadError = nil
             // Write-through: persist the fresh list so the next cold/offline
@@ -6491,7 +6494,7 @@ final class ProjectsStore {
         case failure(String)
     }
 
-    /// Create a project via the plugin `POST /projects` route, then refresh the
+    /// Create a project via the stock `projects.create` RPC, then refresh the
     /// overview so the new project appears in the list. Never throws — failures
     /// come back as ``CreateResult/failure`` for the sheet to surface.
     func createProject(name: String, root: String) async -> CreateResult {
@@ -6499,9 +6502,18 @@ final class ProjectsStore {
         let trimmedRoot = root.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmedName.isEmpty else { return .failure("Project name is required.") }
         guard !trimmedRoot.isEmpty else { return .failure("Root folder path is required.") }
-        guard let rest = connection?.rest else { return .failure("Not connected") }
+        guard connection != nil || gatewayRequest != nil else { return .failure("Not connected") }
         do {
-            let project = try await rest.createProject(name: trimmedName, root: trimmedRoot)
+            let payload: StockProjectCreatePayload = try await request(
+                "projects.create",
+                params: .object([
+                    "name": .string(trimmedName),
+                    "primary_path": .string(trimmedRoot),
+                ])
+            )
+            guard let project = payload.project?.project else {
+                return .failure("The gateway did not return the created project.")
+            }
             await refresh()
             return .created(project)
         } catch {
@@ -6511,52 +6523,8 @@ final class ProjectsStore {
         }
     }
 
-    /// Testing seam: overrides the retry backoff in ``refreshSessions(for:)``
-    /// so unit tests don't burn wall-clock time on the real delay. `nil` (the
-    /// production default) uses ``projectSessionsRetryDelayNanoseconds``.
-    var projectSessionsRetryDelayOverrideNanoseconds: UInt64?
-
-    /// Delay before the single automatic retry in ``refreshSessions(for:)``.
-    /// Short and fixed (not exponential) — this covers a sub-second gateway
-    /// respawn window (PROJECTS-401), not a sustained outage; the manual
-    /// "Retry" affordance in the detail view's error row handles anything
-    /// longer.
-    private static let projectSessionsRetryDelayNanoseconds: UInt64 = 600_000_000
-
-    /// `true` for a failure the gateway can recover from within the same
-    /// respawn window: a 401/403 (device-token auth racing plugin-route
-    /// registration during a crash-respawn — PROJECTS-401), any 5xx, or a
-    /// transport-level failure (timeout / dropped connection). Treated
-    /// exactly like the legacy "gateway too old" 404 — fall back to the
-    /// `cwd_prefix` path, and retry the whole two-tier fetch once.
-    ///
-    /// NOT transient: 4xx other than 401/403/404 (a genuinely malformed
-    /// request) and decode failures (a real contract mismatch) — those
-    /// propagate immediately so the designed error state stays honest.
-    static func isTransientProjectSessionsFailure(_ error: Error) -> Bool {
-        switch error {
-        case RestError.badStatus(let status, _):
-            return status == 401 || status == 403 || status == 404 || (500...599).contains(status)
-        case RestError.network:
-            return true
-        default:
-            return false
-        }
-    }
-
-    /// The detail view's error row copy for `error`. Transient failures (see
-    /// ``isTransientProjectSessionsFailure(_:)``) get directional copy — the
-    /// user should just retry, a raw "HTTP 401" is not actionable — everything
-    /// else keeps its specific message.
-    static func projectSessionsErrorMessage(for error: Error) -> String {
-        guard isTransientProjectSessionsFailure(error) else {
-            return (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
-        }
-        return "Reconnecting to gateway — retry"
-    }
-
-    /// Fetch a project's sessions from the server with `cwd_prefix=project.root`
-    /// (ABH-407) and update ``projectSessionsById`` / ``projectSessionsLoadingIds``
+    /// Fetch a project's sessions from the stock gateway's project ownership
+    /// tree and update ``projectSessionsById`` / ``projectSessionsLoadingIds``
     /// / ``projectSessionsErrorById`` for that project's id. This is the primary
     /// Project detail data source — it does NOT touch ``SessionStore/sessions``
     /// (the global drawer Recents list) or the active session state.
@@ -6566,33 +6534,12 @@ final class ProjectsStore {
     /// successful list for this project intact so the UI doesn't flicker on a
     /// transient network blip.
     func refreshSessions(for project: Project) async {
-        let fetch: () async throws -> (sessions: [SessionSummary], total: Int?)
-        if let sessionsFetch {
-            fetch = { try await sessionsFetch(project) }
-        } else {
-            guard let rest = connection?.rest else {
-                // Offline: paint from the per-project cache snapshot if we have
-                // one, so cold-launch detail isn't a blank "Not connected" wall.
-                await seedProjectSessionsFromCache(for: project)
-                if projectSessionsById[project.id] == nil {
-                    projectSessionsErrorById[project.id] = "Not connected"
-                }
-                return
+        guard connection != nil || gatewayRequest != nil else {
+            await seedProjectSessionsFromCache(for: project)
+            if projectSessionsById[project.id] == nil {
+                projectSessionsErrorById[project.id] = "Not connected"
             }
-            // Primary: the plugin's folded project-sessions route (matches the
-            // count). Fall back to the legacy cwd_prefix path on a 404 (gateway
-            // too old to serve the plugin route) OR a transient failure — a
-            // 401/403/5xx/timeout observed during a gateway crash-respawn
-            // window (PROJECTS-401: device-token auth can race plugin-route
-            // registration on a fresh process). A non-transient failure
-            // propagates so the designed error state is honest.
-            fetch = {
-                do {
-                    return try await rest.projectSessions(projectId: project.id)
-                } catch let error where Self.isTransientProjectSessionsFailure(error) {
-                    return try await rest.sessionsWithTotal(cwdPrefix: project.root)
-                }
-            }
+            return
         }
         // Seed instantly from the per-project cache snapshot so the detail view
         // paints before the network returns (write-through repaints on success).
@@ -6600,57 +6547,19 @@ final class ProjectsStore {
         projectSessionsLoadingIds.insert(project.id)
         defer { projectSessionsLoadingIds.remove(project.id) }
         do {
-            let result = try await fetchProjectSessionsWithRetry(fetch)
-            // S10 (QA-3): never accept a fallback `[]` as authoritative when
-            // the project overview's `sessionCount > 0`. The overview count
-            // comes from the same `_build_project_tree` machinery that folds
-            // worktrees, so a non-zero count is authoritative — a `[]` here
-            // means the detail query's cwd_prefix path missed worktree cwds
-            // (the server fix in `_cwd_prefix_clause` closes this; this is the
-            // iOS-side defensive backstop while the plugin response propagates).
-            // Treat an empty-list-when-count>0 as a transient failure so the
-            // detail surfaces a "Reconnecting to gateway — retry" state rather
-            // than a lying "No sessions yet" (IMG_2593). Preserve any prior
-            // non-empty list so the UI doesn't flicker to empty on a blip.
-            if result.sessions.isEmpty && project.sessionCount > 0 {
-                if projectSessionsById[project.id] == nil {
-                    projectSessionsErrorById[project.id] = Self.projectSessionsEmptyButCountedMessage
-                }
-                return
-            }
-            projectSessionsById[project.id] = result.sessions
+            let payload: StockProjectSessionsPayload = try await request(
+                "projects.project_sessions",
+                params: .object(["project_id": .string(project.id)])
+            )
+            let sessions = payload.project?.sessions ?? []
+            projectSessionsById[project.id] = sessions
             projectSessionsErrorById[project.id] = nil
-            writeThroughProjectSessions(result.sessions, for: project)
+            writeThroughProjectSessions(sessions, for: project)
         } catch {
             if projectSessionsById[project.id] == nil {
-                projectSessionsErrorById[project.id] = Self.projectSessionsErrorMessage(for: error)
+                projectSessionsErrorById[project.id] =
+                    (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
             }
-        }
-    }
-
-    /// S10: surfaced copy when the detail fetch returned `[]` but the project
-    /// overview's `sessionCount > 0`. Same directional copy as a transient
-    /// failure — the user should retry; a lying "No sessions yet" is not
-    /// actionable. Distinct constant so a test can pin the contract.
-    static let projectSessionsEmptyButCountedMessage = "Reconnecting to gateway — retry"
-
-    /// Runs `fetch` (which already carries the 404/transient → `cwd_prefix`
-    /// fallback above); on a transient failure from THAT combined attempt,
-    /// waits one short fixed backoff and retries the whole thing exactly
-    /// once before giving up. Covers the case where a gateway respawn window
-    /// outlasts both the primary and fallback request in the same call.
-    private func fetchProjectSessionsWithRetry(
-        _ fetch: () async throws -> (sessions: [SessionSummary], total: Int?)
-    ) async throws -> (sessions: [SessionSummary], total: Int?) {
-        do {
-            return try await fetch()
-        } catch {
-            guard Self.isTransientProjectSessionsFailure(error) else { throw error }
-            let delay = projectSessionsRetryDelayOverrideNanoseconds ?? Self.projectSessionsRetryDelayNanoseconds
-            if delay > 0 {
-                try? await Task.sleep(nanoseconds: delay)
-            }
-            return try await fetch()
         }
     }
 
@@ -6693,65 +6602,83 @@ final class ProjectsStore {
         projectSessionsErrorById[project.id]
     }
 
-    // MARK: - Derived queries
+}
 
-    /// Client-side fallback/test utility: the sessions belonging to a project
-    /// filtered from an already-loaded ``SessionStore`` by matching `cwd` to the
-    /// project's `root` (exact match on the trimmed path, case-insensitive,
-    /// trailing-slash-insensitive). ABH-407 moved Project detail's primary data
-    /// source to the server-side ``sessions(for:)`` / ``refreshSessions(for:)``
-    /// pair above (`cwd_prefix` query) — this method is kept for tests and as a
-    /// fallback utility, not as the detail view's data source.
-    ///
-    /// Returns `[]` when the session list hasn't loaded yet (a designed
-    /// loading/empty state in the detail view, not a silent zero).
-    func sessions(for project: Project, in sessionStore: SessionStore) -> [SessionSummary] {
-        let root = Self.normalizedPath(project.root)
-        guard !root.isEmpty else { return [] }
-        return sessionStore.sessions.filter {
-            Self.normalizedPath($0.cwd ?? "") == root
-        }
+private struct StockProjectTreePayload: Decodable, Sendable {
+    let projects: [StockProjectTreeNode]
+}
+
+private struct StockProjectSessionsPayload: Decodable, Sendable {
+    let project: StockProjectTreeNode?
+}
+
+private struct StockProjectTreeNode: Decodable, Sendable {
+    let id: String
+    let label: String
+    let path: String?
+    let sessionCount: Int
+    let repos: [StockProjectRepo]?
+
+    var project: Project {
+        Project(
+            id: id,
+            label: label,
+            root: path ?? repos?.first?.path ?? id,
+            sessionCount: sessionCount
+        )
     }
 
-    /// Normalize a filesystem path for cwd matching: trimmed, trailing slashes
-    /// stripped, case-folded. Empty / whitespace-only → "" (never matches).
-    static func normalizedPath(_ path: String) -> String {
-        var value = path.trimmingCharacters(in: .whitespacesAndNewlines)
-        while value.count > 1 && value.hasSuffix("/") { value.removeLast() }
-        return value.lowercased()
+    var sessions: [SessionSummary] {
+        (repos ?? []).flatMap { repo in
+            (repo.groups ?? []).flatMap { $0.sessions ?? [] }
+        }
     }
 }
 
-/// One entry in the projects overview (the slice-1 route's `{id, label, root,
-/// session_count}` contract).
-///
-/// `id` and `root` are both the repo root path (stable identity, matching how
-/// the desktop keys project entries). `session_count` is the number of sessions
-/// whose cwd resolved to that repo root (server-side count; the iOS client
-/// re-derives the live list from ``SessionStore`` for the detail view).
-struct Project: Decodable, Identifiable, Sendable, Equatable, Hashable {
+private struct StockProjectRepo: Decodable, Sendable {
+    let path: String?
+    let groups: [StockProjectGroup]?
+}
+
+private struct StockProjectGroup: Decodable, Sendable {
+    let sessions: [SessionSummary]?
+}
+
+private struct StockProjectCreatePayload: Decodable, Sendable {
+    let project: StockProjectInfo?
+}
+
+private struct StockProjectInfo: Decodable, Sendable {
+    let id: String
+    let name: String
+    let primaryPath: String?
+    let folders: [StockProjectFolder]?
+
+    var project: Project {
+        Project(
+            id: id,
+            label: name,
+            root: primaryPath ?? folders?.first?.path ?? id,
+            sessionCount: 0
+        )
+    }
+}
+
+private struct StockProjectFolder: Decodable, Sendable {
+    let path: String
+}
+
+/// Render projection of a stock gateway project.
+struct Project: Identifiable, Sendable, Equatable, Hashable {
     let id: String
     let label: String
     let root: String
     let sessionCount: Int
-
-    enum CodingKeys: String, CodingKey {
-        case id, label, root
-        case sessionCount = "session_count"
-    }
 
     init(id: String, label: String, root: String, sessionCount: Int) {
         self.id = id
         self.label = label
         self.root = root
         self.sessionCount = sessionCount
-    }
-
-    init(from decoder: Decoder) throws {
-        let c = try decoder.container(keyedBy: CodingKeys.self)
-        self.id = try c.decode(String.self, forKey: .id)
-        self.label = try c.decode(String.self, forKey: .label)
-        self.root = try c.decode(String.self, forKey: .root)
-        self.sessionCount = try c.decode(Int.self, forKey: .sessionCount)
     }
 }
