@@ -6,6 +6,7 @@ import XCTest
 /// app must render the streamed reply it never asked for.
 final class CrossClientSyncUITests: XCTestCase {
 
+    @MainActor
     func testExternallyDrivenForeignTurnIsMirroredLive() throws {
         let env = ProcessInfo.processInfo.environment
         guard let base = env["HERMES_URL"], let token = env["HERMES_TOKEN"],
@@ -23,11 +24,13 @@ final class CrossClientSyncUITests: XCTestCase {
         app.launchEnvironment["HERMES_TRANSPORT"] = "gatewayDirect"
         app.launchArguments += ["-hermes.transportPath", "gatewayDirect"]
         app.launchArguments += ["-hermes.connectionMode", "remoteURL"]
+        app.launchArguments += ["-hermes.connectionOffline", "false"]
         app.launchArguments += ["--uitest-mute-audio"]
         app.launch()
 
         let drawerToggle = app.buttons["drawerToggle"]
         XCTAssertTrue(drawerToggle.waitForExistence(timeout: 30))
+        dismissDeviceConnectionBannerIfPresent()
         drawerToggle.tap()
 
         let ownedSession = app.buttons.matching(identifier: "sessionRow")
@@ -36,12 +39,12 @@ final class CrossClientSyncUITests: XCTestCase {
         ownedSession.tap()
 
         XCTAssertTrue(
-            app.descendants(matching: .any).matching(
+            app.textViews.matching(
                 NSPredicate(format: "label CONTAINS %@", marker + "-FIRST")
             ).firstMatch.waitForExistence(timeout: 60),
             "Externally owned session did not paint its first turn"
         )
-        let secondReply = app.descendants(matching: .any).matching(
+        let secondReply = app.textViews.matching(
             NSPredicate(format: "label CONTAINS %@", marker + "-SECOND")
         ).firstMatch
         let springboard = XCUIApplication(bundleIdentifier: "com.apple.springboard")
@@ -75,6 +78,7 @@ final class CrossClientSyncUITests: XCTestCase {
         )
     }
 
+    @MainActor
     func testExternallyDrivenSessionRepaintsAfterForceClose() throws {
         let env = ProcessInfo.processInfo.environment
         guard let base = env["HERMES_URL"], let token = env["HERMES_TOKEN"],
@@ -89,12 +93,15 @@ final class CrossClientSyncUITests: XCTestCase {
         if let relayURL = env["HERMES_RELAY_URL"], !relayURL.isEmpty {
             app.launchEnvironment["HERMES_RELAY_URL"] = relayURL
         }
+        app.launchArguments += ["-hermes.connectionOffline", "false"]
+        app.launchArguments += ["-hermes.connectionMode", "remoteURL"]
         app.launchArguments += ["--uitest-mute-audio"]
 
         func openSeededSession() {
             app.launch()
             let drawerToggle = app.buttons["drawerToggle"]
             XCTAssertTrue(drawerToggle.waitForExistence(timeout: 30))
+            dismissDeviceConnectionBannerIfPresent()
             drawerToggle.tap()
             let ownedSession = app.buttons.matching(identifier: "sessionRow")
                 .matching(NSPredicate(format: "label BEGINSWITH %@", marker)).firstMatch
@@ -102,7 +109,7 @@ final class CrossClientSyncUITests: XCTestCase {
             ownedSession.tap()
         }
 
-        let secondMarker = app.descendants(matching: .any).matching(
+        let secondMarker = app.textViews.matching(
             NSPredicate(format: "label CONTAINS %@", marker + "-SECOND")
         ).firstMatch
         openSeededSession()
@@ -121,6 +128,7 @@ final class CrossClientSyncUITests: XCTestCase {
         add(attachment)
     }
 
+    @MainActor
     func testStockLoadEarlierPreservesActiveTurn() throws {
         let env = ProcessInfo.processInfo.environment
         guard let base = env["HERMES_URL"], let token = env["HERMES_TOKEN"],
@@ -132,14 +140,19 @@ final class CrossClientSyncUITests: XCTestCase {
         let app = XCUIApplication()
         app.launchEnvironment["HERMES_URL"] = base
         app.launchEnvironment["HERMES_TOKEN"] = token
+        if let relayURL = env["HERMES_RELAY_URL"], !relayURL.isEmpty {
+            app.launchEnvironment["HERMES_RELAY_URL"] = relayURL
+        }
         app.launchEnvironment["HERMES_TRANSPORT"] = "gatewayDirect"
         app.launchArguments += ["-hermes.transportPath", "gatewayDirect"]
         app.launchArguments += ["-hermes.connectionMode", "remoteURL"]
+        app.launchArguments += ["-hermes.connectionOffline", "false"]
         app.launchArguments += ["--uitest-mute-audio"]
         app.launch()
 
         let drawerToggle = app.buttons["drawerToggle"]
         XCTAssertTrue(drawerToggle.waitForExistence(timeout: 30))
+        dismissDeviceConnectionBannerIfPresent()
         drawerToggle.tap()
         let row = app.buttons.matching(identifier: "sessionRow")
             .matching(NSPredicate(format: "label BEGINSWITH %@", title)).firstMatch
@@ -194,6 +207,7 @@ final class CrossClientSyncUITests: XCTestCase {
         app.buttons["Interrupt"].tap()
     }
 
+    @MainActor
     func testDesktopCompletionPushOpensOwningSession() throws {
         let env = ProcessInfo.processInfo.environment
         guard let base = env["HERMES_URL"], let token = env["HERMES_TOKEN"],
@@ -208,33 +222,49 @@ final class CrossClientSyncUITests: XCTestCase {
         if let relayURL = env["HERMES_RELAY_URL"], !relayURL.isEmpty {
             app.launchEnvironment["HERMES_RELAY_URL"] = relayURL
         }
+        app.launchArguments += ["-hermes.connectionOffline", "false"]
+        app.launchArguments += ["-hermes.connectionMode", "remoteURL"]
         app.launchArguments += ["--uitest-mute-audio"]
         app.launch()
         XCTAssertTrue(app.buttons["drawerToggle"].waitForExistence(timeout: 30))
+        dismissDeviceConnectionBannerIfPresent()
 
         XCUIDevice.shared.press(.home)
         print("ABH519_PUSH_READY")
         let springboard = XCUIApplication(bundleIdentifier: "com.apple.springboard")
-        let notification = springboard.staticTexts.containing(
+        let notification = springboard.buttons.containing(
             NSPredicate(format: "label CONTAINS %@", marker + "-COMPLETE")
         ).firstMatch
-        XCTAssertTrue(
-            notification.waitForExistence(timeout: 180),
-            "Desktop completion did not produce a phone notification"
-        )
+        if !notification.waitForExistence(timeout: 15) {
+            springboard.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.01))
+                .press(
+                    forDuration: 0.1,
+                    thenDragTo: springboard.coordinate(
+                        withNormalizedOffset: CGVector(dx: 0.5, dy: 0.8)
+                    )
+                )
+            let focusGroup = springboard.buttons.containing(
+                NSPredicate(format: "label CONTAINS[c] %@", "While in Do Not Disturb")
+            ).firstMatch
+            if focusGroup.waitForExistence(timeout: 5) {
+                focusGroup.tap()
+            }
+        }
+        guard notification.waitForExistence(timeout: 165) else {
+            XCTFail("Desktop completion did not produce a phone notification")
+            return
+        }
         notification.tap()
 
         XCTAssertTrue(app.buttons["drawerToggle"].waitForExistence(timeout: 30))
         XCTAssertTrue(
-            app.staticTexts.containing(
+            app.textViews.containing(
                 NSPredicate(format: "label CONTAINS %@", marker + "-COMPLETE")
             ).firstMatch.waitForExistence(timeout: 30),
             "Completion notification did not open its owning transcript"
         )
         XCTAssertTrue(
-            springboard.staticTexts.containing(
-                NSPredicate(format: "label CONTAINS %@", marker + "-COMPLETE")
-            ).firstMatch.waitForNonExistence(timeout: 8),
+            notification.waitForNonExistence(timeout: 8),
             "Completion produced more than one phone notification"
         )
 
@@ -257,9 +287,15 @@ final class CrossClientSyncUITests: XCTestCase {
         let app = XCUIApplication()
         app.launchEnvironment["HERMES_URL"] = base
         app.launchEnvironment["HERMES_TOKEN"] = token
+        if let relayURL = env["HERMES_RELAY_URL"], !relayURL.isEmpty {
+            app.launchEnvironment["HERMES_RELAY_URL"] = relayURL
+        }
+        app.launchArguments += ["-hermes.connectionOffline", "false"]
+        app.launchArguments += ["-hermes.connectionMode", "remoteURL"]
         app.launchArguments += ["--uitest-mute-audio"]
         app.launch()
         XCTAssertTrue(app.buttons["drawerToggle"].waitForExistence(timeout: 30))
+        dismissDeviceConnectionBannerIfPresent()
 
         XCUIDevice.shared.press(.home)
         RunLoop.current.run(until: Date().addingTimeInterval(2))
@@ -282,6 +318,12 @@ final class CrossClientSyncUITests: XCTestCase {
                         withNormalizedOffset: CGVector(dx: 0.5, dy: 0.8)
                     )
                 )
+            let focusGroup = springboard.buttons.containing(
+                NSPredicate(format: "label CONTAINS[c] %@", "While in Do Not Disturb")
+            ).firstMatch
+            if focusGroup.waitForExistence(timeout: 5) {
+                focusGroup.tap()
+            }
         }
         guard notification.waitForExistence(timeout: 15) else {
             XCTFail("Desktop clarification did not produce a phone notification")
@@ -345,7 +387,10 @@ final class CrossClientSyncUITests: XCTestCase {
         try foreign.connect()
         defer { foreign.close() }
         let runtime = try foreign.createSession()
-        try foreign.submitPrompt(sessionId: runtime, text: "Reply with exactly: HELLO-FROM-DESKTOP")
+        try foreign.submitPrompt(
+            sessionId: runtime,
+            text: "Reply with the uppercase form of the words 'desktop watch ready' and nothing else."
+        )
         try foreign.waitForTurnComplete(sessionId: runtime, timeout: 120)
 
         // 2. App launches on a draft chat (Batch B chat-as-home); open the drawer
@@ -372,8 +417,8 @@ final class CrossClientSyncUITests: XCTestCase {
         firstRow.tap()
         // Resume finished once the prior transcript is visible.
         XCTAssertTrue(
-            app.descendants(matching: .any).matching(
-                NSPredicate(format: "label CONTAINS %@", "HELLO-FROM-DESKTOP")
+            app.textViews.matching(
+                NSPredicate(format: "label CONTAINS %@", "DESKTOP WATCH READY")
             ).firstMatch.waitForExistence(timeout: 60),
             "Resumed transcript did not load"
         )
@@ -381,7 +426,7 @@ final class CrossClientSyncUITests: XCTestCase {
         // 3. Foreign client drives the NEXT turn while the app watches.
         try foreign.submitPrompt(
             sessionId: runtime,
-            text: "Reply with exactly the word MIRRORTEST and nothing else."
+            text: "Reply with the uppercase form of the words 'foreign mirror proof' and nothing else."
         )
 
         // 3a. CLASSIFY the failure surface. The foreign turn runs a real model
@@ -419,11 +464,11 @@ final class CrossClientSyncUITests: XCTestCase {
         // 3b. The foreign turn is now PROVEN complete server-side, so a real
         //     mirror renders promptly: deltas stream during the turn (40ms
         //     coalesce) and `message.complete` triggers a REST backfill. A
-        //     short budget is therefore sufficient; if MIRRORTEST is still
+        //     short budget is therefore sufficient; if the transformed reply is still
         //     absent the turn DID finish but the app dropped it — a genuine
         //     app/server mirror bug, not a slow model.
-        let mirrored = app.descendants(matching: .any).matching(
-            NSPredicate(format: "label CONTAINS[c] %@", "MIRRORTEST")
+        let mirrored = app.textViews.matching(
+            NSPredicate(format: "label CONTAINS %@", "FOREIGN MIRROR PROOF")
         ).firstMatch
         let mirrorRendered = mirrored.waitForExistence(timeout: 15)
         let mirrorLag = Date().timeIntervalSince(completeInstant)
