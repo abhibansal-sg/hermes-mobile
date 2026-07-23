@@ -105,7 +105,6 @@ enum DefaultsKeys {
 
     /// `String` — a prompt captured by an App Intent while disconnected, replayed
     /// on next launch. Owned by ``PendingIntent``.
-    static let pendingIntentPrompt = "hermes.pendingIntentPrompt"
 
     // MARK: App lock
 

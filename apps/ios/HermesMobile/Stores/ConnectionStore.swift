@@ -1944,8 +1944,6 @@ final class ConnectionStore {
         guard isCurrentGeneration(generation) else { return }
         await queueStore?.removeAll()
         inboxStore?.removeAll()
-        PendingIntent.clearPending()
-        SharedStore.clearInbox()
         SharedStore.clearSnapshot()
         await AttachmentBlobCache.shared.clearAll()
         LiveActivityManager.shared.end()

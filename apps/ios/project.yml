@@ -170,7 +170,6 @@ targets:
     sources:
       - path: HermesMobileTests
         excludes:
-          - LegacyWorkImportTests.swift
           - WorkRepositoryCrossProcessTests.swift
           - WorkRepositoryLeaseTests.swift
           - WorkRepositoryMigrationTests.swift
@@ -205,7 +204,6 @@ targets:
     platform: iOS
     hostApplication: HermesWorkTestHost
     sources:
-      - HermesMobileTests/LegacyWorkImportTests.swift
       - HermesMobileTests/WorkRepositoryCrossProcessTests.swift
       - HermesMobileTests/WorkRepositoryLeaseTests.swift
       - HermesMobileTests/WorkRepositoryMigrationTests.swift
@@ -227,7 +225,6 @@ targets:
     platform: macOS
     deploymentTarget: "14.0"
     sources:
-      - HermesMobileTests/LegacyWorkImportTests.swift
       - HermesMobileTests/WorkRepositoryCrossProcessTests.swift
       - HermesMobileTests/WorkRepositoryLeaseTests.swift
       - HermesMobileTests/WorkRepositoryMigrationTests.swift

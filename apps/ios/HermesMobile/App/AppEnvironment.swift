@@ -199,9 +199,6 @@ final class AppEnvironment {
         )
         queueStore.installProcessor(outboxProcessor)
         Task {
-            try? await workRepository.importLegacyWork(
-                from: LegacyWorkImportSource(scope: sessionStore.durableWorkScope)
-            )
             _ = try? await workRepository.cleanupShareWork()
             if let scope = sessionStore.durableWorkScope {
                 try? await workRepository.bindPendingShares(to: scope)
@@ -411,7 +408,6 @@ final class AppEnvironment {
                 WidgetSnapshotWriter.flush()
             },
             flushPendingNavigation: { [weak workRepository] in
-                PendingIntent.flushPendingStorage()
                 try? await workRepository?.flushForBackground()
             }
         ))

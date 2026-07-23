@@ -6,9 +6,9 @@ import SwiftUI
 /// Modern, `SLComposeServiceViewController`-free approach: a plain
 /// `UIViewController` that resolves the incoming `NSExtensionItem`s, then hosts
 /// ``ShareSheetView`` via a `UIHostingController`. On confirm it persists a
-/// ``SharedStore/SharedInboxItem`` (plus image files) into the app group and
-/// completes the request. The extension performs **no networking** — the app's
-/// `SharedInboxDrainer` (X3) picks the item up on next foreground.
+/// durable ``WorkRepository`` item into the app group and completes the
+/// request. The extension performs **no networking** — the app's outbox picks
+/// the item up on next foreground.
 @MainActor
 final class ShareViewController: UIViewController {
     private var hostingController: UIHostingController<AnyView>?

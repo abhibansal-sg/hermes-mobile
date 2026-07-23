@@ -1358,7 +1358,7 @@ final class SessionStore {
         Task { [weak self] in
             guard let self else { return }
             guard self.workRepository == nil else { return }
-            self.workRepository = try? await WorkRepository.openAppGroup(scope: self.durableWorkScope)
+            self.workRepository = try? await WorkRepository.openAppGroup()
             self.restoreComposerDraft(for: self.activeComposerDraftKey)
         }
     }
