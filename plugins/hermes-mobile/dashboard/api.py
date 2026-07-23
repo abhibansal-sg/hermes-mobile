@@ -2842,6 +2842,36 @@ def _project_sessions_server_fallback(
         _log.debug("project sessions: server fallback unavailable: %s", exc)
         return empty
 
+    # A raw cwd prefix cannot see sibling linked worktrees. Reuse the stock
+    # gateway's persisted `git_repo_root` enrichment (and its common-root
+    # resolver only when that column is absent) to fold those rows under the
+    # main checkout id shown by `/projects`.
+    try:
+        from tui_gateway.server import _git_common_repo_root_for_cwd
+
+        candidates = db.list_sessions_rich(
+            limit=session_limit,
+            offset=0,
+            order_by_last_active=True,
+            min_message_count=1,
+            include_children=False,
+            exclude_sources=_PROJECT_TREE_EXCLUDED_SOURCES,
+            include_archived=False,
+        )
+        expected_root = os.path.normcase(os.path.realpath(project_id))
+        folded = []
+        for row in candidates or []:
+            root = str(row.get("git_repo_root") or "")
+            if not root:
+                root = _git_common_repo_root_for_cwd(str(row.get("cwd") or ""))
+            if root and os.path.normcase(os.path.realpath(root)) == expected_root:
+                folded.append(row)
+        if len(folded) > int(total or 0):
+            rows = folded
+            total = len(folded)
+    except Exception as exc:
+        _log.debug("project sessions: worktree fold unavailable: %s", exc)
+
     sessions = [_project_tree_row(r) for r in rows or []]
     return {
         "project_id": project_id,
@@ -2899,6 +2929,9 @@ async def project_sessions(
     )
     if project is not None:
         sessions = _flatten_project_sessions(project)
+        folded = _project_sessions_server_fallback(db, project_id, session_limit)
+        if folded["total"] > int(project.get("sessionCount") or len(sessions)):
+            return folded
         return {
             "project_id": project_id,
             "sessions": sessions,

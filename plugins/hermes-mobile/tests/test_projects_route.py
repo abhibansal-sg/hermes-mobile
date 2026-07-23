@@ -84,7 +84,15 @@ class _FakeSessionDB:
     def list_sessions_rich(self, *, cwd_prefix=None, limit=20, **kw):
         self.list_calls.append({"cwd_prefix": cwd_prefix, "limit": limit, **kw})
         if not cwd_prefix:
-            return []
+            rows = []
+            seen = set()
+            for group in self._sessions.values():
+                for row in group:
+                    session_id = row.get("id")
+                    if session_id not in seen:
+                        seen.add(session_id)
+                        rows.append(row)
+            return [dict(r) for r in rows][:limit]
         rows = self._sessions.get(cwd_prefix, [])
         return [dict(r) for r in rows][:limit]
 
@@ -315,6 +323,66 @@ def test_project_sessions_flattens_hydrated_desktop_lanes(client, monkeypatch):
     }
 
 
+def test_project_sessions_folds_linked_worktrees_when_explicit_tree_undercounts(
+    client, monkeypatch
+):
+    """Physical-device regression: the explicit project tree carried one main
+    checkout row while `/projects` counted the same repo's linked worktrees.
+    The detail route must prefer the larger stock-enriched repo-root fold.
+    """
+    repo_root = "/Volumes/MainData/Developer/products/hermes-mobile"
+    worktree = "/Volumes/MainData/Developer/worktrees/hermes-mobile-feature"
+    db = _FakeSessionDB(
+        sessions_by_prefix={
+            repo_root: [
+                {
+                    "id": "main",
+                    "cwd": repo_root,
+                    "git_repo_root": repo_root,
+                    "message_count": 2,
+                },
+                {
+                    "id": "feature",
+                    "cwd": worktree,
+                    "git_repo_root": repo_root,
+                    "message_count": 4,
+                },
+            ]
+        },
+        count_by_prefix={repo_root: 1},
+    )
+    _patch_project_tree(
+        monkeypatch,
+        projects=[
+            {
+                "id": repo_root,
+                "sessionCount": 1,
+                "repos": [
+                    {
+                        "groups": [
+                            {
+                                "sessions": [
+                                    {"id": "main", "cwd": repo_root, "message_count": 2}
+                                ]
+                            }
+                        ]
+                    }
+                ],
+            }
+        ],
+        session_db=db,
+    )
+
+    resp = client.get(
+        "/api/plugins/hermes-mobile/project-sessions",
+        params={"project_id": repo_root},
+    )
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["total"] == 2
+    assert [row["id"] for row in resp.json()["sessions"]] == ["main", "feature"]
+
+
 def test_project_sessions_unknown_project_is_empty(client, monkeypatch):
     """Unknown ids do not fall back to unrelated sessions from the tree."""
     _patch_project_tree(
@@ -458,12 +526,17 @@ def test_project_sessions_fallback_mirrors_desktop_filtering(client, monkeypatch
     assert resp.status_code == 200, resp.text
 
     assert db.list_calls and db.count_calls
-    lc = db.list_calls[-1]
+    lc = next(call for call in db.list_calls if call["cwd_prefix"] == repo_root)
     assert lc["cwd_prefix"] == repo_root
     assert lc["exclude_sources"] == ["cron"]
     assert lc["include_children"] is False
     assert lc["min_message_count"] == 1
     assert lc["order_by_last_active"] is True
+    fold_call = next(call for call in db.list_calls if call["cwd_prefix"] is None)
+    assert fold_call["exclude_sources"] == ["cron"]
+    assert fold_call["include_children"] is False
+    assert fold_call["min_message_count"] == 1
+    assert fold_call["order_by_last_active"] is True
     cc = db.count_calls[-1]
     assert cc["cwd_prefix"] == repo_root
     assert cc["exclude_children"] is True
