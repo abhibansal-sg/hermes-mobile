@@ -60,7 +60,9 @@ final class ChatStoreTests: XCTestCase {
         let sessions = SessionStore()
         let chat = ChatStore()
         let connection = ConnectionStore(sessionStore: sessions, chatStore: chat)
-        chat.attach(connection: connection, sessions: sessions, attachments: AttachmentStore())
+        let attachments = AttachmentStore()
+        chat.attach(connection: connection, sessions: sessions, attachments: attachments)
+        sessions.attach(connection: connection, chat: chat, attachments: attachments)
         sessions.activeRuntimeId = "runtime-active"
         sessions.activeStoredId = "stored-active"
         chat.pushAlertAuthorityOverride = false
