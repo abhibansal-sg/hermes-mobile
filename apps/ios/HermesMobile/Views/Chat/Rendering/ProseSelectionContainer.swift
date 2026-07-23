@@ -478,6 +478,7 @@ struct ProseSelectionContainer: UIViewRepresentable {
         view.adjustsFontForContentSizeCategory = false
         view.setContentCompressionResistancePriority(.required, for: .vertical)
         view.attributedText = text
+        view.ensureCompleteDocumentLayout()
         view.delegate = context.coordinator
         return view
     }
@@ -491,12 +492,14 @@ struct ProseSelectionContainer: UIViewRepresentable {
         // yank an in-progress selection.
         if let current = uiView.attributedText, current.isEqual(to: text) { return }
         uiView.attributedText = text
+        uiView.ensureCompleteDocumentLayout()
     }
 
     /// Self-size to the proposed width, like the `Text` this replaces. Never
     /// reads `UIScreen.main` (STR-695).
     func sizeThatFits(_ proposal: ProposedViewSize, uiView: ProseTextView, context: Context) -> CGSize? {
         let width = proposal.width ?? 320
+        uiView.ensureCompleteDocumentLayout()
         let fit = uiView.sizeThatFits(CGSize(width: width, height: .greatestFiniteMagnitude))
         return CGSize(width: width, height: ceil(fit.height))
     }
@@ -536,6 +539,22 @@ final class ProseTextView: SelfSizingTextView {
     private var touched = false
     /// One-shot mount clamp fired on first window attach.
     private var mountSelectionCleared = false
+
+    #if DEBUG
+    private(set) var didEnsureCompleteDocumentLayout = false
+    #endif
+
+    /// TextKit 2 is viewport-driven by default. This view is not its own
+    /// viewport: SwiftUI's outer ScrollView owns scrolling, so measure and draw
+    /// the complete document range before reporting the view's height.
+    func ensureCompleteDocumentLayout() {
+        guard let manager = textLayoutManager,
+              let range = manager.textContentManager?.documentRange else { return }
+        manager.ensureLayout(for: range)
+        #if DEBUG
+        didEnsureCompleteDocumentLayout = true
+        #endif
+    }
 
     /// Tests drive selection programmatically as a stand-in for the user
     /// gesture — mark the view interacted so the mount gate stands down.
