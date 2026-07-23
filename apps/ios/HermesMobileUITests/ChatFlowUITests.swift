@@ -186,6 +186,9 @@ final class ChatFlowUITests: XCTestCase {
         let app = XCUIApplication()
         app.launchEnvironment["HERMES_URL"] = url
         app.launchEnvironment["HERMES_TOKEN"] = token
+        if let relayURL = env["HERMES_RELAY_URL"], !relayURL.isEmpty {
+            app.launchEnvironment["HERMES_RELAY_URL"] = relayURL
+        }
         app.launchArguments += ["--uitest-mute-audio"]
         app.launch()
 
@@ -241,7 +244,7 @@ final class ChatFlowUITests: XCTestCase {
             "The answered clarification card did not clear"
         )
         XCTAssertTrue(
-            app.staticTexts.containing(
+            app.descendants(matching: .any).matching(
                 NSPredicate(format: "label CONTAINS %@", "ABH519 owner answered")
             ).firstMatch.waitForExistence(timeout: 180),
             "The clarification answer did not resume and complete the owning turn"
