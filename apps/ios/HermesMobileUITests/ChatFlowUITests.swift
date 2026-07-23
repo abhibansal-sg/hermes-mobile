@@ -456,6 +456,58 @@ final class ChatFlowUITests: XCTestCase {
         app.buttons["newProjectCancel"].tap()
     }
 
+    func testWorkingDirectoryAndFileBrowserRoundTrip() throws {
+        let env = ProcessInfo.processInfo.environment
+        guard let url = env["HERMES_URL"], let token = env["HERMES_TOKEN"],
+              !url.isEmpty, !token.isEmpty else {
+            throw XCTSkip("HERMES_URL/HERMES_TOKEN not provided; skipping live test")
+        }
+
+        let app = XCUIApplication()
+        app.launchEnvironment["HERMES_URL"] = url
+        app.launchEnvironment["HERMES_TOKEN"] = token
+        if let relayURL = env["HERMES_RELAY_URL"], !relayURL.isEmpty {
+            app.launchEnvironment["HERMES_RELAY_URL"] = relayURL
+        }
+        app.launchArguments += ["--uitest-mute-audio"]
+        app.launch()
+
+        let drawerToggle = app.buttons["drawerToggle"]
+        XCTAssertTrue(drawerToggle.waitForExistence(timeout: 30))
+        drawerToggle.tap()
+        let session = app.buttons["sessionRow"].firstMatch
+        XCTAssertTrue(session.waitForExistence(timeout: 20))
+        session.tap()
+
+        let overflow = app.buttons["chatOverflowMenu"]
+        XCTAssertTrue(overflow.waitForExistence(timeout: 20))
+        overflow.tap()
+        let workingDirectory = app.buttons["workingDirMenuItem"]
+        XCTAssertTrue(workingDirectory.waitForExistence(timeout: 15))
+        workingDirectory.tap()
+
+        let useRoot = app.buttons["fileBrowserUseFolder"]
+        XCTAssertTrue(useRoot.waitForExistence(timeout: 20))
+        useRoot.tap()
+        let cwdConfirmation = app.descendants(matching: .any).matching(
+            NSPredicate(format: "label CONTAINS[c] %@", "Working directory set to")
+        ).firstMatch
+        XCTAssertTrue(cwdConfirmation.waitForExistence(timeout: 20))
+
+        let attach = app.buttons["composerAttachButton"]
+        XCTAssertTrue(attach.waitForExistence(timeout: 10))
+        attach.tap()
+        let browse = app.buttons["composerBrowseFiles"]
+        XCTAssertTrue(browse.waitForExistence(timeout: 10))
+        browse.tap()
+        XCTAssertTrue(app.navigationBars["Files"].waitForExistence(timeout: 20))
+        app.navigationBars["Files"].buttons["Done"].firstMatch.tap()
+        XCTAssertTrue(
+            app.textFields["composerInput"].waitForExistence(timeout: 10)
+                || app.textViews["composerInput"].waitForExistence(timeout: 3)
+        )
+    }
+
     /// BUG 2 (hotfix): the open-drawer swipe works from mid-screen with
     /// horizontal-dominance activation (the open-start zone now spans the leading
     /// 50% of the width). Drive a horizontal XCUICoordinate drag starting at
