@@ -28,10 +28,8 @@ final class GatewayForgetCoordinatorTests: XCTestCase {
         defaults.set(server, forKey: DefaultsKeys.serverURL)
         defaults.set(true, forKey: DefaultsKeys.pushRegistrationHealthy)
         DefaultsKeys.setDeviceId("device-1", server: server)
-        PendingIntent.ask(prompt: "private").park()
         defer {
             defaults.removeObject(forKey: DefaultsKeys.gatewayCleanupTombstone)
-            defaults.removeObject(forKey: DefaultsKeys.pendingIntentPrompt)
         }
         let (connection, _, _, queue, _, directory) = try makeStore()
         defer { try? FileManager.default.removeItem(at: directory) }
@@ -45,7 +43,6 @@ final class GatewayForgetCoordinatorTests: XCTestCase {
         XCTAssertNil(DefaultsKeys.deviceId(server: server))
         XCTAssertFalse(defaults.bool(forKey: DefaultsKeys.pushRegistrationHealthy))
         XCTAssertTrue(queue.items.isEmpty)
-        XCTAssertNil(PendingIntent.takePending())
         let data = try XCTUnwrap(defaults.data(forKey: DefaultsKeys.gatewayCleanupTombstone))
         let tombstone = try JSONDecoder().decode(GatewayCleanupTombstone.self, from: data)
         XCTAssertEqual(tombstone, GatewayCleanupTombstone(server: server, deviceId: "device-1", remoteRetryNeeded: true))
@@ -107,7 +104,6 @@ final class GatewayForgetCoordinatorTests: XCTestCase {
         XCTAssertNil(sessions.activeStoredId)
         XCTAssertNil(sessions.activeRuntimeId)
         XCTAssertTrue(chat.messages.isEmpty)
-        XCTAssertEqual(sessions.manifestRevision, 0)
         XCTAssertEqual(connection.phase, .needsSetup)
     }
 }

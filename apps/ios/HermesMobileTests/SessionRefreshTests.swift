@@ -15,12 +15,6 @@ import Observation
 ///    page is preserved (prepended) in `sessions`.
 /// 4. **Stale token response discarded** — a slow response whose `refreshToken`
 ///    was superseded by a newer call does NOT overwrite the current list.
-/// 5. **Coalescing collapses rapid triggers** — calling `scheduleSessionRefresh()`
-///    rapidly (via the `sessionsFetch` seam) results in one refresh, not N.
-/// 6. **Total decoded and exposed** — `totalSessions` is populated from the fetch
-///    result; `nil` total preserves the previously-known value.
-/// 7. **Plugin cursor deltas** — empty, changed-row, tombstone, and request-shape
-///    behavior preserve the loaded working set and compatibility fallbacks.
 @MainActor
 final class SessionRefreshTests: XCTestCase {
 
@@ -77,6 +71,10 @@ final class SessionRefreshTests: XCTestCase {
     /// A fresh store wired with no live connection — suitable for fetch-seam tests.
     private func makeStore() -> SessionStore {
         SessionStore()
+    }
+
+    func testStockSnapshotIsBounded() {
+        XCTAssertEqual(SessionStore.snapshotLimit, 200)
     }
 
     // MARK: - build125: identical first-page refresh produces no array churn (#208)
@@ -214,18 +212,18 @@ final class SessionRefreshTests: XCTestCase {
             "while a turn is in flight (markTurnStarted), the optimistic bump is carried forward so the row doesn't flicker down before the server catches up")
     }
 
-    // MARK: - LANE D: live session must not sink after a reconnect reseed
+    // MARK: - LANE D: live session must not sink after a reconnect snapshot
 
     /// LANE D regression. A live turn is streaming into "mine" (optimistically
     /// bumped to the top). A quick reconnect heal force-clears every in-flight turn
     /// flag (`clearAllTurnsInProgress`) yet PRESERVES the live-frame stamp, then its
-    /// transport-epoch bump forces a full first-page reseed. The reseed page carries
+    /// transport-epoch bump fetches a bounded snapshot. The snapshot carries
     /// the STALE server `lastActive` for "mine" (its last `message.complete` was
     /// yesterday; the in-flight turn has not landed) while two older rows look
     /// fresher. Before the fix, the carry-forward gate was `turnsInProgress`-only, so
     /// the now-empty flag let "mine" decay to its stale value and sink to "yesterday"
     /// — the transient mis-order the user saw. The live-window signal must keep it on
-    /// top through the reseed, with no wrong-order publish.
+    /// top through the refresh, with no wrong-order publish.
     func testLiveSessionSurvivesReconnectReseedWithoutSinking() async {
         let store = makeStore()
         let mine   = makeSummary(id: "mine", lastActive: 100, startedAt: 1)
@@ -245,7 +243,7 @@ final class SessionRefreshTests: XCTestCase {
         XCTAssertTrue(store.turnsInProgressIds.isEmpty,
             "setup: the reconnect heal cleared the turn-in-progress flag")
 
-        // The reconnect's epoch bump forces a full first-page reseed whose page still
+        // The reconnect refresh returns a bounded snapshot that still
         // carries the stale (pre-turn) server lastActive for "mine".
         let mineStale = makeSummary(id: "mine", lastActive: 10, startedAt: 1)
         store.sessionsFetch = { ([olderA, olderB, mineStale], 3) }
@@ -255,80 +253,6 @@ final class SessionRefreshTests: XCTestCase {
             "a still-live session must not sink to its stale server lastActive after a reconnect clears the turn-in-progress flag")
     }
 
-    /// A turn that JUST completed (markTurnCompleted fired, `turnsInProgress` now
-    /// empty) but is still inside the live window must keep its optimistic bump over
-    /// a lagging delta so it does not flicker down before the server catches up.
-    /// This exercises the `mergeSessionDelta` carry-forward gate via the live-window
-    /// signal (the delta cursor is still set, so a heartbeat takes the delta path).
-    func testDeltaCarriesForwardLiveWindowAfterTurnCompletes() async {
-        let store = makeStore()
-        let mine  = makeSummary(id: "mine",  lastActive: 100, startedAt: 1)
-        let other = makeSummary(id: "other", lastActive:  90, startedAt: 1)
-        store.sessionListDeltaFetch = { cursor, _ in
-            if cursor == nil {
-                return SessionListDeltaResult(
-                    sessions: [mine, other], tombstones: [], cursor: "seed", total: 2)
-            }
-            // Lagging heartbeat: server still reports the OLD (pre-turn) value for
-            // mine, which would knock it below "other" without carry-forward.
-            return SessionListDeltaResult(
-                sessions: [self.makeSummary(id: "mine", lastActive: 50, startedAt: 1)],
-                tombstones: [], cursor: "next", total: 2)
-        }
-
-        await store.refresh()
-        // A live turn ran and just settled: stamp the live frame, then complete it.
-        store.markTurnStarted(storedId: "mine")
-        store.noteActivity(storedId: "mine")
-        store.markTurnCompleted(storedId: "mine")
-        XCTAssertTrue(store.turnsInProgressIds.isEmpty,
-            "setup: the turn completed so the explicit flag is clear")
-
-        await store.refresh()
-
-        XCTAssertEqual(store.visibleSessions.map(\.id).first, "mine",
-            "a just-completed session still inside the live window keeps its optimistic bump over a lagging delta")
-    }
-
-    /// A delta that updates one session's activity moves it to the correct sorted
-    /// position, and a subsequent identical (empty) refresh republishes the SAME
-    /// order — no transient reordering across merges.
-    func testDeltaActivityUpdateSortsStablyAcrossIdenticalRefresh() async {
-        let store = makeStore()
-        let a = makeSummary(id: "A", lastActive: 100, startedAt: 1)
-        let b = makeSummary(id: "B", lastActive:  50, startedAt: 1)
-        let c = makeSummary(id: "C", lastActive:  30, startedAt: 1)
-        store.sessionListDeltaFetch = { cursor, _ in
-            switch cursor {
-            case nil:
-                return SessionListDeltaResult(
-                    sessions: [a, b, c], tombstones: [], cursor: "seed", total: 3)
-            case "seed":
-                // B receives fresh (foreign) activity and must jump above A.
-                return SessionListDeltaResult(
-                    sessions: [self.makeSummary(id: "B", lastActive: 400, startedAt: 1)],
-                    tombstones: [], cursor: "moved", total: 3)
-            default:
-                // Up-to-date heartbeat: no changes.
-                return SessionListDeltaResult(
-                    sessions: [], tombstones: [], cursor: "moved", total: 3)
-            }
-        }
-
-        await store.refresh()                       // seed
-        XCTAssertEqual(store.visibleSessions.map(\.id), ["A", "B", "C"])
-
-        await store.refresh()                       // activity delta
-        XCTAssertEqual(store.visibleSessions.map(\.id), ["B", "A", "C"],
-            "a delta bumping B's activity moves it to the correct sorted position")
-
-        let orderAfterMove = store.visibleSessions.map(\.id)
-        await store.refresh()                       // identical/empty heartbeat
-        XCTAssertEqual(store.visibleSessions.map(\.id), orderAfterMove,
-            "an identical refresh must republish the same order (stable, no transient reordering)")
-    }
-
-    /// When `lastActive` is absent, sort falls back to `startedAt` DESC.
     func testVisibleSessionsSortsByStartedAtWhenNoLastActive() async {
         let store = makeStore()
         let old   = makeSummary(id: "old",   startedAt: 100)
@@ -431,38 +355,6 @@ final class SessionRefreshTests: XCTestCase {
             "Stale result from the first refresh must not persist after the second refresh completes")
     }
 
-    // MARK: - 5. Total decoded and exposed
-
-    /// When the fetch returns a non-nil total, `totalSessions` must be updated.
-    func testTotalDecodedAndExposed() async {
-        let store = makeStore()
-        XCTAssertNil(store.totalSessions, "totalSessions must be nil before any fetch")
-
-        let rows = [makeSummary(id: "A", lastActive: 100)]
-        store.sessionsFetch = { (rows, 42) }
-        await store.refresh()
-
-        XCTAssertEqual(store.totalSessions, 42,
-            "totalSessions must reflect the total returned by the fetch")
-    }
-
-    /// When the fetch returns `nil` total, the previously-known `totalSessions`
-    /// must be preserved (WS RPC path has no total field).
-    func testNilTotalPreservesPreviousTotal() async {
-        let store = makeStore()
-
-        // First fetch: establishes a known total.
-        store.sessionsFetch = { ([self.makeSummary(id: "A", lastActive: 100)], 7) }
-        await store.refresh()
-        XCTAssertEqual(store.totalSessions, 7)
-
-        // Second fetch: no total (WS-RPC shape or older gateway).
-        store.sessionsFetch = { ([self.makeSummary(id: "A", lastActive: 200)], nil) }
-        await store.refresh()
-        XCTAssertEqual(store.totalSessions, 7,
-            "A nil total in a subsequent fetch must preserve the previously-known totalSessions")
-    }
-
     // MARK: - 6. Hard-replace semantics gone
 
     /// Verify the old hard-replace (sessions = result) no longer applies: a
@@ -485,494 +377,15 @@ final class SessionRefreshTests: XCTestCase {
             "Hard-replace is no longer acceptable — active session must survive the merge")
     }
 
-    // MARK: - STR-1208 plugin cursor deltas
-
-    func testBackgroundFlushedCursorRestoresAcrossRelaunch() async throws {
-        let suiteName = "SessionCursorFlush-\(UUID().uuidString)"
-        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
-        defer { defaults.removePersistentDomain(forName: suiteName) }
-        let first = SessionStore(defaults: defaults)
-        first.sessionListDeltaFetch = { _, _ in
-            SessionListDeltaResult(
-                sessions: [self.makeSummary(id: "A", lastActive: 100)],
-                tombstones: [],
-                cursor: "persisted-cursor",
-                total: 1
-            )
-        }
-        first.initialFillFetch = { _ in ([], 1) }
-        await first.refresh()
-        first.flushSessionListDeltaCursors(defaults: defaults)
-
-        let relaunched = SessionStore(defaults: defaults)
-        var observedCursor: String?
-        relaunched.sessionListDeltaFetch = { cursor, _ in
-            observedCursor = cursor
-            return SessionListDeltaResult(
-                sessions: [], tombstones: [], cursor: cursor ?? "missing", total: 1
-            )
-        }
-        relaunched.initialFillFetch = { _ in ([], 1) }
-        await relaunched.refresh()
-
-        XCTAssertEqual(observedCursor, "persisted-cursor")
-    }
-
-    func testEmptyCursorDeltaLeavesExistingWindowAndOrderUntouched() async {
-        let store = makeStore()
-        let a = makeSummary(id: "A", lastActive: 100)
-        let b = makeSummary(id: "B", lastActive: 200)
-        var seenCursors: [String?] = []
-
-        // The seed intentionally keeps a backing order that differs from recency.
-        // An empty delta must not sort or replace that loaded window.
-        store.sessionListDeltaFetch = { cursor, _ in
-            seenCursors.append(cursor)
-            if cursor == nil {
-                return SessionListDeltaResult(
-                    sessions: [a, b], tombstones: [], cursor: "c1", total: 500
-                )
-            }
-            return SessionListDeltaResult(
-                sessions: [], tombstones: [], cursor: "c2", total: 500
-            )
-        }
-        // Terminate the detached fill deterministically without changing rows.
-        store.initialFillFetch = { _ in ([], 500) }
-
-        await store.refresh()
-        await store.awaitInitialFillForTesting()
-        XCTAssertEqual(store.sessions.map(\.id), ["A", "B"])
-
-        store.setPaginationForTesting(loadedCount: 250, loadedOffset: 250, total: 500)
-        let before = store.sessions
-        await store.refresh()
-
-        XCTAssertEqual(seenCursors, [nil, "c1"])
-        XCTAssertEqual(store.sessions, before,
-            "an up-to-date empty delta must not rebuild, sort, or clear the current list")
-        XCTAssertEqual(store.loadedCount, 250,
-            "delta heartbeats must preserve the grow-limit pagination window")
-        XCTAssertEqual(store.loadedOffset, 250,
-            "delta heartbeats must not reset the pagination offset")
-        XCTAssertEqual(store.totalSessions, 500)
-    }
-
-    func testChangedCursorDeltaMergesAndResortsByLastActive() async {
-        let store = makeStore()
-        let a = makeSummary(id: "A", lastActive: 100)
-        let b = makeSummary(id: "B", lastActive: 50)
-        store.sessionListDeltaFetch = { cursor, _ in
-            if cursor == nil {
-                return SessionListDeltaResult(
-                    sessions: [a, b], tombstones: [], cursor: "seed", total: 2
-                )
-            }
-            return SessionListDeltaResult(
-                sessions: [self.makeSummary(id: "B", lastActive: 400)],
-                tombstones: [],
-                cursor: "next",
-                total: 2
-            )
-        }
-
-        await store.refresh()
-        await store.refresh()
-
-        XCTAssertEqual(store.sessions.map(\.id), ["B", "A"])
-        XCTAssertEqual(store.sessions.first?.lastActive, 400)
-    }
-
-    /// A2: after a reconnect (transport generation advances), the FIRST session-
-    /// list refresh must bypass the persisted delta cursor and do a FULL first-page
-    /// re-seed + fill-to-target, so an under-populated drawer (hydration cut short)
-    /// is repaired without a process restart. Same-generation refreshes still resume
-    /// incremental deltas.
-    func testReconnectForcesFullReseedBeforeDeltasResume() async {
-        let store = makeStore()
-        var generation: UInt64 = 1
-        store.reconnectGenerationProvider = { generation }
-        var seenCursors: [String?] = []
-        let fullPage = (0..<40).map { makeSummary(id: "s\($0)", lastActive: Double(1000 - $0)) }
-        store.sessionListDeltaFetch = { cursor, _ in
-            seenCursors.append(cursor)
-            if cursor == nil {
-                return SessionListDeltaResult(
-                    sessions: fullPage, tombstones: [], cursor: "cur-\(generation)", total: 40)
-            }
-            // A non-nil cursor is an incremental heartbeat: only change-sets, never
-            // the full list — so it can never by itself repair a partial drawer.
-            return SessionListDeltaResult(
-                sessions: [], tombstones: [], cursor: "cur-\(generation)", total: 40)
-        }
-        store.initialFillFetch = { _ in (fullPage, 40) }
-
-        // Cold connect: full seed populates the drawer and sets the cursor.
-        await store.refresh()
-        await store.awaitInitialFillForTesting()
-        XCTAssertGreaterThanOrEqual(store.sessions.count, SessionStore.initialVisibleTarget)
-        XCTAssertEqual(seenCursors, [nil], "the first connect seeds with a nil cursor")
-
-        // A same-generation heartbeat resumes incremental deltas (non-nil cursor).
-        await store.refresh()
-        XCTAssertEqual(seenCursors.last, "cur-1",
-            "a same-generation refresh uses the persisted delta cursor")
-
-        // The drawer regresses to a partial state with the cursor STILL set — the
-        // exact wedge: incremental deltas alone can never refill it.
-        store.sessions = Array(fullPage.prefix(3))
-        store.setPaginationForTesting(loadedCount: 3, loadedOffset: 3, total: 40)
-
-        // Reconnect: the transport generation advances.
-        generation = 2
-        await store.refresh()
-        await store.awaitInitialFillForTesting()
-
-        XCTAssertNil(seenCursors.last!,
-            "the first refresh after a reconnect must FULL-seed with a nil cursor")
-        XCTAssertGreaterThanOrEqual(store.sessions.count, SessionStore.initialVisibleTarget,
-            "after reconnect the drawer is restored to a full list, not left partial")
-
-        // Deltas resume on the new generation's cursor for subsequent refreshes.
-        await store.refresh()
-        XCTAssertEqual(seenCursors.last, "cur-2",
-            "after the reconnect reseed, incremental deltas resume from the new cursor")
-    }
-
-    func testCursorDeltaTombstonesDropOnlyNonWorkingSetRows() async {
-        let store = makeStore()
-        let old = makeSummary(id: "old", lastActive: 10)
-        let active = makeSummary(id: "active", lastActive: 20)
-        let pinned = makeSummary(id: "pinned", lastActive: 30)
-        let live = makeSummary(id: "live", lastActive: 40)
-        store.activeStoredId = "active"
-        store.togglePin(pinned)
-
-        store.sessionListDeltaFetch = { cursor, _ in
-            switch cursor {
-            case nil:
-                return SessionListDeltaResult(
-                    sessions: [live, pinned, active, old],
-                    tombstones: [],
-                    cursor: "seed",
-                    total: 4
-                )
-            case "seed":
-                return SessionListDeltaResult(
-                    sessions: [],
-                    tombstones: [old, active, pinned, live].map {
-                        SessionListTombstone(id: $0.id)
-                    },
-                    cursor: "tombstoned",
-                    total: 0
-                )
-            default:
-                return SessionListDeltaResult(
-                    sessions: [], tombstones: [], cursor: "settled", total: 0
-                )
-            }
-        }
-
-        await store.refresh()
-        store.noteActivity(storedId: "live")
-        await store.refresh()
-
-        var ids = Set(store.sessions.map(\.id))
-        XCTAssertFalse(ids.contains("old"),
-            "a tombstoned non-working-set row must be removed")
-        XCTAssertTrue(ids.contains("active"),
-            "active rows survive tombstones until the active working set changes")
-        XCTAssertTrue(ids.contains("pinned"),
-            "pinned rows survive tombstones")
-        XCTAssertTrue(ids.contains("live"),
-            "recent live rows survive tombstones")
-
-        // The server advances past a tombstone once. Deferred removals must be
-        // re-evaluated after local protection ends rather than persisting forever.
-        store.activeStoredId = nil
-        store.togglePin(pinned)
-        await store.refresh()
-        ids = Set(store.sessions.map(\.id))
-        XCTAssertFalse(ids.contains("active"))
-        XCTAssertFalse(ids.contains("pinned"))
-        XCTAssertTrue(ids.contains("live"),
-            "a still-live row remains protected while deferred tombstones settle")
-    }
-
-    func testCursorDeltaTombstonesRewindGrowLimitCursor() async {
-        let store = makeStore()
-        let allRows = (0..<150).map {
-            makeSummary(id: "row-\($0)", lastActive: Double(150 - $0))
-        }
-        let seedRows = Array(allRows.prefix(100))
-        let removedRows = Array(allRows.prefix(60))
-        let remainingRows = Array(allRows.dropFirst(60))
-
-        store.sessionListDeltaFetch = { cursor, _ in
-            if cursor == nil {
-                return SessionListDeltaResult(
-                    sessions: seedRows, tombstones: [], cursor: "seed", total: 150
-                )
-            }
-            return SessionListDeltaResult(
-                sessions: [],
-                tombstones: removedRows.map { SessionListTombstone(id: $0.id) },
-                cursor: "tombstoned",
-                total: 90
-            )
-        }
-
-        await store.refresh()
-        XCTAssertEqual(store.loadedCount, 100, "setup: the first server window is consumed")
-        await store.refresh()
-
-        XCTAssertEqual(store.sessions.count, 40, "the sixty loaded tombstones leave forty rows")
-        XCTAssertEqual(store.loadedCount, 40,
-            "tombstoned server rows must stop counting as consumed grow-limit rows")
-        XCTAssertEqual(store.loadedOffset, 40,
-            "the load-more at-end guard must use the rewound server cursor")
-
-        await store.refresh()
-        XCTAssertEqual(store.loadedCount, 40,
-            "replayed tombstones must not rewind an already-removed seen id twice")
-        XCTAssertEqual(store.loadedOffset, 40)
-
-        var requestedLimits: [Int] = []
-        store.initialFillFetch = { limit in
-            requestedLimits.append(limit)
-            return (Array(remainingRows.prefix(limit)), remainingRows.count)
-        }
-        await store.loadMore()
-
-        XCTAssertEqual(requestedLimits, [90],
-            "loadMore must request the remaining current universe instead of stopping at a stale offset")
-        XCTAssertEqual(store.sessions.count, 90)
-        XCTAssertEqual(store.loadedCount, 90)
-        XCTAssertEqual(store.loadedOffset, 90)
-    }
-
-    func testCursorDeltaInvalidatesStaleInitialFillPage() async {
-        let store = makeStore()
-        let seedRows = (0..<5).map {
-            makeSummary(id: "seed-\($0)", lastActive: Double(100 - $0))
-        }
-        let futureTombstone = makeSummary(id: "future", lastActive: 90)
-        let currentTail = (5..<35).map {
-            makeSummary(id: "current-\($0)", lastActive: Double(100 - $0))
-        }
-
-        store.sessionListDeltaFetch = { cursor, _ in
-            if cursor == nil {
-                return SessionListDeltaResult(
-                    sessions: seedRows, tombstones: [], cursor: "seed", total: 60
-                )
-            }
-            return SessionListDeltaResult(
-                sessions: [],
-                tombstones: [SessionListTombstone(id: futureTombstone.id)],
-                cursor: "tombstoned",
-                total: 59
-            )
-        }
-
-        let gate = SessionRefreshGate()
-        var fillCalls = 0
-        store.initialFillFetch = { _ in
-            fillCalls += 1
-            if fillCalls == 1 {
-                await gate.wait()
-                // This grow-window response was computed before the delta removed
-                // `future`, so it is stale even though loadedCount did not change.
-                return (seedRows + [futureTombstone] + currentTail, 60)
-            }
-            return (seedRows + currentTail, 59)
-        }
-
-        await store.refresh()
-        await gate.waitUntilEntered()
-        await store.refresh()
-        XCTAssertFalse(store.sessions.contains { $0.id == futureTombstone.id },
-            "the delta removes the unseen row from the list universe")
-
-        await gate.open()
-        await store.awaitInitialFillForTesting()
-
-        XCTAssertGreaterThanOrEqual(fillCalls, 2,
-            "the pre-delta grow-window page must be discarded and fetched again")
-        XCTAssertFalse(store.sessions.contains { $0.id == futureTombstone.id },
-            "a page started before the tombstone must never resurrect that row")
-        XCTAssertGreaterThanOrEqual(store.sessions.count, SessionStore.initialVisibleTarget)
-    }
-
-    func testProfileScopeChangeRequiresCursorlessSeed() async {
-        let store = makeStore()
-        let row = makeSummary(id: "row", lastActive: 1)
-        var seenCursors: [String?] = []
-        store.sessionListDeltaFetch = { cursor, _ in
-            seenCursors.append(cursor)
-            return SessionListDeltaResult(
-                sessions: cursor == nil ? [row] : [],
-                tombstones: [],
-                cursor: cursor == nil ? "seed" : "next",
-                total: 1
-            )
-        }
-
-        await store.refresh()
-        await store.refresh()
-        store.activeProfile = "work"
-        await store.refresh()
-
-        XCTAssertEqual(seenCursors, [nil, "seed", nil],
-            "a cursor from one profile rail must never suppress another rail's seed")
-    }
-
-    func testPluginSessionListDeltaQueryUsesCursorOnlyAfterSeed() async throws {
-        let config = URLSessionConfiguration.ephemeral
-        config.protocolClasses = [SessionListDeltaQueryProtocol.self]
-        let session = URLSession(configuration: config)
-        defer { session.invalidateAndCancel() }
-        let rest = RestClient(
-            baseURL: URL(string: "http://127.0.0.1:9119")!,
-            token: "test-token",
-            session: session,
-            pathStyle: .plugin
-        )
-
-        let seedResult = await rest.sessionListDelta(
-            limit: 125,
-            minMessages: 1,
-            excludeSource: SessionStore.recentsExcludeSources
-        )
-        let seed = try XCTUnwrap(seedResult)
-        XCTAssertEqual(seed.cursor, "seed+cursor")
-
-        let nextResult = await rest.sessionListDelta(
-            limit: 125,
-            minMessages: 1,
-            excludeSource: SessionStore.recentsExcludeSources,
-            updatedSince: seed.cursor
-        )
-        let next = try XCTUnwrap(nextResult)
-        XCTAssertEqual(next.cursor, "next")
-
-        let malformed = await rest.sessionListDelta(
-            limit: 125,
-            minMessages: 1,
-            excludeSource: SessionStore.recentsExcludeSources,
-            updatedSince: "malformed"
-        )
-        XCTAssertNil(malformed,
-            "a malformed delta must return nil so SessionStore uses the full REST list")
-
-        let legacy = RestClient(
-            baseURL: URL(string: "http://127.0.0.1:9119")!,
-            token: "test-token",
-            session: session,
-            pathStyle: .legacy
-        )
-        let legacyResult = await legacy.sessionListDelta(
-            limit: 125,
-            minMessages: 1,
-            excludeSource: SessionStore.recentsExcludeSources,
-            updatedSince: seed.cursor
-        )
-        XCTAssertNil(legacyResult,
-            "legacy pathStyle must not call the plugin session-list endpoint")
-    }
-}
-
-/// Deterministic rendezvous for interleaving a cursor delta with an in-flight
-/// initial-fill request. `waitUntilEntered()` proves the fetch is blocked before
-/// the test advances the cursor, avoiding scheduler-order false greens.
-private actor SessionRefreshGate {
-    private var isOpen = false
-    private var didEnter = false
-    private var blocked: [CheckedContinuation<Void, Never>] = []
-    private var entered: [CheckedContinuation<Void, Never>] = []
-
-    func wait() async {
-        didEnter = true
-        let observers = entered
-        entered.removeAll()
-        for observer in observers { observer.resume() }
-        if isOpen { return }
-        await withCheckedContinuation { blocked.append($0) }
-    }
-
-    func waitUntilEntered() async {
-        if didEnter { return }
-        await withCheckedContinuation { entered.append($0) }
-    }
-
-    func open() {
-        isOpen = true
-        let waiters = blocked
-        blocked.removeAll()
-        for waiter in waiters { waiter.resume() }
-    }
-}
-
-/// Stateless transport proof for the plugin session-list request contract.
-/// Every unexpected request receives a valid-but-distinct delta, so assertions
-/// fail if the client sends the wrong path/filter/cursor or performs legacy I/O.
-private final class SessionListDeltaQueryProtocol: URLProtocol, @unchecked Sendable {
-    override class func canInit(with request: URLRequest) -> Bool { true }
-    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
-
-    override func startLoading() {
-        guard let url = request.url,
-              let components = URLComponents(url: url, resolvingAgainstBaseURL: false) else {
-            client?.urlProtocol(self, didFailWithError: URLError(.badURL))
-            return
-        }
-        let queryItems = Dictionary(uniqueKeysWithValues: components.queryItems?.compactMap { item in
-            item.value.map { (item.name, $0) }
-        } ?? [])
-        let filtersMatch = url.path == "/api/plugins/hermes-mobile/sessions"
-            && queryItems["limit"] == "125"
-            && queryItems["order"] == "recent"
-            && queryItems["archived"] == "exclude"
-            && queryItems["min_messages"] == "1"
-            && queryItems["exclude_sources"] == "cron,subagent"
-            && queryItems["source"] == nil
-
-        let body: String
-        switch queryItems["updated_since"] {
-        case nil where filtersMatch:
-            body = #"{"sessions":[],"tombstones":[],"cursor":"seed+cursor","total":0}"#
-        case "seed+cursor" where filtersMatch
-                && components.percentEncodedQuery?.contains(
-                    "updated_since=seed%2Bcursor"
-                ) == true:
-            body = #"{"sessions":[],"tombstones":[],"cursor":"next","total":0}"#
-        case "malformed" where filtersMatch:
-            body = #"{"sessions":[42],"tombstones":[],"cursor":"bad","total":0}"#
-        default:
-            body = #"{"sessions":[],"tombstones":[],"cursor":"unexpected","total":0}"#
-        }
-
-        let response = HTTPURLResponse(
-            url: url,
-            statusCode: 200,
-            httpVersion: nil,
-            headerFields: ["Content-Type": "application/json"]
-        )!
-        client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
-        client?.urlProtocol(self, didLoad: Data(body.utf8))
-        client?.urlProtocolDidFinishLoading(self)
-    }
-
-    override func stopLoading() {}
 }
 
 // MARK: - ABH-178: explicit turnInProgress carry-forward gate
 
 /// Tests for the explicit `turnsInProgress` flag that replaced the 10s liveWindow
-/// time-proxy as the carry-forward gate in `mergeSessionPage`. All tests are
+/// time-proxy as the carry-forward gate in `mergeSessionSnapshot`. All tests are
 /// deterministic: no real timestamps, no async waits beyond the `await store.refresh()`.
 ///
-/// The invariant under test: `mergeSessionPage` carries a higher local `lastActive`
+/// The invariant under test: `mergeSessionSnapshot` carries a higher local `lastActive`
 /// forward over the incoming server value IFF the session's stored id is in
 /// `turnsInProgress`. The live-dot (`lastActivityAt`/`liveWindow`) is untouched
 /// — only this carry-forward gate changed.
@@ -1110,215 +523,9 @@ final class TurnInProgressCarryForwardTests: XCTestCase {
 
 import Testing
 
-/// ABH-351 — Projects model decoding + store state + session-filter tests.
-///
-/// These tests exercise the three things slice-2 owns:
-/// 1. The `Project` model decodes the slice-1 route's JSON contract
-///    (`{id, label, root, session_count}`) — including the snake_case key.
-/// 2. `ProjectsStore.normalizedPath` matches a session's cwd to a project's
-///    root (case-insensitive, trailing-slash-insensitive).
-/// 3. `ProjectsStore.sessions(for:in:)` correctly filters a session list to
-///    the ones whose cwd resolves to the project root.
-///
-/// Named `ProjectsStoreModelTests` (not `ProjectsStoreTests`) to avoid
-/// colliding with the XCTest-based `ProjectsStoreTests` in
-/// `ProjectsStoreTests.swift`, which covers the PROJECTS-401 fallback/retry
-/// and cache-first behavior via a real `RestClient` — distinct coverage,
-/// same store, different seam (this file uses the older `sessionsFetch`
-/// closure injection).
+/// Session refresh outcome classification.
 @MainActor
 struct ProjectsStoreModelTests {
-
-    // MARK: - Project model decoding
-
-    @Test("Project decodes the full route contract with snake_case session_count")
-    func decode_fullContract() throws {
-        let json = #"""
-        {
-            "id": "/path/to/hermes-mobile",
-            "label": "hermes-mobile",
-            "root": "/path/to/hermes-mobile",
-            "session_count": 5
-        }
-        """# .data(using: .utf8)!
-
-        let project = try JSONDecoder().decode(Project.self, from: json)
-        #expect(project.id == "/path/to/hermes-mobile")
-        #expect(project.label == "hermes-mobile")
-        #expect(project.root == "/path/to/hermes-mobile")
-        #expect(project.sessionCount == 5)
-    }
-
-    @Test("Project decodes a bare JSON array (route response shape)")
-    func decode_array() throws {
-        let json = #"""
-        [
-            {
-                "id": "/repo/a",
-                "label": "a",
-                "root": "/repo/a",
-                "session_count": 3
-            },
-            {
-                "id": "/repo/b",
-                "label": "b",
-                "root": "/repo/b",
-                "session_count": 0
-            }
-        ]
-        """# .data(using: .utf8)!
-
-        let projects = try JSONDecoder().decode([Project].self, from: json)
-        #expect(projects.count == 2)
-        #expect(projects[0].label == "a")
-        #expect(projects[1].sessionCount == 0)
-    }
-
-    // MARK: - normalizedPath
-
-    @Test("normalizedPath is case-insensitive and trailing-slash-insensitive")
-    func normalizedPath_matching() {
-        #expect(ProjectsStore.normalizedPath("/Users/foo/Repo") == "/users/foo/repo")
-        #expect(ProjectsStore.normalizedPath("/Users/foo/Repo/") == "/users/foo/repo")
-        #expect(ProjectsStore.normalizedPath("/Users/foo/Repo//") == "/users/foo/repo")
-        // whitespace trimmed
-        #expect(ProjectsStore.normalizedPath("  /Users/foo/Repo  ") == "/users/foo/repo")
-    }
-
-    @Test("normalizedPath returns empty for whitespace-only input")
-    func normalizedPath_empty() {
-        #expect(ProjectsStore.normalizedPath("") == "")
-        #expect(ProjectsStore.normalizedPath("   ") == "")
-        #expect(ProjectsStore.normalizedPath("\n") == "")
-    }
-
-    // MARK: - sessions(for:in:)
-
-    @Test("sessions(for:in:) filters sessions whose cwd matches project root")
-    func sessionFilter_matches() {
-        let store = ProjectsStore()
-        let project = Project(
-            id: "/repo/a",
-            label: "a",
-            root: "/Repo/A",
-            sessionCount: 2
-        )
-
-        let sessions = SessionStore()
-        sessions.sessions = [
-            SessionSummary.stub(id: "1", cwd: "/repo/a"),
-            SessionSummary.stub(id: "2", cwd: "/repo/a/"),
-            SessionSummary.stub(id: "3", cwd: "/repo/b"),
-            SessionSummary.stub(id: "4", cwd: nil),
-        ]
-
-        let result = store.sessions(for: project, in: sessions)
-        #expect(result.count == 2)
-        #expect(result.contains { $0.id == "1" })
-        #expect(result.contains { $0.id == "2" })
-    }
-
-    @Test("sessions(for:in:) returns empty when no cwds match")
-    func sessionFilter_noMatch() {
-        let store = ProjectsStore()
-        let project = Project(
-            id: "/repo/x",
-            label: "x",
-            root: "/repo/x",
-            sessionCount: 0
-        )
-
-        let sessions = SessionStore()
-        sessions.sessions = [
-            SessionSummary.stub(id: "1", cwd: "/repo/a"),
-            SessionSummary.stub(id: "2", cwd: nil),
-        ]
-
-        let result = store.sessions(for: project, in: sessions)
-        #expect(result.isEmpty)
-    }
-
-    // MARK: - Store initial state
-
-    @Test("ProjectsStore starts with nil projects, not loading, no error")
-    func initialStoreState() {
-        let store = ProjectsStore()
-        #expect(store.projects == nil)
-        #expect(store.isLoading == false)
-        #expect(store.loadError == nil)
-    }
-
-    // MARK: - refreshSessions(for:) / sessions(for:) server-scoped fetch (ABH-407)
-
-    @Test("refreshSessions(for:) fetches scoped to the project's root and sessions(for:) returns exactly the server rows")
-    func refreshSessions_usesProjectRootAndRendersServerRows() async {
-        let store = ProjectsStore()
-        let project = Project(id: "/repo/a", label: "a", root: "/Repo/A", sessionCount: 2)
-        let serverRows = [
-            SessionSummary.stub(id: "server-1", cwd: "/Repo/A"),
-            SessionSummary.stub(id: "server-2", cwd: "/Repo/A/sub"),
-        ]
-        var requestedRoot: String?
-        store.sessionsFetch = { requestedProject in
-            requestedRoot = requestedProject.root
-            return (serverRows, serverRows.count)
-        }
-
-        await store.refreshSessions(for: project)
-
-        #expect(requestedRoot == "/Repo/A",
-            "refreshSessions must fetch scoped to the project's own root (the cwd_prefix value)")
-        #expect(store.sessions(for: project).map(\.id) == ["server-1", "server-2"])
-        #expect(store.isLoadingSessions(for: project) == false)
-        #expect(store.sessionsError(for: project) == nil)
-    }
-
-    @Test("sessions(for:) trusts only the server-scoped response — a matching-cwd row in the global SessionStore must not leak in")
-    func refreshSessions_falseGreenGuard_globalSessionStoreCwdMatchIsIgnored() async {
-        let store = ProjectsStore()
-        let project = Project(id: "/repo/a", label: "a", root: "/Repo/A", sessionCount: 2)
-
-        // The global SessionStore (drawer Recents) happens to hold rows whose cwd
-        // matches the project root. Pre-ABH-407, Project detail derived its list by
-        // scanning exactly this list — a test that only checked "does the detail
-        // list contain the matching rows" would go green even if the server-scoped
-        // fetch were never wired up. Prove the opposite: the server's cwd_prefix
-        // response — here, empty — is authoritative, so these rows must NOT appear.
-        let sessionStore = SessionStore()
-        sessionStore.sessions = [
-            SessionSummary.stub(id: "stale-1", cwd: "/repo/a"),
-            SessionSummary.stub(id: "stale-2", cwd: "/repo/a"),
-        ]
-        store.sessionsFetch = { _ in ([], 0) }
-
-        await store.refreshSessions(for: project)
-
-        #expect(store.sessions(for: project).isEmpty,
-            "Project detail must render the server's cwd_prefix response, not a client-side scan of SessionStore.sessions")
-        // Sanity: the old client-side helper WOULD have matched these rows —
-        // confirming the false-green guard actually exercises a real divergence.
-        #expect(!store.sessions(for: project, in: sessionStore).isEmpty)
-    }
-
-    @Test("refreshSessions(for:) surfaces a fetch failure without corrupting the global SessionStore")
-    func refreshSessions_failurePreservesGlobalSessionStore() async {
-        let store = ProjectsStore()
-        let project = Project(id: "/repo/a", label: "a", root: "/Repo/A", sessionCount: 0)
-        struct StubError: Error, LocalizedError {
-            var errorDescription: String? { "boom" }
-        }
-        store.sessionsFetch = { _ in throw StubError() }
-
-        let sessionStore = SessionStore()
-        sessionStore.sessions = [SessionSummary.stub(id: "untouched", cwd: "/repo/a")]
-
-        await store.refreshSessions(for: project)
-
-        #expect(store.sessions(for: project).isEmpty)
-        #expect(store.sessionsError(for: project) == "boom")
-        #expect(sessionStore.sessions.map(\.id) == ["untouched"],
-            "a failed project-scoped fetch must never mutate the global drawer Recents list")
-    }
 
     // MARK: - ABH-470 background outcome seam
 
@@ -1356,22 +563,6 @@ struct ProjectsStoreModelTests {
         let timedOut = SessionStore()
         timedOut.sessionsFetch = { throw URLError(.timedOut) }
         #expect(await timedOut.refreshOutcome() == .timeout)
-    }
-}
-
-/// Minimal stub for ProjectsStoreModelTests: id + optional cwd, everything else nil.
-extension SessionSummary {
-    static func stub(id: String, cwd: String?) -> SessionSummary {
-        SessionSummary(
-            id: id,
-            title: nil,
-            preview: nil,
-            startedAt: nil,
-            messageCount: nil,
-            source: nil,
-            lastActive: nil,
-            cwd: cwd
-        )
     }
 }
 

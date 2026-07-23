@@ -26,8 +26,5 @@ extension SyncMetaRecord {
         static let sessionListLastFullFetchAt = "sessionList.lastFullFetchAt"
         static let evictionLastRunAt = "eviction.lastRunAt"
         static let schemaVersion = "schemaVersion"
-        static func manifest(_ scope: CacheScope) -> String {
-            "manifest.\(scope.serverId).\(scope.profileId)"
-        }
     }
 }

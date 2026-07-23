@@ -489,9 +489,25 @@ final class ChatFlowUITests: XCTestCase {
         let emptyState = app.staticTexts["No projects found"]
         XCTAssertTrue(
             projectRow.waitForExistence(timeout: 15) || emptyState.waitForExistence(timeout: 5),
-            "Projects route produced neither content nor its honest empty state"
+            "Projects RPC produced neither content nor its honest empty state"
         )
         XCTAssertFalse(app.staticTexts["Couldn't load projects"].exists)
+
+        if projectRow.exists {
+            let advertisedCount = Int(
+                (projectRow.value as? String ?? "").split(separator: " ").first ?? "0"
+            ) ?? 0
+            projectRow.tap()
+            XCTAssertTrue(app.buttons["projectDetailNewSession"].waitForExistence(timeout: 10))
+            XCTAssertFalse(app.otherElements["projectSessionsErrorRow"].exists)
+            if advertisedCount > 0 {
+                XCTAssertTrue(
+                    app.buttons["projectSessionRow"].firstMatch.waitForExistence(timeout: 20),
+                    "A project advertising sessions must hydrate at least one session row"
+                )
+            }
+            app.navigationBars.buttons.firstMatch.tap()
+        }
 
         let newProject = app.buttons["drawerNewProject"]
         XCTAssertTrue(newProject.waitForExistence(timeout: 10))

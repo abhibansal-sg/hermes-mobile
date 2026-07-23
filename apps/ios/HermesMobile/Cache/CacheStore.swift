@@ -36,17 +36,6 @@ actor CacheStore {
         let sessionId: String
     }
 
-    struct ManifestCommitPayload: Codable {
-        let revision: Int64
-        let cursor: String
-        let sessions: [SessionSummary]
-        let attention: [ManifestAttentionItem]
-        let activeTurns: [ManifestActiveTurn]
-        let transcriptHeads: [String: Int]
-        let capabilities: Set<String>
-        let serverTime: Double?
-    }
-
     // MARK: - Internal state (actor-isolated)
 
     private let db: DatabaseQueue
@@ -123,26 +112,6 @@ actor CacheStore {
             }
             let records = try request.order(Column("lastActive").desc).fetchAll(db)
             return try records.map { try $0.decodeSummary() }
-        }
-    }
-
-    /// Reads the last indivisible manifest snapshot. Session rows and metadata
-    /// are read in the same SQLite snapshot, so no consumer can observe mixed
-    /// revisions after relaunch.
-    func loadManifestProjection(scope: CacheScope) throws -> ManifestProjection {
-        try db.read { db in
-            let rows = try SessionCacheRecord
-                .filter(Column("serverId") == scope.serverId)
-                .filter(Column("profileId") == scope.profileId)
-                .order(Column("lastActive").desc)
-                .fetchAll(db)
-            let legacySessions = try rows.map { try $0.decodeSummary() }
-            guard let raw = try SyncMetaRecord.fetchOne(db, key: SyncMetaRecord.Key.manifest(scope))?.value,
-                  let data = raw.data(using: .utf8),
-                  let payload = try? JSONDecoder().decode(ManifestCommitPayload.self, from: data) else {
-                return ManifestProjection(revision: 0, cursor: nil, sessions: legacySessions, attention: [], activeTurns: [], transcriptHeads: [:], capabilities: [], freshness: .cached)
-            }
-            return ManifestProjection(revision: payload.revision, cursor: payload.cursor, sessions: payload.sessions, attention: payload.attention, activeTurns: payload.activeTurns, transcriptHeads: payload.transcriptHeads, capabilities: payload.capabilities, freshness: .cached, lastSyncedAt: payload.serverTime.map(Date.init(timeIntervalSince1970:)))
         }
     }
 
@@ -376,59 +345,6 @@ actor CacheStore {
                 arguments: [scope.serverId, scope.profileId]
             ) else { return nil }
             return LastOpenedSession(profileId: row["profileId"], sessionId: row["sessionId"])
-        }
-    }
-
-    /// Applies the fully validated chain in one GRDB transaction. Tombstones
-    /// are unconditional on disk; survivor policy belongs to the in-memory
-    /// working-set overlay and can never repersist a removed row.
-    func applyManifest(_ chain: ManifestChain, scope: CacheScope) throws -> ManifestProjection {
-        try db.write { db in
-            if let oldRaw = try SyncMetaRecord.fetchOne(db, key: SyncMetaRecord.Key.manifest(scope))?.value,
-               let data = oldRaw.data(using: .utf8),
-               let old = try? JSONDecoder().decode(ManifestCommitPayload.self, from: data),
-               chain.revision <= old.revision {
-                let rows = try SessionCacheRecord.filter(Column("serverId") == scope.serverId).filter(Column("profileId") == scope.profileId).order(Column("lastActive").desc).fetchAll(db)
-                return ManifestProjection(revision: old.revision, cursor: old.cursor, sessions: old.sessions, attention: old.attention, activeTurns: old.activeTurns, transcriptHeads: old.transcriptHeads, capabilities: old.capabilities, freshness: .fresh)
-            }
-
-            for id in chain.tombstones {
-                try SessionCacheRecord
-                    .filter(Column("id") == id)
-                    .filter(Column("serverId") == scope.serverId)
-                    .filter(Column("profileId") == scope.profileId)
-                    .deleteAll(db)
-            }
-            for summary in chain.sessions where !chain.tombstones.contains(summary.id) {
-                // A1(ii): stamp the row's stored profileId with the SAME
-                // normalization `saveSessionList` uses. Previously this passed the
-                // raw `scope` straight through, so an aggregate ("all") manifest
-                // apply persisted the literal "all" onto rows — violating the
-                // identity invariant that "all" is a query selector, never a stored
-                // value, and stranding those rows out of every concrete-profile read.
-                let rowProfile = Self.storedProfileId(for: summary, scope: scope)
-                let existing = try SessionCacheRecord
-                    .filter(Column("serverId") == scope.serverId)
-                    .filter(Column("profileId") == rowProfile)
-                    .filter(Column("id") == summary.id)
-                    .fetchOne(db)
-                let record = try SessionCacheRecord.make(from: summary, scope: CacheScope(serverId: scope.serverId, profileId: rowProfile), isPinned: existing?.isPinned ?? false, lastAccessedAt: existing?.lastAccessedAt ?? 0, transcriptCachedAt: existing?.transcriptCachedAt, maxMessageId: existing?.maxMessageId)
-                try record.save(db)
-            }
-            let previous: [SessionSummary]
-            if chain.reset { previous = [] }
-            else if let raw = try SyncMetaRecord.fetchOne(db, key: SyncMetaRecord.Key.manifest(scope))?.value,
-                    let data = raw.data(using: .utf8), let old = try? JSONDecoder().decode(ManifestCommitPayload.self, from: data) { previous = old.sessions }
-            else { previous = (try? SessionCacheRecord.filter(Column("serverId") == scope.serverId).filter(Column("profileId") == scope.profileId).fetchAll(db).map { try $0.decodeSummary() }) ?? [] }
-            var byID = Dictionary(uniqueKeysWithValues: previous.map { ($0.id, $0) })
-            for id in chain.tombstones { byID.removeValue(forKey: id) }
-            for session in chain.sessions where !chain.tombstones.contains(session.id) { byID[session.id] = session }
-            let projectedSessions = byID.values.sorted { ($0.lastActive ?? 0) > ($1.lastActive ?? 0) }
-            let payload = ManifestCommitPayload(revision: chain.revision, cursor: chain.cursor, sessions: projectedSessions, attention: chain.attention, activeTurns: chain.activeTurns, transcriptHeads: chain.transcriptHeads, capabilities: chain.capabilities, serverTime: chain.serverTime)
-            let encoded = try JSONEncoder().encode(payload)
-            try SyncMetaRecord(key: SyncMetaRecord.Key.manifest(scope), value: String(decoding: encoded, as: UTF8.self)).save(db)
-            let rows = try SessionCacheRecord.filter(Column("serverId") == scope.serverId).filter(Column("profileId") == scope.profileId).order(Column("lastActive").desc).fetchAll(db)
-            return ManifestProjection(revision: chain.revision, cursor: chain.cursor, sessions: projectedSessions, attention: chain.attention, activeTurns: chain.activeTurns, transcriptHeads: chain.transcriptHeads, capabilities: chain.capabilities, freshness: .fresh, lastSyncedAt: chain.serverTime.map(Date.init(timeIntervalSince1970:)))
         }
     }
 
@@ -1018,10 +934,8 @@ actor CacheStore {
     /// active write scope. `all` is only ever a query selector, never a stored
     /// value (CONTRACT-OFFLINE-CACHE identity invariant): a blank/absent summary
     /// profile collapses to the scope's own profile, or `default` when the scope
-    /// itself is the aggregate key. Shared by EVERY write path (`saveSessionList`,
-    /// `upsertSession`, `applyManifest`) so the stored profileId can never drift
-    /// between them — the divergence that previously let a literal `all` reach a
-    /// row via the un-normalized manifest apply.
+    /// itself is the aggregate key. Shared by every session-list write path so
+    /// the stored profileId can never drift between them.
     static func storedProfileId(for summary: SessionSummary, scope: CacheScope) -> String {
         let profile = summary.profile?.trimmingCharacters(in: .whitespacesAndNewlines)
         // A real session profile is never the aggregate sentinel — reject a

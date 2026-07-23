@@ -120,7 +120,7 @@ async def test_stock_proxy_rejects_bad_phone_credentials(transparent_pair):
     assert exc.value.response.status_code == 401
 
 
-async def test_stock_proxy_preserves_validated_device_identity(
+async def test_stock_proxy_exchanges_validated_device_credential(
     transparent_pair, monkeypatch
 ):
     port, observed, event_wire = transparent_pair
@@ -144,5 +144,5 @@ async def test_stock_proxy_preserves_validated_device_identity(
         )
 
     assert response.status_code == 207
-    assert observed["ws_token"] == "device-secret"
-    assert observed["http_token"] == "device-secret"
+    assert observed["ws_token"] == "gateway-secret"
+    assert observed["http_token"] == "gateway-secret"

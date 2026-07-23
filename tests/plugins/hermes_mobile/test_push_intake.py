@@ -61,19 +61,11 @@ class _FakeRelayClient:
         *,
         configured: bool,
         register_exc: Exception | None = None,
-        register_background_exc: Exception | None = None,
-        unregister_background_exc: Exception | None = None,
     ) -> None:
         self.configured = configured
-        self.events = []
         self.device_registrations = []
         self.device_unregistrations = []
-        self.background_device_registrations = []
-        self.background_device_unregistrations = []
         self.register_exc = register_exc
-        self.register_background_exc = register_background_exc
-        self.unregister_background_exc = unregister_background_exc
-        self.delivery_failures = 0
 
     def relay_url_configured(self) -> bool:
         return self.configured
@@ -84,73 +76,16 @@ class _FakeRelayClient:
     def map_push_kind(self, kind: str) -> str:
         return self._KIND_MAP.get(kind, "proactive")
 
-    async def send_event(self, **kwargs):
-        self.events.append(kwargs)
-
     async def register_device(self, **kwargs):
-        time.sleep(0.2)
         if self.register_exc is not None:
             raise self.register_exc
         self.device_registrations.append(kwargs)
 
     async def unregister_device(self, **kwargs):
-        time.sleep(0.2)
         self.device_unregistrations.append(kwargs)
 
-    def register_device_background(self, **kwargs):
-        if self.register_background_exc is not None:
-            raise self.register_background_exc
-        self.background_device_registrations.append(kwargs)
 
-    def unregister_device_background(self, **kwargs):
-        if self.unregister_background_exc is not None:
-            raise self.unregister_background_exc
-        self.background_device_unregistrations.append(kwargs)
-
-    def _record_delivery_failure(self):
-        self.delivery_failures += 1
-
-
-class _FakePushEngine:
-    def __init__(self, *, direct_available: bool, accepted: int = 1) -> None:
-        self.direct_available = direct_available
-        self.accepted = accepted
-        self.direct_calls = 0
-
-        self.registered = []
-        self.unregistered = []
-
-    class APNsConfig:
-        def __init__(self) -> None:
-            self.topic = "ai.hermes.test"
-            self.use_sandbox = False
-
-        @classmethod
-        def from_env(cls):
-            return cls()
-
-    def direct_apns_test_push_available(self) -> bool:
-        return self.direct_available
-
-    def send_direct_apns_test_push(self) -> int:
-        self.direct_calls += 1
-        return self.accepted
-
-    def register_token(
-        self, token, *, platform="ios", env="", events=None, device_id=None
-    ) -> bool:
-        item = {"token": token, "platform": platform, "env": env, "events": events}
-        if device_id is not None:
-            item["device_id"] = device_id
-        self.registered.append(item)
-        return True
-
-    def unregister_token(self, token) -> bool:
-        self.unregistered.append(token)
-        return True
-
-
-def _push_test_client(monkeypatch, push_engine, relay_client):
+def _push_test_client(monkeypatch, relay_client):
     fastapi = pytest.importorskip("fastapi")
     testclient = pytest.importorskip("fastapi.testclient")
 
@@ -159,8 +94,6 @@ def _push_test_client(monkeypatch, push_engine, relay_client):
     monkeypatch.setattr(api, "_device_has_scope", lambda request, scope: True)
 
     def _fake_plugin_module(name: str):
-        if name == "push_engine":
-            return push_engine
         if name == "relay_client":
             return relay_client
         raise AssertionError(f"unexpected plugin module: {name}")
@@ -171,67 +104,11 @@ def _push_test_client(monkeypatch, push_engine, relay_client):
     return testclient.TestClient(app)
 
 
-def test_relay_test_push_uses_direct_apns_when_configured(monkeypatch):
-    push = _FakePushEngine(direct_available=True, accepted=1)
-    relay = _FakeRelayClient(configured=False)
-    client = _push_test_client(monkeypatch, push, relay)
-
-    resp = client.post("/relay/test-push")
-
-    assert resp.status_code == 200
-    assert resp.json() == {
-        "ok": True,
-        "transport": "direct_apns",
-        "detail": "sent via direct APNs",
-    }
-    assert push.direct_calls == 1
-    assert relay.events == []
-
-
-def test_relay_test_push_reports_no_push_configured_without_transport(monkeypatch):
-    push = _FakePushEngine(direct_available=False)
-    relay = _FakeRelayClient(configured=False)
-    client = _push_test_client(monkeypatch, push, relay)
-
-    resp = client.post("/relay/test-push")
-
-    assert resp.status_code == 200
-    body = resp.json()
-    assert body == {
-        "ok": False,
-        "transport": "none",
-        "detail": "no push configured",
-    }
-    assert "relay URL is not configured" not in body["detail"]
-    assert push.direct_calls == 0
-    assert relay.events == []
-
-
-def test_relay_test_push_keeps_relay_path_when_relay_configured(monkeypatch):
-    push = _FakePushEngine(direct_available=False)
-    relay = _FakeRelayClient(configured=True)
-    client = _push_test_client(monkeypatch, push, relay)
-
-    resp = client.post("/relay/test-push")
-
-    assert resp.status_code == 200
-    assert resp.json() == {
-        "ok": True,
-        "transport": "relay",
-        "detail": "sent via relay",
-    }
-    assert push.direct_calls == 0
-    assert len(relay.events) == 1
-    assert relay.events[0]["source"] == "relay_test_push"
-
-
 def test_push_register_forwards_device_token_to_configured_relay(monkeypatch):
-    push = _FakePushEngine(direct_available=False)
     relay = _FakeRelayClient(configured=True)
-    client = _push_test_client(monkeypatch, push, relay)
+    client = _push_test_client(monkeypatch, relay)
     token = "ab" * 32
 
-    started = time.monotonic()
     resp = client.post(
         "/push/register",
         json={
@@ -241,26 +118,14 @@ def test_push_register_forwards_device_token_to_configured_relay(monkeypatch):
             "events": ["approval", "turn_complete"],
         },
     )
-    elapsed = time.monotonic() - started
-
     assert resp.status_code == 200
     assert resp.json() == {"ok": True}
-    assert elapsed < 0.15
-    assert push.registered == [
-        {
-            "token": token,
-            "platform": "ios",
-            "env": "sandbox",
-            "events": ["approval", "turn_complete"],
-        }
-    ]
-    assert relay.device_registrations == []
-    assert relay.background_device_registrations == [
+    assert relay.device_registrations == [
         {
             "token": token,
             "platform": "ios",
             "environment": "sandbox",
-            "bundle_id": "ai.hermes.test",
+            "bundle_id": "ai.hermes.app",
             "preferences": {
                 "replies": True,
                 "attention": True,
@@ -271,52 +136,40 @@ def test_push_register_forwards_device_token_to_configured_relay(monkeypatch):
 
 
 def test_push_register_skips_relay_when_relay_not_configured(monkeypatch):
-    push = _FakePushEngine(direct_available=False)
     relay = _FakeRelayClient(configured=False)
-    client = _push_test_client(monkeypatch, push, relay)
+    client = _push_test_client(monkeypatch, relay)
 
     resp = client.post("/push/register", json={"token": "ab" * 32})
 
-    assert resp.status_code == 200
-    assert resp.json() == {"ok": True}
-    assert len(push.registered) == 1
+    assert resp.status_code == 503
+    assert resp.json() == {"detail": "Push relay is not configured"}
     assert relay.device_registrations == []
-    assert relay.background_device_registrations == []
 
 
 def test_push_unregister_forwards_device_token_to_configured_relay(monkeypatch):
-    push = _FakePushEngine(direct_available=False)
     relay = _FakeRelayClient(configured=True)
-    client = _push_test_client(monkeypatch, push, relay)
+    client = _push_test_client(monkeypatch, relay)
     token = "ab" * 32
 
     resp = client.request("DELETE", "/push/register", json={"token": token})
 
     assert resp.status_code == 200
     assert resp.json() == {"ok": True, "removed": True}
-    assert push.unregistered == [token]
-    assert relay.device_unregistrations == []
-    assert relay.background_device_unregistrations == [{"token": token}]
+    assert relay.device_unregistrations == [{"token": token}]
 
 
-def test_push_register_returns_ok_when_relay_enrollment_fails(monkeypatch):
-    push = _FakePushEngine(direct_available=False)
+def test_push_register_surfaces_relay_enrollment_failure(monkeypatch):
     relay = _FakeRelayClient(
-        configured=True, register_background_exc=RuntimeError("relay down")
+        configured=True, register_exc=RuntimeError("relay down")
     )
-    client = _push_test_client(monkeypatch, push, relay)
+    client = _push_test_client(monkeypatch, relay)
     token = "ab" * 32
 
     resp = client.post("/push/register", json={"token": token})
 
-    assert resp.status_code == 200
-    assert resp.json() == {"ok": True}
-    assert push.registered == [
-        {"token": token, "platform": "ios", "env": "", "events": None}
-    ]
+    assert resp.status_code == 503
+    assert resp.json() == {"detail": "Push relay enrollment failed"}
     assert relay.device_registrations == []
-    assert relay.background_device_registrations == []
-    assert relay.delivery_failures == 1
 
 
 # ===========================================================================
@@ -523,7 +376,9 @@ def test_push_hook_approval_enriched_and_categorized(monkeypatch, push_engine):
 
 def test_live_event_and_approval_apns_share_stable_identity(monkeypatch, push_engine, tmp_path):
     monkeypatch.setattr(
-        push_engine, "_registry_path", lambda: tmp_path / "push_tokens.json"
+        push_engine,
+        "_la_registry_path",
+        lambda: tmp_path / "live_activity_tokens.json",
     )
     monkeypatch.setattr(
         push_engine,

@@ -1,9 +1,7 @@
-"""ABH-283 — relay pairing endpoint.
+"""Relay pairing-link endpoint.
 
-Tests the additive ``POST /relay/pair`` plugin route used by the iOS Relay
-settings panel. The route mints a relay pairing tuple through relay_client,
-requires dashboard auth + approve scope, refuses to run before a relay URL is
-configured, and never exposes the raw agent secret.
+The route mints the one link a user can tap, requires dashboard auth + approve
+scope, refuses to run before configuration, and never exposes the agent secret.
 """
 
 from __future__ import annotations
@@ -62,7 +60,7 @@ def _api():
     return sys.modules[_API_MODULE_NAME]
 
 
-def test_post_relay_pair_returns_pairing_tuple_without_agent_secret(
+def test_post_relay_pair_returns_mobile_link_without_agent_secret(
     client, relay_env, monkeypatch
 ):
     relay.set_relay_config(
@@ -76,10 +74,11 @@ def test_post_relay_pair_returns_pairing_tuple_without_agent_secret(
 
     assert response.status_code == 200, response.text
     assert response.json() == {
-        "kind": "relay",
-        "relay": "https://relay.example.test/root",
-        "agent": "agent_123",
-        "pairing": "pair_secret_456",
+        "url": (
+            "hermesapp://pair?"
+            "relay=https%3A%2F%2Frelay.example.test%2Froot"
+            "&agent=agent_123&pairing=pair_secret_456&kind=relay"
+        )
     }
     assert "agent_secret" not in response.text
     assert "registration-token-secret" not in response.text

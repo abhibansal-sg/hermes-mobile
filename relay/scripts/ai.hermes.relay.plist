@@ -46,6 +46,10 @@
 		<string>__REPO_ROOT__</string>
 		<key>HERMES_HOME</key>
 		<string>__HERMES_HOME__</string>
+		<key>HERMES_RELAY_PLUGIN_DIR</key>
+		<string>__HERMES_HOME__/plugins/hermes-mobile</string>
+		<key>PYTHONPATH</key>
+		<string>__HERMES_HOME__/hermes-agent</string>
 		<key>PATH</key>
 		<string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
 	</dict>

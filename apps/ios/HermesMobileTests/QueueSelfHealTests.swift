@@ -183,11 +183,6 @@ final class QueueSelfHealTests: XCTestCase {
         XCTAssertFalse(accepted)
         XCTAssertEqual(chat.lastError, "No active session",
                        "a self-heal that can't bind still fails gracefully")
-        // STR-815: `prompt.submit` was never dispatched here — this is exactly
-        // the signal `PendingIntentRouter.deliverAskPrompt` uses to decide a
-        // refused `.ask` send is safe to also clean up the session it created.
-        XCTAssertFalse(chat.lastSendReachedServer,
-                       "a pre-submit refusal must not look like an attempted submit")
     }
 
     // MARK: - Supersession: a stale on-demand resume must not clobber a switch

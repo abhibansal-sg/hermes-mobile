@@ -184,7 +184,7 @@ final class ConnectionStore {
     // gateway's `session.info` events (emitted after a `config.set` hot-swap).
     // They are nil when no session is active or no info has arrived yet.
     // The session popup reads these to show current state; the global defaults
-    // are separate (Settings → ModelPickerView → POST /api/model/set).
+    // are separate (Settings → ModelPickerView → global `config.set`).
 
     /// The live session's model id as reported by the last `session.info`.
     /// Distinct from `activeModelName`: this is the per-session override after a
@@ -331,6 +331,15 @@ final class ConnectionStore {
         return ModelOptions(json: result)
     }
 
+    /// Stock global model inventory/defaults for Settings and draft chats.
+    func globalModelOptions() async throws -> ModelOptions {
+        let result = try await client.requestRaw(
+            "model.options",
+            timeout: .seconds(30)
+        )
+        return ModelOptions(json: result)
+    }
+
     /// Send `config.set` with `key="model"` and the active `session_id` so the
     /// model switch is scoped to the live session only (not global).
     func sessionSetModel(_ model: String, sessionId: String) async throws {
@@ -340,6 +349,18 @@ final class ConnectionStore {
                 "key": .string("model"),
                 "value": .string(model),
                 "session_id": .string(sessionId),
+            ]),
+            timeout: .seconds(30)
+        )
+    }
+
+    /// Set the model used by new sessions through the stock global config RPC.
+    func globalSetModel(_ model: String) async throws {
+        _ = try await client.requestRaw(
+            "config.set",
+            params: .object([
+                "key": .string("model"),
+                "value": .string(model),
             ]),
             timeout: .seconds(30)
         )
@@ -485,22 +506,40 @@ final class ConnectionStore {
     /// Base address for the transparent stock-protocol lane. The existing relay
     /// override selects the proxy host; without one, direct gateway behavior is
     /// preserved during the Phase 2 rollout.
-    func stockProxyURL(forGateway gatewayURL: URL) -> URL {
+    private func stockProxyOverrideURL() -> URL? {
         let rawOverride: String?
         #if DEBUG
-        rawOverride = ProcessInfo.processInfo.environment["HERMES_RELAY_URL"]
-            ?? DefaultsKeys.relayURLOverrideValue()
+        let environmentOverride = ProcessInfo.processInfo.environment["HERMES_RELAY_URL"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        rawOverride = environmentOverride?.isEmpty == false
+            ? environmentOverride
+            : DefaultsKeys.relayURLOverrideValue()
         #else
         rawOverride = DefaultsKeys.relayURLOverrideValue()
         #endif
         guard let rawOverride,
               let override = URL(string: rawOverride),
               var components = URLComponents(url: override, resolvingAgainstBaseURL: false)
-        else { return gatewayURL }
-        components.scheme = override.scheme == "wss" ? "https" : "http"
+        else { return nil }
+        switch override.scheme?.lowercased() {
+        case "https", "wss": components.scheme = "https"
+        case "http", "ws": components.scheme = "http"
+        default: return nil
+        }
         components.path = ""
         components.queryItems = nil
-        return components.url ?? gatewayURL
+        return components.url
+    }
+
+    func stockProxyURL(forGateway gatewayURL: URL) -> URL {
+        stockProxyOverrideURL() ?? gatewayURL
+    }
+
+    /// A relay URL is the public WebSocket endpoint, so its real Host header
+    /// must survive the upgrade. Direct gateway connections keep their configured
+    /// mode (including the shared-dashboard loopback override).
+    func stockProxyWebSocketMode(forGateway gatewayURL: URL) -> ConnectionMode {
+        stockProxyOverrideURL() == nil ? connectionMode : .remoteURL
     }
 
     /// The accepted transport generation. Runtime bindings use this value to
@@ -863,12 +902,9 @@ final class ConnectionStore {
     private static let backgroundCapabilityBurstStagger: Duration = .milliseconds(300)
 
     /// WS-RECONNECT-SOFTEN (a) — minimum spacing between FORCED capability
-    /// re-probes across reconnects. A forced re-probe fires 5 concurrent REST
-    /// calls (`pluginMount`, then `upload`/`fs`/`profiles`/`devices`) — needed
-    /// once per genuine drop (the gateway may have restarted on a different
-    /// build), but firing it on EVERY attempt of a rapid reconnect crash-loop
-    /// piles five requests onto a server that is already struggling to come
-    /// up. See the throttle at the `recoverActiveSession` call site.
+    /// re-probes across reconnects. A forced re-probe checks the plugin bundle
+    /// and stock profile route once per genuine drop, but not on every attempt
+    /// of a rapid reconnect loop.
     private static let capabilitiesReprobeMinInterval: Duration = .seconds(20)
 
     /// The `ContinuousClock` instant of the last FORCED capabilities re-probe
@@ -1347,6 +1383,7 @@ final class ConnectionStore {
             return "A session token is required."
         }
         let stockTransportURL = stockProxyURL(forGateway: url)
+        let stockTransportMode = stockProxyWebSocketMode(forGateway: url)
 
         // Cancel any reconnect loop tied to a previous configuration.
         reconnectTask?.cancel()
@@ -1363,10 +1400,6 @@ final class ConnectionStore {
         hasConnected = false
         deviceIssueLimitReachedServers.remove(trimmedURL)
         deviceLimitAdvisory = nil
-
-        // Reset the initial-fill guard so the next refresh() after this
-        // configure re-runs the fill-to-30 loop for the new server.
-        sessionStore.resetInitialFill()
 
         phase = .connecting
 
@@ -1411,12 +1444,12 @@ final class ConnectionStore {
         do {
             beginTransportAttempt()
             if let connectRPC {
-                try await connectRPC(stockTransportURL, trimmedToken, connectionMode)
+                try await connectRPC(stockTransportURL, trimmedToken, stockTransportMode)
             } else {
                 try await client.connect(
                     baseURL: stockTransportURL,
                     token: trimmedToken,
-                    mode: connectionMode
+                    mode: stockTransportMode
                 )
             }
         } catch {
@@ -1930,8 +1963,6 @@ final class ConnectionStore {
         guard isCurrentGeneration(generation) else { return }
         await queueStore?.removeAll()
         inboxStore?.removeAll()
-        PendingIntent.clearPending()
-        SharedStore.clearInbox()
         SharedStore.clearSnapshot()
         await AttachmentBlobCache.shared.clearAll()
         LiveActivityManager.shared.end()
@@ -2457,16 +2488,17 @@ final class ConnectionStore {
                     return
                 }
                 let stockTransportURL = self.stockProxyURL(forGateway: url)
+                let stockTransportMode = self.stockProxyWebSocketMode(forGateway: url)
 
                 do {
                     self.beginTransportAttempt()
                     if let hook = self.connectRPC {
-                        try await hook(stockTransportURL, token, self.connectionMode)
+                        try await hook(stockTransportURL, token, stockTransportMode)
                     } else {
                         try await self.client.connect(
                             baseURL: stockTransportURL,
                             token: token,
-                            mode: self.connectionMode
+                            mode: stockTransportMode
                         )
                     }
                     guard !Task.isCancelled,
@@ -2897,7 +2929,7 @@ final class ConnectionStore {
                 guard self.isActiveGeneration(generation) else { return }
                 // Throttle repeated FORCED re-probes: a reconnect crash-loop
                 // (the gateway flapping every few seconds) would otherwise pile
-                // 5 concurrent REST calls onto the server on EVERY attempt.
+                // capability checks onto the server on every attempt.
                 // `force: false` still probes once per genuinely new server URL
                 // (the in-memory/disk cache short-circuit only applies to a
                 // server already probed this app version) — the throttle only

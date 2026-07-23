@@ -89,77 +89,10 @@ final class SessionStore {
     /// Sessions as returned by `session.list`, newest-first as the server orders them.
     var sessions: [SessionSummary] = []
 
-    /// Total session count as reported by the most recent `GET /api/sessions` response.
-    /// `nil` until at least one REST fetch returns the wrapper's `total` field. Used by
-    /// the drawer's "N of TOTAL" count affordance (ABH-86 item 6).
-    private(set) var totalSessions: Int? = nil
-
-    // MARK: - Pagination (UX1)
-
-    /// The offset of the next page to fetch, i.e. the number of rows already loaded
-    /// from the server. Reset to 0 on every first-page refresh; advanced by each
-    /// successful `loadMore()` call. Thread-safe: always mutated on `@MainActor`.
-    private(set) var loadedOffset: Int = 0
-
-    /// Number of rows loaded from the server (first-page + any appended pages).
-    /// Equivalent to `sessions.count` *before* working-set survivors are prepended —
-    /// but we track it separately so `filteredCount`/`loadedCount` are honest even
-    /// when working-set survivors inflate the array. Resets on every first-page fetch.
-    private(set) var loadedCount: Int = 0
-
-    /// ABH-373: Every server row id consumed across all pages — INCLUDING machinery
-    /// that was filtered out at ingress and never entered `sessions`. Grow-limit
-    /// pagination re-fetches the full expanded window each iteration (limit grows by
-    /// `pageSize`), so deduping the `loadedCount` cursor advance against `sessions`
-    /// (which excludes filtered machinery) would re-count those rows every iteration
-    /// and inflate the cursor past `totalSessions` — halting `loadMore` before later
-    /// human sessions. Tracking all-seen ids makes the ingress filter cursor-neutral:
-    /// a row consumed from the server is counted exactly once regardless of whether it
-    /// passes the machinery predicate. Reset alongside `sessions`/`loadedCount` on
-    /// every list clear and rebuilt from the raw page on every first-page replace.
-    private var seenServerSessionIds: Set<String> = []
-
-    /// True while a `loadMore()` page fetch is in flight (distinct from `isLoading`
-    /// which gates the first-page spinner). Drives the sentinel loading row.
-    private(set) var isLoadingMore: Bool = false
-
-    /// Number of sessions currently visible after all client-side filters
-    /// (human-recents source/count gate, profile scope). The drawer uses this together with
-    /// `loadedCount` / `totalSessions` to produce the filter-honest header copy.
-    var filteredCount: Int { visibleSessions.count }
-
-    // MARK: - Heartbeat timer (UX1)
-
-    /// The foreground heartbeat task that refreshes the first page every 30 s while
-    /// `scenePhase == .active`. Cancelled when the scene goes to background or the
-    /// store is torn down. Storm-proof: each tick calls `refresh()` which already
-    /// bumps `refreshToken`, so a slow prior response is discarded by the stale-token
-    /// guard before it can overwrite a newer list.
-    private var heartbeatTask: Task<Void, Never>?
-
-    /// Interval between foreground heartbeat ticks (30 s, matching the user spec).
-    static let heartbeatInterval: TimeInterval = 30
-
-    /// iOS page size for grow-limit pagination (mirrors desktop's
-    /// `SIDEBAR_SESSIONS_PAGE_SIZE = 50` from `store/layout.ts:20`).
-    private static let pageSize: Int = 50
-
-    /// Minimum number of human-facing, non-empty sessions to show after a cold
-    /// launch. After the first-page merge, `refresh()` keeps fetching with
-    /// growing limits (reusing `loadMore()`-exact semantics) until either this
-    /// many visible sessions are present OR the server is exhausted. The loop
-    /// respects Recents/profile filters because `visibleSessions` already
-    /// applies them, so the target is always "30 the user can actually see".
-    static let initialVisibleTarget: Int = 30
-
-    /// Minimum number of NEWLY-VISIBLE sessions a single `loadMore()` should add
-    /// before it stops paging. User spec: infinite scroll must auto-load "at least
-    /// thirty" sessions as the user nears the bottom — not the one-visible-row
-    /// minimum the old loop stopped at. Under a dense cron-heavy server window +
-    /// `hideCron`, breaking at the first new visible row surfaced as little as +1
-    /// per page and felt like "it only loads a few". The loop now keeps growing the
-    /// limit until it has added this many visible rows OR the server is exhausted.
-    static let loadMorePageVisibleTarget: Int = 30
+    /// One recent authoritative window. Older sessions remain available through
+    /// the existing server-backed search instead of a second pagination state
+    /// machine in the drawer.
+    static let snapshotLimit = 200
 
     /// Sources excluded server-side from the human-chat Recents list (drawer
     /// bifurcation). Automation RUNS (`source == "cron"`) and agent-internal
@@ -188,42 +121,6 @@ final class SessionStore {
         "review:",
     ]
 
-    /// Latches `true` ONLY when the initial fill has *successfully completed* —
-    /// the target was met OR the server was proven exhausted. An aborted /
-    /// cancelled / errored attempt leaves this `false` so the next `refresh()`
-    /// re-kicks the fill (the old bug latched this at the START of the loop, so a
-    /// fill aborted by a sibling `refresh()`'s token bump was gated off forever).
-    /// Reset to `false` on disconnect so the next cold-connect re-runs the fill.
-    private var initialFillDone: Bool = false
-
-    /// Single in-flight flag for ``ensureInitialFill()``. Guarantees NO two fills
-    /// ever run concurrently: a second kick while one is in flight is a no-op.
-    /// Mutated only on `@MainActor`, so no atomics are needed.
-    private var isFillingInitial: Bool = false
-
-    /// The dedicated initial-fill task, with its OWN lifecycle independent of the
-    /// per-request ``refreshToken``. A sibling `refresh()` (connect / gateway.ready
-    /// / drawer-open / heartbeat) bumping `refreshToken` does NOT touch this task —
-    /// that decoupling is the whole fix. Cancelled (and the fill un-latched) by
-    /// ``resetInitialFill()`` on a server change so a fresh cold-connect re-fills.
-    private var initialFillTask: Task<Void, Never>?
-
-    /// Cancellation generation for ``initialFillTask``. Bumped by
-    /// ``resetInitialFill()``; the fill loop re-checks it after every `await` and
-    /// bails if it no longer matches, so a stale fill from a previous server can
-    /// never append onto the new server's freshly-reset list.
-    private var fillGeneration: Int = 0
-
-    /// High-water mark of the server-row window the initial fill expanded to
-    /// (i.e. the largest `loadedCount` the fill reached). Every FIRST-PAGE refresh
-    /// fetches `max(100, loadedFloor, loadedCount)` rows so a heartbeat /
-    /// gateway.ready replace AFTER the fill completes never collapses the window
-    /// back to ~100 (which dropped the drawer from 39 visible to ~8). Without this
-    /// floor the fill is one-shot: a single post-fill replace undoes it, because
-    /// `initialFillDone` is latched and the fill won't re-run. Reset to 0 by
-    /// ``resetInitialFill()`` on a server change. Mutated only on `@MainActor`.
-    private var loadedFloor: Int = 0
-
     /// Monotonic counter incremented before each `refresh()` call. A response
     /// decoded from an earlier request (identified by a smaller token value) is
     /// discarded so a slow prior response can never overwrite a newer list.
@@ -240,7 +137,6 @@ final class SessionStore {
         // Existing refresh paths already guard this token at every network
         // result publication. Bumping it discards an in-flight response.
         refreshToken &+= 1
-        resetInitialFill()
         cancelEnsureRuntime()
         cancelRuntimeBinding()
     }
@@ -282,7 +178,6 @@ final class SessionStore {
     /// the long-lived store graph and reappearing during an immediate re-pair.
     func removeForgottenGatewayState() {
         invalidateConnectionWork()
-        stopHeartbeat()
         cancelPrefetch()
         searchTask?.cancel()
         searchTask = nil
@@ -312,13 +207,7 @@ final class SessionStore {
         archivedSessions.removeAll()
         automationSessions.removeAll()
         profiles.removeAll()
-        totalSessions = nil
         automationSessionsTotal = nil
-        loadedOffset = 0
-        loadedCount = 0
-        loadedFloor = 0
-        seenServerSessionIds.removeAll()
-        resetSessionListDeltaState()
 
         liveCleanupTask?.cancel()
         liveCleanupTask = nil
@@ -326,9 +215,6 @@ final class SessionStore {
         lastActivityStampAt.removeAll()
         turnsInProgress.removeAll()
 
-        manifestFreshness = .cached
-        manifestLastSyncedAt = nil
-        manifestRevision = 0
         coldReadCacheScope = nil
         lastColdReadServerId = nil
 
@@ -341,7 +227,6 @@ final class SessionStore {
         lastError = nil
         sessionActionError = nil
         isLoading = false
-        isLoadingMore = false
         isLoadingAutomationSessions = false
         automationSessionsError = nil
 
@@ -350,114 +235,6 @@ final class SessionStore {
         activeProfile = Self.defaultProfileName
     }
 
-    /// Revision of the server-side Recents universe represented by `sessions`.
-    /// Unlike `refreshToken`, this does not cancel the dedicated initial fill on
-    /// every heartbeat. It changes only when a first-page replacement or cursor
-    /// delta can make an already-started grow-window response stale.
-    private var sessionListUniverseRevision: Int = 0
-
-    /// Identity of one server-side Recents list universe. Cursor state is never
-    /// shared across gateways, path families, profile rails, or source filters.
-    private struct SessionListDeltaScope: Hashable, Codable {
-        let serverURL: String
-        let pathStyle: String
-        let activeProfile: String
-        let rail: String
-        let excludedSources: String
-        let source: String
-    }
-
-    private struct PersistedSessionListCursor: Codable {
-        let scope: SessionListDeltaScope
-        let cursor: String
-    }
-
-    /// Opaque plugin session-list cursors partitioned by list universe.
-    @ObservationIgnored
-    private var sessionListDeltaCursors: [SessionListDeltaScope: String] = [:]
-
-    /// The transport generation the delta rail last FULL-seeded under (A2). Every
-    /// reconnect / foreground-recovery bumps `ConnectionStore.transportEpoch`, so
-    /// comparing it here lets the FIRST session-list refresh on a new transport
-    /// bypass the persisted delta cursor and do a full first-page re-seed +
-    /// fill-to-target before incremental deltas resume — otherwise an
-    /// under-populated drawer (initial hydration cut short by the 8s timeout) can
-    /// never be repaired without a process restart. This single data-driven seam
-    /// keys off the epoch that ALL recovery entry points already advance, so no
-    /// per-path flag and no third recovery path is needed.
-    @ObservationIgnored
-    private var lastReseededTransportGeneration: UInt64?
-
-    /// The current transport generation for the A2 reseed gate. The live path is
-    /// `connection?.transportEpoch`; a test injects `reconnectGenerationProvider`
-    /// to simulate a reconnect deterministically without a live socket.
-    private var currentReconnectGeneration: UInt64? {
-        #if DEBUG
-        if let provider = reconnectGenerationProvider { return provider() }
-        #endif
-        return connection?.transportEpoch
-    }
-
-    #if DEBUG
-    /// Test seam for the A2 reconnect full-reseed gate: overrides the transport
-    /// generation the gate reads. Bumping the returned value between refreshes
-    /// simulates a reconnect (which, in the app, bumps `transportEpoch`).
-    var reconnectGenerationProvider: (() -> UInt64?)?
-    #endif
-
-    /// Tombstones deferred while a row belongs to the active/pinned/live working
-    /// set. They are re-evaluated on every later delta so advancing the server
-    /// cursor cannot leave a protected row behind forever after protection ends.
-    @ObservationIgnored
-    private var pendingSessionListTombstones: [SessionListDeltaScope: Set<String>] = [:]
-
-    private func sessionListDeltaScope(
-        excludeSource: [String],
-        source: String? = nil
-    ) -> SessionListDeltaScope? {
-        let serverURL: String
-        if let live = connection?.serverURLString, !live.isEmpty {
-            serverURL = live
-        } else if sessionListDeltaFetch != nil {
-            serverURL = "__test__"
-        } else {
-            return nil
-        }
-        let pathStyle = connection?.rest?.pathStyle.rawValue
-            ?? (sessionListDeltaFetch == nil ? "none" : "__test__")
-        return SessionListDeltaScope(
-            serverURL: serverURL,
-            pathStyle: pathStyle,
-            activeProfile: activeProfile.trimmingCharacters(in: .whitespacesAndNewlines),
-            rail: usesAggregateRail ? "aggregate" : "single",
-            excludedSources: excludeSource.joined(separator: ","),
-            source: source?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        )
-    }
-
-    private func resetSessionListDeltaState() {
-        sessionListDeltaCursors.removeAll()
-        pendingSessionListTombstones.removeAll()
-        UserDefaults.standard.removeObject(forKey: DefaultsKeys.sessionListDeltaCursors)
-    }
-
-    func flushSessionListDeltaCursors(defaults: UserDefaults = .standard) {
-        let persisted = sessionListDeltaCursors
-            .map { PersistedSessionListCursor(scope: $0.key, cursor: $0.value) }
-            .sorted {
-                let left = [$0.scope.serverURL, $0.scope.pathStyle, $0.scope.activeProfile,
-                            $0.scope.rail, $0.scope.excludedSources, $0.scope.source].joined(separator: "|")
-                let right = [$1.scope.serverURL, $1.scope.pathStyle, $1.scope.activeProfile,
-                             $1.scope.rail, $1.scope.excludedSources, $1.scope.source].joined(separator: "|")
-                return left < right
-            }
-        if persisted.isEmpty {
-            defaults.removeObject(forKey: DefaultsKeys.sessionListDeltaCursors)
-        } else if let data = try? JSONEncoder().encode(persisted) {
-            defaults.set(data, forKey: DefaultsKeys.sessionListDeltaCursors)
-        }
-        _ = defaults.synchronize()
-    }
     /// One owner for durable identity, live identity, ownership mode, and the
     /// socket generation that made a drive claim. The computed properties keep
     /// existing callers source-compatible while this value remains authoritative.
@@ -1028,8 +805,7 @@ final class SessionStore {
     /// decision in ``collapsedProfiles`` / ``expandedProfiles`` so the default
     /// rule cannot undo it: expanding a default-collapsed group writes an
     /// explicit-expand, and collapsing the default group writes an explicit-
-    /// collapse. Idempotent and independent of ``resetInitialFill()`` (the
-    /// STR-991 teardown path never touches collapse state).
+    /// collapse. Independent of session snapshot refreshes.
     func toggleCollapsed(profile: String) {
         if isProfileGroupCollapsed(profile) {
             collapsedProfiles.remove(profile)
@@ -1074,8 +850,6 @@ final class SessionStore {
             // rows or schedule a cache write for the old profile.
             refreshToken &+= 1
             coldReadCacheScope = nil
-            resetInitialFill()
-            resetSessionListDeltaState()
         }
     }
 
@@ -1242,9 +1016,6 @@ final class SessionStore {
     /// stuck, which would revive the infinite-carry-forward bug.
     func clearAllTurnsInProgress() {
         turnsInProgress.removeAll()
-        // This hook is called on every disconnect/reconnect path. A fresh
-        // connection must seed its own cursor before requesting deltas.
-        resetSessionListDeltaState()
     }
 
     #if DEBUG
@@ -1454,12 +1225,6 @@ final class SessionStore {
     /// Wired once by `AppEnvironment.attachCache(_:)`.
     private var cacheStore: CacheStore?
 
-    /// The last atomically committed manifest state, restored with the drawer.
-    /// It is the shared freshness source for compact and split shells.
-    private(set) var manifestFreshness: ManifestFreshness = .cached
-    private(set) var manifestLastSyncedAt: Date?
-    private(set) var manifestRevision: Int64 = 0
-
     /// Latches `true` after the first `refresh()` has run the cold-launch cache
     /// read. The read only fires when `sessions` is still empty (cold launch),
     /// so a warm in-memory list is never overwritten by a (possibly older) disk
@@ -1574,13 +1339,6 @@ final class SessionStore {
         // desktop's default "All profiles" view. Inert until the switcher is shown.
         activeProfile = defaults.string(forKey: DefaultsKeys.activeProfile)
             ?? DefaultsKeys.allProfilesScope
-        if let data = defaults.data(forKey: DefaultsKeys.sessionListDeltaCursors),
-           let persisted = try? JSONDecoder().decode([PersistedSessionListCursor].self, from: data) {
-            sessionListDeltaCursors = Dictionary(
-                persisted.map { ($0.scope, $0.cursor) },
-                uniquingKeysWith: { _, latest in latest }
-            )
-        }
         // STR-1022: profile-group collapse decisions are derived (see
         // ``isProfileGroupCollapsed(_:)``); these two sets hold only the user's
         // explicit overrides and are persisted so choices survive restarts.
@@ -1600,7 +1358,7 @@ final class SessionStore {
         Task { [weak self] in
             guard let self else { return }
             guard self.workRepository == nil else { return }
-            self.workRepository = try? await WorkRepository.openAppGroup(scope: self.durableWorkScope)
+            self.workRepository = try? await WorkRepository.openAppGroup()
             self.restoreComposerDraft(for: self.activeComposerDraftKey)
         }
     }
@@ -1608,24 +1366,6 @@ final class SessionStore {
     func attachWorkRepository(_ repository: WorkRepository) {
         workRepository = repository
         restoreComposerDraft(for: activeComposerDraftKey)
-    }
-
-    /// Reset the initial-fill guard so the next `refresh()` re-runs the
-    /// fill-to-30 loop. Call this whenever the gateway URL / token changes
-    /// so a fresh cold-connect on a new server re-populates the drawer.
-    ///
-    /// Cancels any in-flight ``ensureInitialFill()`` and bumps ``fillGeneration``
-    /// so a stale fill that resumes after an `await` cannot append onto the new
-    /// server's reset list, and drops ``isFillingInitial`` so the next kick is
-    /// free to start.
-    func resetInitialFill() {
-        initialFillDone = false
-        fillGeneration &+= 1
-        initialFillTask?.cancel()
-        initialFillTask = nil
-        isFillingInitial = false
-        loadedFloor = 0
-        resetSessionListDeltaState()
     }
 
     private var client: HermesGatewayClient? { connection?.client }
@@ -2015,8 +1755,8 @@ final class SessionStore {
 
     /// Count of ``automationSessions`` as of the most recent successful
     /// fetch — i.e. the filtered row count, never the raw server-reported
-    /// total. `nil` until the first successful fetch completes (mirrors
-    /// ``totalSessions``). Deliberately NOT the server's `total` field: an
+    /// total. `nil` until the first successful fetch completes. Deliberately
+    /// NOT the server's `total` field: an
     /// older gateway that ignores `source=cron,subagent` can return a page
     /// containing human rows, which ``loadAutomationSessions()`` drops via
     /// ``isAutomationSource(_:)`` — preserving the untrusted server total
@@ -2258,11 +1998,6 @@ final class SessionStore {
         }
         do {
             lastColdReadServerId = scope.serverId
-            if let manifest = try? await cacheStore.loadManifestProjection(scope: scope) {
-                manifestFreshness = manifest.freshness
-                manifestLastSyncedAt = manifest.lastSyncedAt
-                manifestRevision = manifest.revision
-            }
             var cached = Self.filterCachedSessions(
                 try await cacheStore.loadSessionList(scope: scope),
                 activeProfile: activeProfile,
@@ -2305,13 +2040,6 @@ final class SessionStore {
                     // and slipped through an older build). The predicate is the
                     // single source of truth.
                     sessions = cached.filter(Self.isHumanRecentsSession)
-                    // The cold cache paint is a real first page for the
-                    // pagination cursors and the initial-fill fast-path.
-                    // ABH-373: seed all-seen ids from the RAW cached page
-                    // (before the machinery filter) so the cursor math on
-                    // subsequent grow-limit appends is accurate.
-                    seenServerSessionIds = Set(cached.map(sessionListIdentity))
-                    loadedCount = cached.count
                     if let lastOpened = try? await cacheStore.loadLastOpenedSession(scope: scope),
                        currentCacheScope == scope,
                        coldReadCacheScope == scope,
@@ -2324,7 +2052,6 @@ final class SessionStore {
                         // until the gateway is operationally ready.
                         open(summary, bindRuntime: false)
                     }
-                    loadedOffset = cached.count
                 }
             }
             paintFinished = true
@@ -2517,7 +2244,7 @@ final class SessionStore {
 
     // MARK: - Listing
 
-    /// Refresh the session list via `session.list` (limit 100).
+    /// Refresh the session list from one bounded stock snapshot.
     ///
     /// **Non-destructive merge (ABH-86 item 3):** after the fetch resolves, rows
     /// missing from the incoming page are dropped UNLESS their id belongs to the
@@ -2557,7 +2284,7 @@ final class SessionStore {
         // fires at most once and ONLY while `sessions` is still empty — a warm
         // in-memory list (already populated by an earlier refresh) is never
         // clobbered by a disk snapshot. The subsequent network fetch below runs
-        // unchanged and `mergeSessionPage` reconciles server authority over the
+        // unchanged and `mergeSessionSnapshot` reconciles server authority over the
         // cached rows. No cache (tests/previews) ⇒ this is a no-op and the path
         // is byte-identical to today.
         // P4 SERVER-switch policy: if the active server changed since the last
@@ -2577,10 +2304,6 @@ final class SessionStore {
             // (now sole) cached rows rather than leaving the prior server's list
             // on screen while the network refetches.
             sessions = []
-            loadedCount = 0
-            loadedOffset = 0
-            seenServerSessionIds = []  // ABH-373
-            resetSessionListDeltaState()
             coldReadCacheScope = nil
         }
 
@@ -2605,18 +2328,12 @@ final class SessionStore {
         // Use the injected seam when present (unit tests, no live gateway).
         if let fetch = sessionsFetch {
             do {
-                let (fetched, total) = try await fetch()
+                let (fetched, _) = try await fetch()
                 guard refreshToken == myToken,
                       currentCacheScope == myCacheScope else { return .timeout }
-                mergeSessionPage(fetched, total: total)
+                mergeSessionSnapshot(fetched)
                 if let myCacheScope { persistSessionListToCache(scope: myCacheScope) }
                 lastError = nil
-
-                // Kick the decoupled initial-fill (idempotent; survives a sibling
-                // refresh()'s token bump). It runs to the target / server-exhaust
-                // on its OWN task, independent of `myToken`.
-                ensureInitialFill()
-
                 SpotlightIndexer.index(sessions: sessions)
             } catch {
                 guard refreshToken == myToken,
@@ -2626,31 +2343,30 @@ final class SessionStore {
             return .success
         }
 
-        // Multi-profile aggregate rail (F4b): only when the capability is
-        // available AND the scope is not the default profile. The default scope
-        // and every stock-gateway case skip this entirely → the existing fetch.
-        if usesAggregateRail, let rest = connection?.rest {
+        // One bounded stock snapshot. The aggregate profile rail is retained
+        // when available; every other configuration uses the stock recent-list
+        // endpoint. Older sessions remain discoverable through search.
+        if let rest = connection?.rest {
             do {
-                // fill30: the aggregate rail is just as autonomous-loop-dense as the single
-                // rail, so it needs the SAME fill-to-target treatment. Floor the
-                // first-page window at what the fill reached (so a post-fill
-                // heartbeat / drawer-open can't collapse it back to 100) and kick
-                // the decoupled `ensureInitialFill()` — which pages this rail via
-                // `profileSessions` (routed inside `resolvedInitialFillFetch`).
-                // Previously this branch fetched a HARDCODED limit=100 and `return`ed
-                // BEFORE the fill, so on a multi-profile gateway the drawer was stuck
-                // at ~6 human Recents regardless of the single-rail fix.
-                let fetchLimit = max(100, loadedFloor, loadedCount)
-                let result = try await rest.profileSessions(
-                    profile: DefaultsKeys.allProfilesScope, limit: fetchLimit,
-                    excludeSource: Self.recentsExcludeSources
-                )
+                let fetched: [SessionSummary]
+                if usesAggregateRail {
+                    fetched = try await rest.profileSessions(
+                        profile: DefaultsKeys.allProfilesScope,
+                        limit: Self.snapshotLimit,
+                        excludeSource: Self.recentsExcludeSources
+                    ).sessions
+                } else {
+                    fetched = try await rest.sessionsWithTotal(
+                        limit: Self.snapshotLimit,
+                        minMessages: 1,
+                        excludeSource: Self.recentsExcludeSources
+                    ).sessions
+                }
                 guard refreshToken == myToken,
                       currentCacheScope == myCacheScope else { return .timeout }
-                mergeSessionPage(result.sessions, total: result.total)
+                mergeSessionSnapshot(fetched)
                 if let myCacheScope { persistSessionListToCache(scope: myCacheScope) }
                 lastError = nil
-                ensureInitialFill()
                 SpotlightIndexer.index(sessions: sessions)
                 return .success
             } catch {
@@ -2658,145 +2374,6 @@ final class SessionStore {
                       currentCacheScope == myCacheScope else { return .timeout }
                 let outcome = Self.backgroundRefreshOutcome(for: error)
                 if outcome == .authFailure { fallbackOutcome = outcome }
-                // Fall through to the single-profile fetch below (defensive — a
-                // transient aggregate failure still shows the recents list).
-            }
-        }
-
-        // Prefer REST: order=recent is compression-chain aware and surfaces
-        // old sessions with fresh activity (the WS RPC is creation-ordered,
-        // which buries them under high-volume cron sessions).
-        // UX1: min_messages=1 matches desktop's listAllProfileSessions(limit, 1)
-        // so scaffold/empty sessions never clutter the drawer.
-        // BUG B (heartbeat-reset guard): use `max(100, loadedCount)` so the
-        // heartbeat's first-page re-fetch never shrinks a window that the
-        // initial-fill loop already expanded to reach `initialVisibleTarget`.
-        let rest = connection?.rest
-        if rest != nil || sessionListDeltaFetch != nil {
-            let deltaScope = !usesAggregateRail
-                && (sessionListDeltaFetch != nil || rest?.pathStyle == .plugin)
-                ? sessionListDeltaScope(excludeSource: Self.recentsExcludeSources)
-                : nil
-            do {
-                // Floor the first-page window at what the initial fill reached so a
-                // post-fill heartbeat / gateway.ready replace can't collapse the
-                // drawer back to ~100 rows (fill30): `max(100, loadedFloor, loadedCount)`.
-                let fetchLimit = max(100, loadedFloor, loadedCount)
-                // A2: the transport generation at the start of this refresh. If it
-                // advanced since the delta rail last full-seeded, a reconnect /
-                // foreground-recovery happened and the FIRST refresh on the new
-                // transport must FULL-seed (bypass the persisted cursor) before
-                // incremental deltas resume — see `lastReseededTransportGeneration`.
-                let reseedGeneration = currentReconnectGeneration
-                if let deltaScope {
-                    var previousCursor = sessionListDeltaCursors[deltaScope]
-                    if previousCursor != nil,
-                       reseedGeneration != lastReseededTransportGeneration {
-                        // Reconnected/recovered since the last seed: drop the cursor
-                        // so this refresh takes the full first-page seed + fill-to-
-                        // target path, then deltas resume from the new cursor.
-                        previousCursor = nil
-                        sessionListDeltaCursors[deltaScope] = nil
-                    }
-                    let delta: SessionListDeltaResult?
-                    do {
-                        delta = try await resolvedSessionListDeltaFetch(
-                            rest: rest,
-                            limit: fetchLimit,
-                            updatedSince: previousCursor
-                        )
-                    } catch {
-                        delta = nil
-                    }
-                    guard refreshToken == myToken,
-                          currentCacheScope == myCacheScope,
-                          sessionListDeltaScope(
-                              excludeSource: Self.recentsExcludeSources
-                          ) == deltaScope else { return .timeout }
-
-                    if let delta {
-                        sessionListDeltaCursors[deltaScope] = delta.cursor
-                        // This refresh is now the seed for the current transport
-                        // generation; subsequent same-generation refreshes resume
-                        // incremental deltas (A2).
-                        lastReseededTransportGeneration = reseedGeneration
-                        let didChange: Bool
-                        if previousCursor == nil {
-                            mergeSessionPage(delta.sessions, total: delta.total)
-                            reconcilePendingSessionListTombstones(
-                                afterAuthoritativePage: delta.sessions,
-                                scope: deltaScope
-                            )
-                            didChange = true
-                        } else {
-                            didChange = mergeSessionDelta(delta, scope: deltaScope)
-                        }
-                        if didChange {
-                            if let myCacheScope { persistSessionListToCache(scope: myCacheScope) }
-                            SpotlightIndexer.index(sessions: sessions)
-                        }
-                        lastError = nil
-                        ensureInitialFill()
-                        return .success
-                    }
-
-                    // A missing/old/malformed plugin endpoint must retry from a
-                    // full seed later. Continue through the stock REST path now.
-                    sessionListDeltaCursors[deltaScope] = nil
-                }
-
-                guard let rest else { return .retryableFailure }
-                let result = try await rest.sessionsWithTotal(
-                    limit: fetchLimit, minMessages: 1,
-                    excludeSource: Self.recentsExcludeSources
-                )
-                guard refreshToken == myToken,
-                      currentCacheScope == myCacheScope else { return .timeout }
-                if let deltaScope {
-                    guard sessionListDeltaScope(
-                        excludeSource: Self.recentsExcludeSources
-                    ) == deltaScope else { return .timeout }
-                }
-                mergeSessionPage(result.sessions, total: result.total)
-                if let deltaScope {
-                    reconcilePendingSessionListTombstones(
-                        afterAuthoritativePage: result.sessions,
-                        scope: deltaScope
-                    )
-                    // The stock REST path is itself a full first-page seed; mark the
-                    // current transport generation as seeded so a delta cursor set
-                    // later this generation is not force-bypassed again (A2).
-                    lastReseededTransportGeneration = reseedGeneration
-                }
-                if let myCacheScope { persistSessionListToCache(scope: myCacheScope) }
-                lastError = nil
-
-                // BUG B FIX (re-architected — fill30): ensure at least
-                // `initialVisibleTarget` VISIBLE sessions after cold-connect, robust
-                // against the concurrent-refresh race. The fill no longer runs inline
-                // under `myToken` (a sibling refresh() bumping the token used to abort
-                // it after one ~100-row page and `initialFillDone` then gated the retry
-                // off forever). Instead it runs on a DEDICATED, idempotent task with
-                // its own lifecycle (`ensureInitialFill()`), pages with grow-limit +
-                // dedupe-append until the target is met or the server is exhausted, and
-                // latches `initialFillDone` ONLY on successful completion — so an
-                // aborted attempt is retried by the next refresh().
-                ensureInitialFill()
-
-                // Republish the session list into Spotlight (fire-and-forget).
-                SpotlightIndexer.index(sessions: sessions)
-                return .success
-            } catch {
-                guard refreshToken == myToken,
-                      currentCacheScope == myCacheScope else { return .timeout }
-                let outcome = Self.backgroundRefreshOutcome(for: error)
-                if outcome == .authFailure { fallbackOutcome = outcome }
-                if let deltaScope {
-                    guard sessionListDeltaScope(
-                        excludeSource: Self.recentsExcludeSources
-                    ) == deltaScope else { return .timeout }
-                }
-                // Fall through to the WS RPC below.
             }
         }
 
@@ -2804,13 +2381,12 @@ final class SessionStore {
         do {
             let raw = try await client.requestRaw(
                 "session.list",
-                params: .object(["limit": .number(100)])
+                params: .object(["limit": .number(Double(Self.snapshotLimit))])
             )
             guard refreshToken == myToken,
                   currentCacheScope == myCacheScope else { return .timeout }
             let fetched = Self.parseSessions(from: raw)
-            // WS RPC shape has no total; preserve whatever was last known.
-            mergeSessionPage(fetched, total: nil)
+            mergeSessionSnapshot(fetched)
             if let myCacheScope { persistSessionListToCache(scope: myCacheScope) }
             lastError = nil
             // Republish the session list into Spotlight (fire-and-forget).
@@ -2841,7 +2417,7 @@ final class SessionStore {
         return .retryableFailure
     }
 
-    /// Single write seam for a failed refresh/fill fetch. Classifies the error and
+    /// Single write seam for a failed refresh fetch. Classifies the error and
     /// writes ``lastError`` ONLY for a genuine failure — a cancellation never
     /// reaches it, so a cancelled refresh can never paint a false error row over
     /// retained cached rows. Returns the classified background-policy outcome
@@ -2856,47 +2432,6 @@ final class SessionStore {
         return fallback ?? Self.backgroundRefreshOutcome(for: error)
     }
 
-    private func resolvedSessionListDeltaFetch(
-        rest: RestClient?,
-        limit: Int,
-        updatedSince: String?
-    ) async throws -> SessionListDeltaResult? {
-        if let fetch = sessionListDeltaFetch {
-            return try await fetch(updatedSince, limit)
-        }
-        guard let rest else { return nil }
-        return await rest.sessionListDelta(
-            limit: limit,
-            minMessages: 1,
-            excludeSource: Self.recentsExcludeSources,
-            updatedSince: updatedSince
-        )
-    }
-
-    /// Reconcile deferred tombstones after a full, authoritative page. Rows
-    /// present in the page are live again; rows still present locally but absent
-    /// from the page are working-set survivors and remain pending until a later
-    /// refresh can remove them safely.
-    private func reconcilePendingSessionListTombstones(
-        afterAuthoritativePage page: [SessionSummary],
-        scope: SessionListDeltaScope
-    ) {
-        let incomingIds = Set(page.filter(Self.isHumanRecentsSession).map(\.id))
-        let currentIds = Set(sessions.map(\.id))
-        var pending = pendingSessionListTombstones[scope] ?? []
-        pending.subtract(incomingIds)
-        pending.formUnion(currentIds.subtracting(incomingIds))
-        pending.formIntersection(currentIds)
-        if pending.isEmpty {
-            pendingSessionListTombstones[scope] = nil
-        } else {
-            pendingSessionListTombstones[scope] = pending
-        }
-    }
-
-    /// Merge changed rows and deferred removals without replacing the loaded
-    /// grow-limit window. Returns whether the backing `sessions` rows changed so
-    /// empty heartbeats can skip cache and Spotlight rewrites.
     /// Whether an optimistically-bumped local `lastActive` should be carried
     /// forward over a lagging server value for `identity` on a list merge (the
     /// anti-flicker keep-active-at-top invariant, ABH-86/178/157).
@@ -2911,7 +2446,7 @@ final class SessionStore {
     ///     Covers a turn STILL receiving frames after `turnsInProgress` was
     ///     force-cleared by a disconnect/reconnect (`clearAllTurnsInProgress`).
     ///     Without it, the reconnect's transport-epoch bump forces an A2 full
-    ///     first-page reseed (`mergeSessionPage`) in which the active session —
+    ///     bounded snapshot (`mergeSessionSnapshot`) in which the active session —
     ///     present in the server page, so not a working-set survivor — decays to
     ///     the server's stale `lastActive` and sinks to "yesterday" until the next
     ///     live frame re-bumps it (LANE D transient mis-order).
@@ -2924,104 +2459,7 @@ final class SessionStore {
         return false
     }
 
-    private func mergeSessionDelta(
-        _ delta: SessionListDeltaResult,
-        scope: SessionListDeltaScope
-    ) -> Bool {
-        let previousTotal = totalSessions
-        if let total = delta.total { totalSessions = total }
-
-        let incoming = delta.sessions.filter(Self.isHumanRecentsSession)
-        let incomingIds = Set(incoming.map(\.id))
-        let filteredChangedIds = Set(delta.sessions.map(\.id)).subtracting(incomingIds)
-        var departedIds = Set(delta.tombstones.map(\.id))
-        departedIds.formUnion(filteredChangedIds)
-        // A current human row wins if a defensive server response includes both
-        // an upsert and a tombstone for the same id.
-        departedIds.subtract(incomingIds)
-
-        let totalChanged = delta.total != nil && previousTotal != delta.total
-        if !incoming.isEmpty || !departedIds.isEmpty || totalChanged {
-            sessionListUniverseRevision &+= 1
-        }
-
-        // Grow-limit pagination counts rows in the CURRENT server universe. A
-        // tombstoned id that was previously consumed must stop advancing the
-        // cursor, even when its rendered row remains temporarily protected as
-        // active/pinned/live. Otherwise a reduced total can leave loadedOffset at
-        // or past the end while current rows still exist beyond the loaded window.
-        let departedSeenIds = departedIds.intersection(seenServerSessionIds)
-        if !departedSeenIds.isEmpty {
-            seenServerSessionIds.subtract(departedSeenIds)
-            loadedCount = max(0, loadedCount - departedSeenIds.count)
-            loadedOffset = loadedCount
-        }
-
-        var pending = pendingSessionListTombstones[scope] ?? []
-        pending.formUnion(departedIds)
-        // A current human row is authoritative evidence that a prior tombstone
-        // was superseded (for example, a session re-entered the list universe).
-        pending.subtract(incomingIds)
-
-        let removableIds = pending.subtracting(workingSetSessionIds())
-        let countBeforeRemoval = sessions.count
-        if !removableIds.isEmpty {
-            sessions.removeAll { removableIds.contains($0.id) }
-            pending.subtract(removableIds)
-            if let cacheStore, let cacheScope = currentCacheScope {
-                for id in removableIds {
-                    Task { try? await cacheStore.removeSession(scope: cacheScope, sessionId: id) }
-                }
-            }
-        }
-        let didRemove = sessions.count != countBeforeRemoval
-
-        let priorLastActive: [String: Double] = sessions.reduce(into: [:]) { result, row in
-            if let lastActive = row.lastActive { result[sessionListIdentity(row)] = lastActive }
-        }
-        let reconciled = incoming.map { row -> SessionSummary in
-            let identity = sessionListIdentity(row)
-            guard let prior = priorLastActive[identity],
-                  shouldCarryForwardLastActive(identity),
-                  prior > (row.lastActive ?? -.greatestFiniteMagnitude) else { return row }
-            var bumped = row
-            bumped.lastActive = prior
-            return bumped
-        }
-
-        var didUpsert = false
-        for row in reconciled {
-            if let index = sessions.firstIndex(where: { $0.id == row.id }) {
-                if sessions[index] != row {
-                    sessions[index] = row
-                    didUpsert = true
-                }
-            } else {
-                sessions.append(row)
-                didUpsert = true
-            }
-        }
-
-        if didUpsert {
-            // Match `visibleSessions`: descending activity with stable ordering
-            // when timestamps tie. Do not add an id tie-breaker here.
-            sessions.sort { lhs, rhs in
-                let left = lhs.lastActive ?? lhs.startedAt ?? -.greatestFiniteMagnitude
-                let right = rhs.lastActive ?? rhs.startedAt ?? -.greatestFiniteMagnitude
-                return left > right
-            }
-        }
-
-        if pending.isEmpty {
-            pendingSessionListTombstones[scope] = nil
-        } else {
-            pendingSessionListTombstones[scope] = pending
-        }
-        return didRemove || didUpsert
-    }
-
-    /// Non-destructive merge of an incoming page into `sessions` (ABH-86 item 3,
-    /// desktop parity with `store/session.ts:mergeSessionPage`).
+    /// Reconcile one bounded authoritative snapshot into the cached drawer.
     ///
     /// Semantics:
     /// - Build the incoming id set.
@@ -3032,81 +2470,14 @@ final class SessionStore {
     /// - Prepend survivors to the incoming page (they float to the top briefly,
     ///   then fall into place on the next refresh once the server catches up).
     /// - Incoming page wins for all other rows.
-    /// - When `total` is non-nil, update ``totalSessions``.
-    ///
-    /// UX1: `isAppend` mode merges an additional page on top of the existing
-    /// `sessions` array rather than replacing it. Deduplication is by `id`.
-    /// Working-set survivor logic is skipped on appended pages (the first-page
-    /// already carries those survivors). `loadedCount` is advanced accordingly.
     private func sessionListIdentity(_ row: SessionSummary) -> String {
         usesAggregateRail ? row.scopedIdentity : row.id
     }
 
-    private func mergeSessionPage(_ page: [SessionSummary], total: Int?, isAppend: Bool = false) {
-        // ABH-373: Gate machinery at INGRESS. Every path that writes into
-        // `sessions` — fetch, WS-triggered refresh, background refresh, load-more
-        // append, initial-fill append — funnels through this merge. Filtering
-        // here means machinery (cron / subagent / agent / cli-loop) can NEVER
-        // enter the drawer's backing array, so there is no flicker where a row
-        // flashes in then disappears on the next `visibleSessions` read. The
-        // predicate is the single source of truth (`isHumanRecentsSession`);
-        // `visibleSessions` retains it as belt-and-suspenders, but the invariant
-        // is established at write time, not read time.
-        //
-        // ABH-373 (two dedupe concerns — do NOT conflate them):
-        //
-        // 1. ROW-INCLUSION dedupe (which rows enter `sessions`): against the
-        //    RENDERED set `sessions.map(\.id)`. This is the only set that
-        //    contains working-set survivors (pinned/active/live rows carried
-        //    forward from a prior first-page replace). Deduping row inclusion
-        //    against any other set risks appending a survivor twice → a duplicate
-        //    Identifiable id → SwiftUI ForEach undefined behavior.
-        //
-        // 2. CURSOR-ADVANCE dedupe (how far `loadedCount` has consumed the
-        //    server list): against `seenServerSessionIds` (ALL server rows ever
-        //    consumed, INCLUDING machinery filtered out at ingress). Grow-limit
-        //    pagination re-fetches the full expanded window each iteration, so
-        //    overlap rows reappear — they must NOT advance the cursor again.
-        //    This set intentionally EXCLUDES working-set survivors (they are
-        //    local-only, never delivered by the server), which is exactly why it
-        //    must never be used for row inclusion.
-        let rawCount = page.count
-        let pageIds = page.map(sessionListIdentity)
+    private func mergeSessionSnapshot(_ page: [SessionSummary]) {
+        // Gate machinery at ingress so cron/subagent/agent rows never enter the
+        // human drawer, including when an older gateway ignores the query filter.
         let incoming = page.filter(Self.isHumanRecentsSession)
-        // Update the total count when the server provides it.
-        if let total { totalSessions = total }
-
-        if isAppend {
-            // ABH-373 REWORK: row-inclusion dedupe MUST be against the actual
-            // rendered set (`sessions`), NOT against `seenServerSessionIds`. The
-            // all-seen-id set intentionally EXCLUDES working-set survivors
-            // (pinned/active/live rows carried forward from a prior first-page
-            // replace that were absent from that server page). A survivor that
-            // reappears in a grown-limit append window would pass a
-            // `seenServerSessionIds` filter and be appended a SECOND time → a
-            // duplicate Identifiable id in `sessions` → SwiftUI ForEach undefined
-            // behavior. Dedupe against the rendered set guarantees each id is
-            // present exactly once.
-            let existingIds = Set(sessions.map(sessionListIdentity))
-            let newRows = incoming.filter { !existingIds.contains(sessionListIdentity($0)) }
-            // ABH-373: the CURSOR advance dedupe stays against `seenServerSessionIds`
-            // (all server rows ever consumed, including filtered machinery). A
-            // grow-limit page returns the full expanded window, so rows from earlier
-            // pages reappear — they are NOT new and must not advance `loadedCount`
-            // again. This set is cursor-only; never use it for row inclusion.
-            let newlySeenRawIds = pageIds.filter { !seenServerSessionIds.contains($0) }
-            seenServerSessionIds.formUnion(pageIds)
-            sessions.append(contentsOf: newRows)
-            loadedCount += newlySeenRawIds.count
-            return
-        }
-
-        // A full first-page response establishes a new authoritative universe.
-        // Initial-fill requests that started before this replacement must re-page
-        // even when the replacement happened to preserve `loadedCount`.
-        sessionListUniverseRevision &+= 1
-
-        // First-page (replace) path — original ABH-86 merge semantics.
         let incomingIds = Set(incoming.map(sessionListIdentity))
 
         // Working-set: active session + live/working + pinned. These survive
@@ -3157,8 +2528,7 @@ final class SessionStore {
 
         // Merge: survivors first (they have the most up-to-date local state),
         // then the incoming page (server authority for everything else).
-        // build125 smoothness (#208): a periodic first-page refresh (the 30s
-        // heartbeat / drawer-open) very often returns byte-identical rows. Under
+        // Identical refreshes are common. Under
         // `@Observable`, reassigning `sessions` with an equal-but-new array still
         // fires the observation and relayouts the whole LazyVStack. Publish ONLY
         // when the merged result actually differs — an id-diff over the value-typed
@@ -3169,18 +2539,6 @@ final class SessionStore {
         if merged != sessions {
             sessions = merged
         }
-
-        // Reset pagination cursors on a first-page refresh.
-        // ABH-373: a first-page replace is a fresh server window — rebuild the
-        // all-seen-id set from the RAW page (before the machinery filter) so the
-        // cursor math on subsequent grow-limit appends is accurate. Only the RAW
-        // page ids count as "seen"; survivors (working-set rows absent from the
-        // page) are local-only and must not be seeded (they may be machinery a
-        // prior build failed to filter, and a future append should still skip them
-        // honestly). `loadedCount` / `loadedOffset` track the RAW page position.
-        seenServerSessionIds = Set(pageIds)
-        loadedCount = rawCount
-        loadedOffset = rawCount
     }
 
     private func workingSetSessionIds() -> Set<String> {
@@ -3229,7 +2587,7 @@ final class SessionStore {
     /// drawer IMMEDIATELY — without waiting for the server's `lastActive` (which
     /// only advances on message.complete) to round-trip. `visibleSessions` sorts
     /// by `lastActive DESC` and is computed, so mutating the row here triggers an
-    /// instant re-sort; `mergeSessionPage` carries this higher value forward over
+    /// instant re-sort; `mergeSessionSnapshot` carries this higher value forward over
     /// the next (stale) refresh until the server catches up. No-op when the id is
     /// unknown (the caller's debounced `scheduleSessionRefresh` discovers it).
     func noteActivity(storedId: String?) {
@@ -3242,7 +2600,7 @@ final class SessionStore {
         }
         // ABH-157 — the optimistic bump and the LIVE WINDOW are the same signal: a
         // row is only "ahead of the server" while it is actively being driven.
-        // Stamp `lastActivityAt` here too so `mergeSessionPage`'s carry-forward
+        // Stamp `lastActivityAt` here too so `mergeSessionSnapshot`'s carry-forward
         // (gated on the live window) keeps this bump until the turn SETTLES, then
         // lets it decay to the authoritative server value. Without this unifying
         // stamp the bump would be carried forward FOREVER (device-clock skew →
@@ -3252,7 +2610,7 @@ final class SessionStore {
 
     /// P3 write-through: persist the current `sessions` array into the local
     /// cache, fire-and-forget, OFF the UI path. Called after every successful
-    /// `mergeSessionPage` so the cache tracks the freshest list. `saveSessionList`
+    /// `mergeSessionSnapshot` so the cache tracks the freshest list. `saveSessionList`
     /// is an upsert (never deletes rows absent from the batch) and preserves
     /// `isPinned`/`lastAccessedAt`/transcript cursors on existing rows, so a
     /// partial-page refresh can never evict an unseen session or drop a cached
@@ -3272,330 +2630,16 @@ final class SessionStore {
         return rows.compactMap { $0.decoded(as: SessionSummary.self) }
     }
 
-    // MARK: - Load more (UX1 grow-limit pagination)
-
-    /// Load the next page of sessions and append them to the existing list.
-    ///
-    /// **Pagination contract (UX1 — grow-limit, desktop-exact):**
-    /// - Uses GROW-THE-LIMIT semantics (desktop-controller.tsx:290): the new
-    ///   request is `limit = loadedCount + PAGE_SIZE, offset=0, min_messages=1`.
-    ///   The server window expands; we deduplicate the overlap by id so rows
-    ///   already in the list are not duplicated.
-    /// - A patched gateway server-filters cron/subagent via `exclude_sources`
-    ///   (plural — the real FastAPI param, see `RestClient.sessionsWithTotal`), so
-    ///   the window is already automation-free and this loop converges fast. The
-    ///   client-side Recents filter remains the hard invariant guarantee against a
-    ///   STOCK/older gateway that ignores the param and returns a dense firehose window: `loadMore`
-    ///   keeps fetching in a loop until `visibleSessions` grows OR there are no more
-    ///   server rows — so the user is never stranded at a wall of hidden automation rows.
-    /// - A fetch is a no-op when already at the server total, already loading, or
-    ///   when a first-page refresh is in flight (`isLoading`).
-    /// - The same `refreshToken` / stale-response guard from `refresh()` protects
-    ///   against a slow prior loadMore response overwriting a newer list.
-    ///
-    /// Injectable seam: when `sessionsFetch` is set, `loadMore()` is a no-op
-    /// (unit tests drive pagination via `sessionsFetch` with `refresh()`).
-    func loadMore() async {
-        // Guard: nothing to do if we're at the known total, or a load is already in flight.
-        if let total = totalSessions, loadedOffset >= total { return }
-        guard !isLoadingMore, !isLoading else { return }
-        // A fetch source is required: the injected fill seam (`initialFillFetch`,
-        // unit tests) or a live REST client. Without either, silently no-op
-        // (mirrors the prior `connection?.rest` guard so the no-connection tests
-        // still see loadMore as a no-op).
-        guard initialFillFetch != nil || connection?.rest != nil else { return }
-
-        isLoadingMore = true
-        defer { isLoadingMore = false }
-
-        // Keep fetching with a growing limit until we have added at least
-        // `loadMorePageVisibleTarget` (30) NEWLY-VISIBLE rows since this call
-        // started, OR the server is exhausted. Measuring the delta from the
-        // call's starting visible count (not the prior iteration) is what
-        // guarantees a full ~30-row batch per auto-load even when a dense
-        // autonomous firehose window filters most of each fetched page out.
-        //
-        // The page is fetched via `resolvedInitialFillFetch` — the SAME resolver
-        // the cold-launch fill uses — so loadMore pages the identical rail the
-        // list was populated from (on the aggregate "All profiles" rail that is
-        // `profileSessions`, not `sessionsWithTotal`). This keeps loadMore
-        // consistent with refresh()/fill and makes the loop unit-testable via the
-        // `initialFillFetch` seam.
-        let startVisibleCount = visibleSessions.count
-        repeat {
-            let newLimit = loadedCount + Self.pageSize
-            refreshToken &+= 1
-            let myToken = refreshToken
-
-            do {
-                let result = try await resolvedInitialFillFetch(limit: newLimit)
-                guard refreshToken == myToken else { return }
-                let loadedBefore = loadedCount
-                mergeSessionPage(result.sessions, total: result.total, isAppend: true)
-                loadedOffset = loadedCount  // grow-limit: offset advances with loadedCount
-                // Server returned no new rows despite a larger limit — it is
-                // exhausted even if `totalSessions` is unknown/stale. Bail to
-                // avoid spinning forever on a window that can't grow.
-                if loadedCount == loadedBefore { break }
-            } catch {
-                guard refreshToken == myToken else { return }
-                recordRefreshFailure(error)
-                return
-            }
-
-            // Stop if we've reached the known server total.
-            if let total = totalSessions, loadedOffset >= total { break }
-            // Stop once this call has surfaced a full batch of new visible rows.
-            if visibleSessions.count - startVisibleCount >= Self.loadMorePageVisibleTarget { break }
-        } while true
-    }
-
-    // MARK: - Initial fill (fill30 — cold-launch fill-to-target, race-robust)
-
-    /// Kick the cold-launch initial fill: page (grow-limit) until at least
-    /// ``initialVisibleTarget`` sessions are VISIBLE after the user's current
-    /// filters (human-Recents / profile — `visibleSessions` already applies them) OR
-    /// the server is exhausted. Idempotent and concurrency-safe; the safe entry
-    /// point every `refresh()` calls.
-    ///
-    /// ## Why a dedicated task (the fill30 fix)
-    /// The old fill ran *inline* in `refresh()` under that call's `refreshToken`.
-    /// At cold launch `refresh()` fires several times in quick succession (connect
-    /// hydration, `gateway.ready`, drawer-open, the 30 s heartbeat); each bumps the
-    /// token. When a sibling bumped the token mid-fill, the in-flight loop's
-    /// `guard refreshToken == myToken` aborted it after the first ~100-row page —
-    /// and because `initialFillDone` was latched at the *start*, the later refresh()
-    /// never retried it. Net: the drawer stuck at ~6 visible through dense automation rows.
-    ///
-    /// This entry point decouples the fill from the per-request token:
-    /// - **No two fills ever run concurrently** — `isFillingInitial` gates a second
-    ///   kick to a no-op while one is in flight.
-    /// - **Survives a sibling `refresh()`** — the loop pages on its OWN task and
-    ///   does NOT check `refreshToken`; a token bump can't abort it. It is bound
-    ///   only to ``fillGeneration`` (bumped solely by ``resetInitialFill()`` on a
-    ///   server change), so a stale fill can't append onto a new server's list.
-    /// - **Retried until it actually completes** — `initialFillDone` latches `true`
-    ///   ONLY when the loop terminates by meeting the target or proving the server
-    ///   exhausted. An aborted / errored / cancelled attempt leaves it `false`, so
-    ///   the next `refresh()` re-kicks the fill.
-    /// - **Terminates cleanly** — stops the instant `loadedCount >= totalSessions`
-    ///   (a gateway with < 30 human Recents rows never spins) and bounds itself with a
-    ///   no-progress guard so a server that returns the same window forever can't
-    ///   loop.
-    func ensureInitialFill() {
-        // Already satisfied or already running → nothing to kick.
-        guard !initialFillDone, !isFillingInitial else { return }
-        // Fast path: the first page already meets the target. Latch done without
-        // spinning up a task (and without a needless page fetch).
-        if visibleSessions.count >= Self.initialVisibleTarget {
-            initialFillDone = true
-            return
-        }
-        // Fast path: the server is already exhausted (everything is loaded) but we
-        // still fell short — there is nothing more to fetch, so the fill is "done"
-        // in the only sense that matters (a <30 gateway must not spin).
-        if let total = totalSessions, loadedCount >= total {
-            initialFillDone = true
-            return
-        }
-
-        isFillingInitial = true
-        let myGeneration = fillGeneration
-        initialFillTask = Task { [weak self] in
-            guard let self else { return }
-            await self.runInitialFill(generation: myGeneration)
-        }
-    }
-
-    /// The decoupled fill loop body. Pages with grow-limit + dedupe-append until
-    /// the target is met, the server is exhausted, no progress is made, or the
-    /// fill is cancelled by a server change (``fillGeneration`` no longer matches).
-    /// Latches ``initialFillDone`` ONLY on a clean terminal outcome.
-    ///
-    /// MainActor-isolated (the whole store is `@MainActor`), so every read/write of
-    /// `loadedCount` / `loadedOffset` / `initialFillDone` / `isFillingInitial`
-    /// happens on the actor — no data races under Swift 6 strict concurrency.
-    private func runInitialFill(generation: Int) async {
-        // Drop the in-flight flag on EVERY exit so a later refresh() can re-kick a
-        // fill that ended without latching `initialFillDone` (abort / error / cancel).
-        defer { isFillingInitial = false }
-
-        while visibleSessions.count < Self.initialVisibleTarget {
-            // Cancelled by resetInitialFill() (server change) or task cancellation:
-            // bail WITHOUT latching done so a re-connect re-fills the new server.
-            guard generation == fillGeneration, !Task.isCancelled else { return }
-            // Server exhausted before the target: clean terminal outcome — latch
-            // done so a <30-human-Recents gateway never spins on every refresh().
-            // An UNKNOWN total is NOT exhaustion (release audit): a payload
-            // that omits `total` must keep paging — the no-progress guard
-            // below is the reliable exhaustion signal in that case.
-            if let total = totalSessions, loadedCount >= total {
-                initialFillDone = true
-                return
-            }
-
-            let priorLoaded = loadedCount
-            let priorUniverseRevision = sessionListUniverseRevision
-            let newLimit = loadedCount + Self.pageSize
-            do {
-                let page = try await resolvedInitialFillFetch(limit: newLimit)
-                // Re-check the generation AFTER the await: a server change while the
-                // page was in flight must discard it (never append onto the reset
-                // list). A sibling refresh()'s `refreshToken` bump is deliberately
-                // NOT checked — that is the whole point of decoupling the fill.
-                guard generation == fillGeneration, !Task.isCancelled else { return }
-                // Heartbeat-composition guard (BUG-B partner): a heartbeat /
-                // gateway.ready refresh() may have run its FIRST-PAGE replace while
-                // this page was in flight, resetting `loadedCount` (its window is
-                // `max(100, loadedFloor, loadedCount)`, so it never shrinks below the
-                // fill's progress — but it can land between our limit-compute and append).
-                // If `loadedCount` OR the server-universe revision no longer
-                // matches what we paged from, this page is for a stale window:
-                // skip the append and re-loop to recompute a fresh `newLimit`.
-                // The revision catches same-sized first-page replacements and
-                // unseen tombstones that cursor math alone cannot observe.
-                guard loadedCount == priorLoaded,
-                      sessionListUniverseRevision == priorUniverseRevision else { continue }
-                mergeSessionPage(page.sessions, total: page.total, isAppend: true)
-                loadedOffset = loadedCount
-                // Raise the high-water floor so a later first-page refresh re-fetches
-                // at least this many rows (keeps the target visible after the fill).
-                loadedFloor = max(loadedFloor, loadedCount)
-            } catch {
-                // A mid-loop page failure is non-fatal and NOT terminal: surface the
-                // error and stop, leaving `initialFillDone == false` so the next
-                // refresh() re-kicks the fill (the old code latched done here, so a
-                // single transient error abandoned the fill permanently).
-                // Cancellation routes through the shared seam so a torn-down fill
-                // never surfaces a false error row (#208).
-                recordRefreshFailure(error)
-                return
-            }
-
-            // No-progress guard: a server that keeps returning the same window
-            // (loadedCount didn't advance) would otherwise loop forever. Treat it
-            // as exhausted and latch done.
-            if loadedCount <= priorLoaded {
-                initialFillDone = true
-                return
-            }
-        }
-
-        // Target met — clean terminal outcome.
-        initialFillDone = true
-    }
-
-    /// Await the in-flight initial-fill task to completion. TEST SEAM ONLY: the
-    /// fill now runs on its OWN task (decoupled from `refresh()`'s `refreshToken`),
-    /// so `await refresh()` returns before the fill finishes. Tests call this to
-    /// deterministically wait for the fill instead of polling. Re-awaits a re-kicked
-    /// fill (detected via the still-in-flight flag) so a retry is waited out too.
-    func awaitInitialFillForTesting() async {
-        // `Task` is a value type (no identity), so loop on the in-flight flag: await
-        // the current task, and if a fresh fill is still running afterward (a re-kick
-        // replaced the task while we awaited), await that one too. Bounded: each
-        // settled fill either latches `initialFillDone` or drops `isFillingInitial`.
-        while let task = initialFillTask {
-            await task.value
-            if !isFillingInitial { break }
-        }
-    }
-
-    /// Test seam for priming pagination invariants around delta refreshes.
     #if DEBUG
-    func setPaginationForTesting(loadedCount: Int, loadedOffset: Int, total: Int?) {
-        self.loadedCount = loadedCount
-        self.loadedOffset = loadedOffset
-        self.totalSessions = total
-    }
-
-    /// Read-only accessor to the wired connection so tests can seed a ready
-    /// transport (`ConnectionStore._seedConnectedForTesting`) without threading the
-    /// store through their own graph builder.
+    /// Test access to the connection wired by ``attach(connection:chat:)``.
     var connectionForTesting: ConnectionStore? { connection }
 
-    /// Stamp the active runtime binding (id + the transport epoch it was minted
-    /// under) exactly as a live resume would, so the `ensureActiveRuntime`
-    /// fast-path — which now requires a transport-ready connection AND a matching
-    /// epoch (#210) — is deterministically exercisable without a gateway.
+    /// Test-only runtime binding used to exercise reconnect self-healing.
     func _bindActiveRuntimeForTesting(id: String, epoch: UInt64) {
         activeRuntimeId = id
         activeRuntimeEpoch = epoch
     }
     #endif
-
-    /// Resolve the page fetch for ``runInitialFill(generation:)``: the injected
-    /// ``initialFillFetch`` seam in tests, else the live grow-limit fetch on the
-    /// SAME rail the first page used — the aggregate `profileSessions` rail when
-    /// multi-profile is active (fill30), otherwise the single `sessionsWithTotal`
-    /// rail. `nil` REST (unconfigured) throws so the loop surfaces an error and
-    /// unlatches rather than silently latching done.
-    private func resolvedInitialFillFetch(limit: Int) async throws
-        -> (sessions: [SessionSummary], total: Int?) {
-        if let filler = initialFillFetch {
-            return try await filler(limit)
-        }
-        guard let rest = connection?.rest else { throw GatewayError.notConnected }
-        if usesAggregateRail {
-            // Grow-limit on the aggregate rail so the fill pages the SAME list the
-            // first-page replace populated (otherwise the fill's appended single-rail
-            // rows would not match the aggregate window and dedupe would misbehave).
-            let result = try await rest.profileSessions(
-                profile: DefaultsKeys.allProfilesScope, limit: limit,
-                excludeSource: Self.recentsExcludeSources
-            )
-            return (result.sessions, result.total)
-        }
-        return try await rest.sessionsWithTotal(
-            limit: limit, minMessages: 1, excludeSource: Self.recentsExcludeSources
-        )
-    }
-
-    // MARK: - Heartbeat (UX1)
-
-    /// Start the 30-second foreground heartbeat. A no-op if already running.
-    /// Safe to call multiple times (idempotent via the `heartbeatTask` guard).
-    /// Each tick calls `refresh()`, which bumps `refreshToken` and uses the
-    /// ABH-86 stale-token guard — so a slow prior response is always discarded.
-    func startHeartbeat() {
-        guard heartbeatTask == nil else { return }
-        heartbeatTask = Task { [weak self] in
-            while !Task.isCancelled {
-                try? await Task.sleep(for: .seconds(Self.heartbeatInterval))
-                guard !Task.isCancelled, let self else { return }
-                await self.refresh()
-            }
-        }
-    }
-
-    /// Stop the foreground heartbeat (called when the scene goes background or inactive).
-    func stopHeartbeat() {
-        heartbeatTask?.cancel()
-        heartbeatTask = nil
-    }
-
-    /// React to a scene-phase change: start the heartbeat when the scene is active
-    /// (`isActive == true`), stop it otherwise.
-    ///
-    /// Pass `isActive: scenePhase == .active` from the caller. The `SessionStore`
-    /// is Foundation-only and does not import SwiftUI, so `ScenePhase` is not
-    /// directly referenced here — the caller resolves it.
-    ///
-    /// Called by the app root's `.onChange(of: scenePhase)` handler.
-    func handleScenePhaseActive(_ isActive: Bool) {
-        if isActive {
-            startHeartbeat()
-        } else {
-            stopHeartbeat()
-        }
-    }
-
-    /// Trigger an immediate first-page refresh when the drawer opens. Reuses the
-    /// ABH-86 coalescing seam (bumps `refreshToken`, discards stale responses) so
-    /// a rapid drawer-open + heartbeat tick within 30s collapses to one fetch.
-    func drawerOpenRefresh() {
-        Task { [weak self] in await self?.refresh() }
-    }
 
     // MARK: - Profiles (F4b — switcher data, feature-detected)
 
@@ -3635,11 +2679,6 @@ final class SessionStore {
         // `sessions.isEmpty` guard would skip the disk re-paint and the user
         // would see the OLD profile's rows until the network returns.
         sessions = []
-        loadedCount = 0
-        loadedOffset = 0
-        loadedFloor = 0  // ABH review P2: don't carry the prior profile's high-water
-                         // window into the new profile's first-page fetch (over-fetch).
-        seenServerSessionIds = []  // ABH-373
         // A profile switch invalidates all in-flight selection work. The
         // durable selection remains available through cache restoration, but a
         // late old-profile resume/transcript must not publish here.
@@ -4262,8 +3301,7 @@ final class SessionStore {
                         workGeneration: transcriptWorkGeneration,
                         transportEpoch: transcriptTransportEpoch
                     )
-                    // Surface the chain-tip row in the drawer NOW rather than
-                    // on the next 30s heartbeat (release audit P2).
+                    // Surface the chain-tip row in the drawer immediately.
                     Task { [weak self] in await self?.refresh() }
                 }
                 self.lastError = nil
@@ -5638,19 +4676,8 @@ final class SessionStore {
     /// `connection?.rest` path (same as the existing `refresh()` body); tests
     /// inject a closure that answers with a preset list (or throws) without a
     /// live gateway. The closure returns a tuple of `(sessions, total?)` so
-    /// tests can also verify that `totalSessions` is decoded and exposed.
+    /// tests can verify snapshot reconciliation without a live gateway.
     var sessionsFetch: (() async throws -> (sessions: [SessionSummary], total: Int?))?
-
-    /// Injectable seam for the plugin session-list delta endpoint. The first
-    /// parameter is the previously stored cursor, if any; the second is the
-    /// grow-limit window size requested for this refresh.
-    var sessionListDeltaFetch: ((String?, Int) async throws -> SessionListDeltaResult?)?
-
-    /// Injectable seam for the initial-fill grow-limit loop (Bug B). Each call
-    /// pops the next page from the array, letting tests stage multiple pages
-    /// without a live REST client. `nil` = live REST path. The closure receives
-    /// the requested `limit` so tests can assert on grow-limit semantics.
-    var initialFillFetch: ((Int) async throws -> (sessions: [SessionSummary], total: Int?))?
 
     /// REST fetch backing ``seedTranscript(storedId:profile:token:)``, injected for
     /// tests (mirrors `ChatStore.backfillFetch`). In the app it resolves the
@@ -6317,20 +5344,9 @@ struct SessionActionError: Identifiable, Equatable {
     let message: String
 }
 
-// MARK: - Projects overview (ABH-351 SLICE 2)
+// MARK: - Projects
 
-/// ABH-351 (SLICE 2) — read-only Projects browsing for the drawer's Projects tab.
-///
-/// Fetches the projects overview from the slice-1 REST route
-/// (`GET /api/plugins/hermes-mobile/projects`) — the merged user-created +
-/// auto-discovered git-repo-roots + session-cwds list, junk-filtered, reshaped
-/// to `{id, label, root, session_count}`. The store exposes the fetched list
-/// plus designed loading / empty / error states, and derives per-project
-/// sessions from ``SessionStore`` (a project's sessions are the ones whose
-/// `cwd` matches the project's `root`).
-///
-/// This slice is READ-ONLY browsing + session-start ONLY. Create-project /
-/// attach-folders / set-idea is a FAST-FOLLOW and lives outside this store.
+/// Projects browsing backed by the stock gateway project RPCs.
 ///
 /// The store is `@Observable` + `@MainActor`, mirroring the app's other store
 /// shape (``SessionStore``, ``ConnectionStore``). It owns NO back-references at
@@ -6342,7 +5358,7 @@ final class ProjectsStore {
 
     // MARK: - Published state
 
-    /// The fetched projects overview (slice-1 route payload), or `nil` before
+    /// The fetched projects overview, or `nil` before
     /// the first successful load completes. An empty array IS a valid loaded
     /// state (no projects discovered) and renders a designed empty state, NOT
     /// this `nil` placeholder.
@@ -6359,7 +5375,7 @@ final class ProjectsStore {
     // MARK: - Per-project sessions (ABH-407)
 
     /// Server-scoped session lists for Project detail, keyed by ``Project/id``.
-    /// Populated by ``refreshSessions(for:)`` via `GET /api/sessions?cwd_prefix=…`
+    /// Populated by ``refreshSessions(for:)`` via `projects.project_sessions`
     /// — independent of ``SessionStore/sessions`` (the global drawer Recents list)
     /// so a project fetch can never corrupt Recents or the active session state.
     private(set) var projectSessionsById: [String: [SessionSummary]] = [:]
@@ -6371,15 +5387,12 @@ final class ProjectsStore {
     /// Cleared on the next successful fetch for that project.
     private(set) var projectSessionsErrorById: [String: String] = [:]
 
-    /// Testing seam: when set, ``refreshSessions(for:)`` calls this instead of
-    /// hitting the network via `connection?.rest` — mirrors
-    /// ``SessionStore/sessionsFetch``. Lets tests prove the store renders
-    /// exactly the (stubbed) server-scoped response without a live gateway.
-    var sessionsFetch: ((Project) async throws -> (sessions: [SessionSummary], total: Int?))?
+    /// Narrow test seam for the stock JSON-RPC boundary.
+    var gatewayRequest: ((String, JSONValue) async throws -> JSONValue)?
 
     // MARK: - Back-reference (injected by AppEnvironment)
 
-    /// The connection store, for REST access. `nil` until
+    /// The connection store, for gateway access. `nil` until
     /// ``attach(connection:)`` is called by the composition root.
     private var connection: ConnectionStore?
 
@@ -6398,11 +5411,32 @@ final class ProjectsStore {
 
     init() {}
 
-    /// Inject the connection store (REST access). Called once by
+    /// Inject the connection store. Called once by
     /// ``AppEnvironment`` after the store graph is built — mirrors the
     /// attach-pattern the other stores use (``SessionStore/attach`` etc.).
     func attach(connection: ConnectionStore) {
         self.connection = connection
+    }
+
+    private func request<T: Decodable & Sendable>(
+        _ method: String,
+        params: JSONValue = .object([:])
+    ) async throws -> T {
+        let raw: JSONValue
+        if let gatewayRequest {
+            raw = try await gatewayRequest(method, params)
+        } else if let connection {
+            raw = try await connection.client.requestRaw(method, params: params)
+        } else {
+            throw GatewayError.notConnected
+        }
+        guard let decoded = raw.decoded(as: T.self) else {
+            throw GatewayError.decoding(
+                method: method,
+                underlying: "result did not match \(T.self)"
+            )
+        }
+        return decoded
     }
 
     /// Inject the offline cache + its scope provider, and immediately seed the
@@ -6431,7 +5465,7 @@ final class ProjectsStore {
 
     // MARK: - Fetch
 
-    /// Fetch the projects overview from the slice-1 REST route and update
+    /// Fetch the projects overview from the stock gateway and update
     /// ``projects`` / ``isLoading`` / ``loadError``.
     ///
     /// Safe to call repeatedly (drawer-open refresh, pull-to-refresh). A fetch
@@ -6439,7 +5473,7 @@ final class ProjectsStore {
     /// ``loadError`` and leave the last successful ``projects`` intact so the
     /// UI doesn't flicker on a transient network blip.
     func refresh() async {
-        guard let rest = connection?.rest else {
+        guard connection != nil || gatewayRequest != nil else {
             // Offline: paint from disk so cold launch shows the last-known
             // projects instead of a blank "Not connected" list.
             await seedFromCache()
@@ -6449,15 +5483,11 @@ final class ProjectsStore {
         isLoading = true
         defer { isLoading = false }
         do {
-            let data = try await rest.get(
-                path: "\(rest.mobileAPIPrefix)/projects"
+            let payload: StockProjectTreePayload = try await request(
+                "projects.tree",
+                params: .object(["preview_limit": .number(3)])
             )
-            // The route returns a bare JSON array (see test_projects_route.py);
-            // decode with default keys (no snake_case conversion needed — the
-            // keys are already lowercase with underscores).
-            let decoded = try JSONDecoder().decode(
-                [Project].self, from: data
-            )
+            let decoded = payload.projects.map(\.project)
             projects = decoded
             loadError = nil
             // Write-through: persist the fresh list so the next cold/offline
@@ -6491,7 +5521,7 @@ final class ProjectsStore {
         case failure(String)
     }
 
-    /// Create a project via the plugin `POST /projects` route, then refresh the
+    /// Create a project via the stock `projects.create` RPC, then refresh the
     /// overview so the new project appears in the list. Never throws — failures
     /// come back as ``CreateResult/failure`` for the sheet to surface.
     func createProject(name: String, root: String) async -> CreateResult {
@@ -6499,9 +5529,18 @@ final class ProjectsStore {
         let trimmedRoot = root.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmedName.isEmpty else { return .failure("Project name is required.") }
         guard !trimmedRoot.isEmpty else { return .failure("Root folder path is required.") }
-        guard let rest = connection?.rest else { return .failure("Not connected") }
+        guard connection != nil || gatewayRequest != nil else { return .failure("Not connected") }
         do {
-            let project = try await rest.createProject(name: trimmedName, root: trimmedRoot)
+            let payload: StockProjectCreatePayload = try await request(
+                "projects.create",
+                params: .object([
+                    "name": .string(trimmedName),
+                    "primary_path": .string(trimmedRoot),
+                ])
+            )
+            guard let project = payload.project?.project else {
+                return .failure("The gateway did not return the created project.")
+            }
             await refresh()
             return .created(project)
         } catch {
@@ -6511,52 +5550,8 @@ final class ProjectsStore {
         }
     }
 
-    /// Testing seam: overrides the retry backoff in ``refreshSessions(for:)``
-    /// so unit tests don't burn wall-clock time on the real delay. `nil` (the
-    /// production default) uses ``projectSessionsRetryDelayNanoseconds``.
-    var projectSessionsRetryDelayOverrideNanoseconds: UInt64?
-
-    /// Delay before the single automatic retry in ``refreshSessions(for:)``.
-    /// Short and fixed (not exponential) — this covers a sub-second gateway
-    /// respawn window (PROJECTS-401), not a sustained outage; the manual
-    /// "Retry" affordance in the detail view's error row handles anything
-    /// longer.
-    private static let projectSessionsRetryDelayNanoseconds: UInt64 = 600_000_000
-
-    /// `true` for a failure the gateway can recover from within the same
-    /// respawn window: a 401/403 (device-token auth racing plugin-route
-    /// registration during a crash-respawn — PROJECTS-401), any 5xx, or a
-    /// transport-level failure (timeout / dropped connection). Treated
-    /// exactly like the legacy "gateway too old" 404 — fall back to the
-    /// `cwd_prefix` path, and retry the whole two-tier fetch once.
-    ///
-    /// NOT transient: 4xx other than 401/403/404 (a genuinely malformed
-    /// request) and decode failures (a real contract mismatch) — those
-    /// propagate immediately so the designed error state stays honest.
-    static func isTransientProjectSessionsFailure(_ error: Error) -> Bool {
-        switch error {
-        case RestError.badStatus(let status, _):
-            return status == 401 || status == 403 || status == 404 || (500...599).contains(status)
-        case RestError.network:
-            return true
-        default:
-            return false
-        }
-    }
-
-    /// The detail view's error row copy for `error`. Transient failures (see
-    /// ``isTransientProjectSessionsFailure(_:)``) get directional copy — the
-    /// user should just retry, a raw "HTTP 401" is not actionable — everything
-    /// else keeps its specific message.
-    static func projectSessionsErrorMessage(for error: Error) -> String {
-        guard isTransientProjectSessionsFailure(error) else {
-            return (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
-        }
-        return "Reconnecting to gateway — retry"
-    }
-
-    /// Fetch a project's sessions from the server with `cwd_prefix=project.root`
-    /// (ABH-407) and update ``projectSessionsById`` / ``projectSessionsLoadingIds``
+    /// Fetch a project's sessions from the stock gateway's project ownership
+    /// tree and update ``projectSessionsById`` / ``projectSessionsLoadingIds``
     /// / ``projectSessionsErrorById`` for that project's id. This is the primary
     /// Project detail data source — it does NOT touch ``SessionStore/sessions``
     /// (the global drawer Recents list) or the active session state.
@@ -6566,33 +5561,12 @@ final class ProjectsStore {
     /// successful list for this project intact so the UI doesn't flicker on a
     /// transient network blip.
     func refreshSessions(for project: Project) async {
-        let fetch: () async throws -> (sessions: [SessionSummary], total: Int?)
-        if let sessionsFetch {
-            fetch = { try await sessionsFetch(project) }
-        } else {
-            guard let rest = connection?.rest else {
-                // Offline: paint from the per-project cache snapshot if we have
-                // one, so cold-launch detail isn't a blank "Not connected" wall.
-                await seedProjectSessionsFromCache(for: project)
-                if projectSessionsById[project.id] == nil {
-                    projectSessionsErrorById[project.id] = "Not connected"
-                }
-                return
+        guard connection != nil || gatewayRequest != nil else {
+            await seedProjectSessionsFromCache(for: project)
+            if projectSessionsById[project.id] == nil {
+                projectSessionsErrorById[project.id] = "Not connected"
             }
-            // Primary: the plugin's folded project-sessions route (matches the
-            // count). Fall back to the legacy cwd_prefix path on a 404 (gateway
-            // too old to serve the plugin route) OR a transient failure — a
-            // 401/403/5xx/timeout observed during a gateway crash-respawn
-            // window (PROJECTS-401: device-token auth can race plugin-route
-            // registration on a fresh process). A non-transient failure
-            // propagates so the designed error state is honest.
-            fetch = {
-                do {
-                    return try await rest.projectSessions(projectId: project.id)
-                } catch let error where Self.isTransientProjectSessionsFailure(error) {
-                    return try await rest.sessionsWithTotal(cwdPrefix: project.root)
-                }
-            }
+            return
         }
         // Seed instantly from the per-project cache snapshot so the detail view
         // paints before the network returns (write-through repaints on success).
@@ -6600,57 +5574,19 @@ final class ProjectsStore {
         projectSessionsLoadingIds.insert(project.id)
         defer { projectSessionsLoadingIds.remove(project.id) }
         do {
-            let result = try await fetchProjectSessionsWithRetry(fetch)
-            // S10 (QA-3): never accept a fallback `[]` as authoritative when
-            // the project overview's `sessionCount > 0`. The overview count
-            // comes from the same `_build_project_tree` machinery that folds
-            // worktrees, so a non-zero count is authoritative — a `[]` here
-            // means the detail query's cwd_prefix path missed worktree cwds
-            // (the server fix in `_cwd_prefix_clause` closes this; this is the
-            // iOS-side defensive backstop while the plugin response propagates).
-            // Treat an empty-list-when-count>0 as a transient failure so the
-            // detail surfaces a "Reconnecting to gateway — retry" state rather
-            // than a lying "No sessions yet" (IMG_2593). Preserve any prior
-            // non-empty list so the UI doesn't flicker to empty on a blip.
-            if result.sessions.isEmpty && project.sessionCount > 0 {
-                if projectSessionsById[project.id] == nil {
-                    projectSessionsErrorById[project.id] = Self.projectSessionsEmptyButCountedMessage
-                }
-                return
-            }
-            projectSessionsById[project.id] = result.sessions
+            let payload: StockProjectSessionsPayload = try await request(
+                "projects.project_sessions",
+                params: .object(["project_id": .string(project.id)])
+            )
+            let sessions = payload.project?.sessions ?? []
+            projectSessionsById[project.id] = sessions
             projectSessionsErrorById[project.id] = nil
-            writeThroughProjectSessions(result.sessions, for: project)
+            writeThroughProjectSessions(sessions, for: project)
         } catch {
             if projectSessionsById[project.id] == nil {
-                projectSessionsErrorById[project.id] = Self.projectSessionsErrorMessage(for: error)
+                projectSessionsErrorById[project.id] =
+                    (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
             }
-        }
-    }
-
-    /// S10: surfaced copy when the detail fetch returned `[]` but the project
-    /// overview's `sessionCount > 0`. Same directional copy as a transient
-    /// failure — the user should retry; a lying "No sessions yet" is not
-    /// actionable. Distinct constant so a test can pin the contract.
-    static let projectSessionsEmptyButCountedMessage = "Reconnecting to gateway — retry"
-
-    /// Runs `fetch` (which already carries the 404/transient → `cwd_prefix`
-    /// fallback above); on a transient failure from THAT combined attempt,
-    /// waits one short fixed backoff and retries the whole thing exactly
-    /// once before giving up. Covers the case where a gateway respawn window
-    /// outlasts both the primary and fallback request in the same call.
-    private func fetchProjectSessionsWithRetry(
-        _ fetch: () async throws -> (sessions: [SessionSummary], total: Int?)
-    ) async throws -> (sessions: [SessionSummary], total: Int?) {
-        do {
-            return try await fetch()
-        } catch {
-            guard Self.isTransientProjectSessionsFailure(error) else { throw error }
-            let delay = projectSessionsRetryDelayOverrideNanoseconds ?? Self.projectSessionsRetryDelayNanoseconds
-            if delay > 0 {
-                try? await Task.sleep(nanoseconds: delay)
-            }
-            return try await fetch()
         }
     }
 
@@ -6693,65 +5629,83 @@ final class ProjectsStore {
         projectSessionsErrorById[project.id]
     }
 
-    // MARK: - Derived queries
+}
 
-    /// Client-side fallback/test utility: the sessions belonging to a project
-    /// filtered from an already-loaded ``SessionStore`` by matching `cwd` to the
-    /// project's `root` (exact match on the trimmed path, case-insensitive,
-    /// trailing-slash-insensitive). ABH-407 moved Project detail's primary data
-    /// source to the server-side ``sessions(for:)`` / ``refreshSessions(for:)``
-    /// pair above (`cwd_prefix` query) — this method is kept for tests and as a
-    /// fallback utility, not as the detail view's data source.
-    ///
-    /// Returns `[]` when the session list hasn't loaded yet (a designed
-    /// loading/empty state in the detail view, not a silent zero).
-    func sessions(for project: Project, in sessionStore: SessionStore) -> [SessionSummary] {
-        let root = Self.normalizedPath(project.root)
-        guard !root.isEmpty else { return [] }
-        return sessionStore.sessions.filter {
-            Self.normalizedPath($0.cwd ?? "") == root
-        }
+private struct StockProjectTreePayload: Decodable, Sendable {
+    let projects: [StockProjectTreeNode]
+}
+
+private struct StockProjectSessionsPayload: Decodable, Sendable {
+    let project: StockProjectTreeNode?
+}
+
+private struct StockProjectTreeNode: Decodable, Sendable {
+    let id: String
+    let label: String
+    let path: String?
+    let sessionCount: Int
+    let repos: [StockProjectRepo]?
+
+    var project: Project {
+        Project(
+            id: id,
+            label: label,
+            root: path ?? repos?.first?.path ?? id,
+            sessionCount: sessionCount
+        )
     }
 
-    /// Normalize a filesystem path for cwd matching: trimmed, trailing slashes
-    /// stripped, case-folded. Empty / whitespace-only → "" (never matches).
-    static func normalizedPath(_ path: String) -> String {
-        var value = path.trimmingCharacters(in: .whitespacesAndNewlines)
-        while value.count > 1 && value.hasSuffix("/") { value.removeLast() }
-        return value.lowercased()
+    var sessions: [SessionSummary] {
+        (repos ?? []).flatMap { repo in
+            (repo.groups ?? []).flatMap { $0.sessions ?? [] }
+        }
     }
 }
 
-/// One entry in the projects overview (the slice-1 route's `{id, label, root,
-/// session_count}` contract).
-///
-/// `id` and `root` are both the repo root path (stable identity, matching how
-/// the desktop keys project entries). `session_count` is the number of sessions
-/// whose cwd resolved to that repo root (server-side count; the iOS client
-/// re-derives the live list from ``SessionStore`` for the detail view).
-struct Project: Decodable, Identifiable, Sendable, Equatable, Hashable {
+private struct StockProjectRepo: Decodable, Sendable {
+    let path: String?
+    let groups: [StockProjectGroup]?
+}
+
+private struct StockProjectGroup: Decodable, Sendable {
+    let sessions: [SessionSummary]?
+}
+
+private struct StockProjectCreatePayload: Decodable, Sendable {
+    let project: StockProjectInfo?
+}
+
+private struct StockProjectInfo: Decodable, Sendable {
+    let id: String
+    let name: String
+    let primaryPath: String?
+    let folders: [StockProjectFolder]?
+
+    var project: Project {
+        Project(
+            id: id,
+            label: name,
+            root: primaryPath ?? folders?.first?.path ?? id,
+            sessionCount: 0
+        )
+    }
+}
+
+private struct StockProjectFolder: Decodable, Sendable {
+    let path: String
+}
+
+/// Render projection of a stock gateway project.
+struct Project: Identifiable, Sendable, Equatable, Hashable {
     let id: String
     let label: String
     let root: String
     let sessionCount: Int
-
-    enum CodingKeys: String, CodingKey {
-        case id, label, root
-        case sessionCount = "session_count"
-    }
 
     init(id: String, label: String, root: String, sessionCount: Int) {
         self.id = id
         self.label = label
         self.root = root
         self.sessionCount = sessionCount
-    }
-
-    init(from decoder: Decoder) throws {
-        let c = try decoder.container(keyedBy: CodingKeys.self)
-        self.id = try c.decode(String.self, forKey: .id)
-        self.label = try c.decode(String.self, forKey: .label)
-        self.root = try c.decode(String.self, forKey: .root)
-        self.sessionCount = try c.decode(Int.self, forKey: .sessionCount)
     }
 }
