@@ -472,6 +472,17 @@ def foreground_device_ids_for_session(stored_session_id: Any) -> Set[str]:
         }
 
 
+def foreground_devices_by_session() -> Dict[str, List[str]]:
+    """Snapshot live phone foreground selections for relay push gating."""
+    with _ws_index_lock:
+        result: Dict[str, List[str]] = {}
+        for device_id, stored_id in _device_foreground_sessions.items():
+            if not _ws_device_sockets.get(device_id):
+                continue
+            result.setdefault(stored_id, []).append(device_id)
+        return result
+
+
 def _normalize_session_id(session_id: Any) -> str:
     return session_id.strip() if isinstance(session_id, str) else ""
 

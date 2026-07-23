@@ -55,6 +55,50 @@ def test_recipient_filter_excludes_only_selected_device(monkeypatch, tmp_path):
     ) == {"sandbox": ["b" * 64]}
 
 
+def test_live_relay_claim_suppresses_duplicate_in_process_alert(monkeypatch, tmp_path):
+    _isolate_home(monkeypatch, tmp_path)
+    push = load_plugin_module("push_engine")
+    push._RELAY_OWNER_UNTIL = 0.0
+    calls = []
+    monkeypatch.setattr(push, "_push_hook", lambda *args: calls.append(args))
+
+    assert push.claim_relay_notification_ownership(15) == 15
+    push.handle_gateway_event("message.complete", "sid", {"text": "done"})
+
+    assert push.relay_owns_notifications()
+    assert calls == []
+    push._RELAY_OWNER_UNTIL = 0.0
+
+
+def test_live_relay_claim_keeps_local_interrupt_cleanup(monkeypatch, tmp_path):
+    _isolate_home(monkeypatch, tmp_path)
+    push = load_plugin_module("push_engine")
+    monkeypatch.setattr(push, "_RELAY_OWNER_UNTIL", 0.0)
+    calls = []
+    monkeypatch.setattr(push, "_push_hook", lambda *args: calls.append(args))
+
+    push.claim_relay_notification_ownership(15)
+    push.handle_gateway_event("session.interrupt", "sid", None)
+
+    assert calls == [("session.interrupt", "sid", None)]
+
+
+def test_relay_notification_claim_expires_to_plugin_fallback(
+    monkeypatch, tmp_path
+):
+    _isolate_home(monkeypatch, tmp_path)
+    push = load_plugin_module("push_engine")
+    now = [100.0]
+    monkeypatch.setattr(push.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(push, "_RELAY_OWNER_UNTIL", 0.0)
+
+    push.claim_relay_notification_ownership(15)
+    assert push.relay_owns_notifications() is True
+
+    now[0] = 116.0
+    assert push.relay_owns_notifications() is False
+
+
 def test_error_event_notifies_turn_error_kind(monkeypatch, tmp_path):
     _isolate_home(monkeypatch, tmp_path)
     push = load_plugin_module("push_engine")

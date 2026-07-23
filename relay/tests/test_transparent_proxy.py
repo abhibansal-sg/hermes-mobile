@@ -146,3 +146,16 @@ async def test_stock_proxy_preserves_validated_device_identity(
     assert response.status_code == 207
     assert observed["ws_token"] == "device-secret"
     assert observed["http_token"] == "device-secret"
+
+
+def test_health_status_can_include_notification_readiness():
+    relay = DownstreamServer(
+        DownstreamConfig(auth_token="phone-secret"),
+        GatewayConfig(token="gateway-secret"),
+    )
+    relay.extend_status(lambda: {"connected": True, "claimed": True})
+
+    assert relay.status()["notifications"] == {
+        "connected": True,
+        "claimed": True,
+    }
