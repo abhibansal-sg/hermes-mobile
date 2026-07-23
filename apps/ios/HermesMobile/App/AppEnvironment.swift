@@ -502,8 +502,6 @@ final class VoiceConversationAutoSpeakCoordinator {
         chat: ChatStore,
         controller: VoiceConversationController
     ) async {
-        guard !UITestAudioGuard.isUITestAudioMuted else { return }
-
         let reply = chat.latestCompletedAssistantReply(excluding: lastSpokenAssistantReplyId)
         if let reply {
             lastSpokenAssistantReplyId = reply.id

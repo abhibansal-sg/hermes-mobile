@@ -515,7 +515,16 @@ struct ComposerView: View {
         .opacity((isCapturing || voice.isEnabled) ? 0 : 1)
         .accessibilityHidden(isCapturing || voice.isEnabled)
         .overlay {
-            if isCapturing {
+            if voice.isEnabled {
+                // Conversation mode uses the same recorder as dictation, so it
+                // must win while that recorder is actively capturing.
+                ConversationModeStrip(
+                    controller: voice,
+                    onMute: { Task { await voice.toggleMute() } },
+                    onDoneTalking: { Task { await voice.stopTurn(forceTranscribe: true) } },
+                    onHardStop: { voice.end() }
+                )
+            } else if isCapturing {
                 RecordingStrip(
                     recorder: recorder,
                     isHoldMode: recorder.isHoldToTalk,
@@ -532,16 +541,6 @@ struct ComposerView: View {
                         resetHoldState()
                         stopAndTranscribe()
                     }
-                )
-            } else if voice.isEnabled {
-                // Same field+actionRow-stays-mounted pattern as isCapturing above:
-                // conversation mode's own controls are plain buttons (no in-flight
-                // gesture to preserve), so overlaying is purely a visual takeover.
-                ConversationModeStrip(
-                    controller: voice,
-                    onMute: { Task { await voice.toggleMute() } },
-                    onDoneTalking: { Task { await voice.stopTurn(forceTranscribe: true) } },
-                    onHardStop: { voice.end() }
                 )
             }
         }
@@ -883,6 +882,7 @@ struct ComposerView: View {
                 .background {
                     Capsule().strokeBorder(theme.border, lineWidth: 1)
                 }
+                .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
         .disabled(!isConnected)
