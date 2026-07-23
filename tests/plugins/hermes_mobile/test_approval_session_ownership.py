@@ -178,6 +178,62 @@ def test_paired_phone_can_resolve_shared_desktop_attention(
         gateway._answers.pop("desktop-clarify", None)
 
 
+def test_approval_respond_allows_paired_device_after_owner_socket_disconnect(
+    client, devices, clean_gateway_sessions, monkeypatch
+):
+    """Pin the intended live-socket ownership boundary for paired devices."""
+    owner, other = devices
+    _own_session("disconnected-owner", owner["device_id"], clean_gateway_sessions)
+    ws = gateway._sessions["disconnected-owner"]["transport"]._ws
+    device_tokens.deregister_ws_socket(owner["device_id"], ws)
+    captured = _patch_resolver(monkeypatch)
+
+    allowed = client.post(
+        f"{_PREFIX}/approvals/respond",
+        json={"session_id": "disconnected-owner", "choice": "approve"},
+        headers={"X-Hermes-Session-Token": other["token"]},
+    )
+
+    assert allowed.status_code == 200
+    assert allowed.json() == {"resolved": True}
+    assert captured[0]["audit"]["device_id"] == other["device_id"]
+
+
+def test_approval_respond_device_token_returns_404_for_unknown_session(
+    client, devices
+):
+    owner, _other = devices
+
+    missing = client.post(
+        f"{_PREFIX}/approvals/respond",
+        json={"session_id": "unknown-session", "choice": "approve"},
+        headers={"X-Hermes-Session-Token": owner["token"]},
+    )
+
+    assert missing.status_code == 404
+    assert missing.json() == {"detail": "Unknown session"}
+
+
+def test_approval_respond_device_token_fails_closed_when_socket_lookup_errors(
+    client, devices, clean_gateway_sessions, monkeypatch
+):
+    owner, _other = devices
+    _share_session("socket-lookup-error", clean_gateway_sessions)
+
+    def _raise(_ws):
+        raise RuntimeError("socket index unavailable")
+
+    monkeypatch.setattr(device_tokens, "_device_ids_for_ws_socket", _raise)
+    denied = client.post(
+        f"{_PREFIX}/approvals/respond",
+        json={"session_id": "socket-lookup-error", "choice": "approve"},
+        headers={"X-Hermes-Session-Token": owner["token"]},
+    )
+
+    assert denied.status_code == 403
+    assert denied.json() == {"detail": "Device token does not own session"}
+
+
 def test_live_activity_register_requires_device_to_own_session(
     client, devices, clean_gateway_sessions
 ):
