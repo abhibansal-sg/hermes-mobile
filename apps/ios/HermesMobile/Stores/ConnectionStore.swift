@@ -884,12 +884,9 @@ final class ConnectionStore {
     private static let backgroundCapabilityBurstStagger: Duration = .milliseconds(300)
 
     /// WS-RECONNECT-SOFTEN (a) — minimum spacing between FORCED capability
-    /// re-probes across reconnects. A forced re-probe fires 5 concurrent REST
-    /// calls (`pluginMount`, then `upload`/`fs`/`profiles`/`devices`) — needed
-    /// once per genuine drop (the gateway may have restarted on a different
-    /// build), but firing it on EVERY attempt of a rapid reconnect crash-loop
-    /// piles five requests onto a server that is already struggling to come
-    /// up. See the throttle at the `recoverActiveSession` call site.
+    /// re-probes across reconnects. A forced re-probe checks the plugin bundle
+    /// and stock profile route once per genuine drop, but not on every attempt
+    /// of a rapid reconnect loop.
     private static let capabilitiesReprobeMinInterval: Duration = .seconds(20)
 
     /// The `ContinuousClock` instant of the last FORCED capabilities re-probe
@@ -2914,7 +2911,7 @@ final class ConnectionStore {
                 guard self.isActiveGeneration(generation) else { return }
                 // Throttle repeated FORCED re-probes: a reconnect crash-loop
                 // (the gateway flapping every few seconds) would otherwise pile
-                // 5 concurrent REST calls onto the server on EVERY attempt.
+                // capability checks onto the server on every attempt.
                 // `force: false` still probes once per genuinely new server URL
                 // (the in-memory/disk cache short-circuit only applies to a
                 // server already probed this app version) — the throttle only

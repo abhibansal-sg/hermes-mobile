@@ -167,21 +167,6 @@ final class PathStyleTests: XCTestCase {
         }
     }
 
-    func testCapabilityProbesFollowTheClientStyle() async {
-        // The connect-time stage-2 probes must target the RESOLVED family —
-        // a de-patched server 404s the legacy paths, so probing legacy there
-        // would wrongly hide upload/fs/devices affordances.
-        let client = makeClient(style: .plugin, script: [(Data(), 400)])
-        _ = await client.probeUploadEndpoint()
-        _ = await client.probeFsEndpoint()
-        _ = await client.probeDevicesEndpoint()
-        XCTAssertEqual(recordedPaths, [
-            "/api/plugins/hermes-mobile/upload",
-            "/api/plugins/hermes-mobile/fs/list",
-            "/api/plugins/hermes-mobile/devices",
-        ])
-    }
-
     // MARK: - 2. Self-healing alternate-family retries
 
     func testRespondToApprovalRetriesAlternateFamilyOnRouteMiss() async {

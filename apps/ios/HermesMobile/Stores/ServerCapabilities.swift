@@ -15,12 +15,12 @@ import Foundation
 ///   - ``State/available`` — the probe (or a passive signal) confirmed support.
 ///   - ``State/unavailable`` — the probe proved the endpoint is missing.
 ///
-/// Probing strategy (cheap, cached per server URL + app version in
+/// Capability strategy (cached per server URL + app version in
 /// `UserDefaults` so reconnects don't re-probe; a `configure()` to a NEW URL or
 /// an app-version change re-probes):
-///   - **upload**: eager single probe — `POST /api/upload` with an EMPTY body.
-///     `400` ("multipart field 'file' required") ⇒ available; `404`/`405` ⇒
-///     unavailable. Zero side effects either way (no file is created).
+///   - **plugin bundle**: one mount probe proves the bundled upload, fs, and
+///     device routes together. These routes ship from the same plugin router.
+///   - **profiles**: one independent stock-route probe.
 ///   - **pushRegistry**: wired off ``PushRegistrar``'s existing 404 soft-fail —
 ///     a soft-fail ⇒ unavailable, a `2xx`/`4xx` validation response ⇒ available.
 ///   - **broadcast**: passive — marked available when the connection router sees
@@ -49,15 +49,14 @@ final class ServerCapabilities {
     /// anything else ⇒ unknown (and the path family stays `.legacy`, which is
     /// what today's live server speaks).
     private(set) var pluginMount: State = .unknown
-    /// `POST <prefix>/upload` — image attachments. Probed eagerly at connect.
+    /// `POST <prefix>/upload` — follows the plugin-mount verdict.
     private(set) var upload: State = .unknown
     /// `POST/DELETE /api/push/register` — remote push. Set from PushRegistrar.
     private(set) var pushRegistry: State = .unknown
     /// `stored_session_id` enrichment on broadcast frames. Set passively.
     private(set) var broadcast: State = .unknown
     /// `GET /api/fs/list` + `/api/fs/read` — the F4A file-browser / @-file
-    /// endpoints. Probed EAGERLY at connect (like `upload`): a `400`
-    /// ("session_id required") ⇒ available, a `404`/`405` ⇒ unavailable. Every
+    /// endpoints. Ships in the same plugin router as the mount probe. Every
     /// file-browser / working-dir / @-file affordance gates on `fs !=
     /// .unavailable` so a stock gateway shows none of them and never errors.
     private(set) var fs: State = .unknown
@@ -82,11 +81,8 @@ final class ServerCapabilities {
     /// gateway (today's live 9119) shows none of the switcher chrome and never
     /// errors — the F4b dormancy guarantee.
     private(set) var profiles: State = .unknown
-    /// The W3a per-device-token capability. Probed EAGERLY at connect (like
-    /// `fs`/`upload`/`profiles`) by hitting `GET /api/devices` — the device-token
-    /// list, the route genuinely NEW in W3a: a `200` with a well-formed
-    /// `{"devices":[…]}` body ⇒ available (even an EMPTY registry is a 200, so the
-    /// panel renders with zero rows), a `404`/`405` ⇒ unavailable.
+    /// The W3a per-device-token capability. The plugin-mount probe itself reads
+    /// the device list, so this shares the plugin-bundle verdict.
     ///
     /// EVERY Devices-section affordance (the Settings section, the revoke button,
     /// the audit view, AND the auto-upgrade issue call) gates on
@@ -174,24 +170,21 @@ final class ServerCapabilities {
         let mountState = await Self.probePluginMount(rest: rest)
         guard probedServerURL == serverURL else { return }
         pluginMount = mountState
-        let styledRest = rest.withPathStyle(resolvedPathStyle)
 
-        // Stage 2: the remaining eager probes are side-effect-free and
-        // independent; run them concurrently against the resolved family so a
-        // fresh connect pays two round-trips total, not five.
-        async let uploadProbe = Self.probeUpload(rest: styledRest)
-        async let fsProbe = Self.probeFs(rest: styledRest)
-        async let profilesProbe = Self.probeProfiles(rest: styledRest)
-        async let devicesProbe = Self.probeDevices(rest: styledRest)
-        let (uploadState, fsState, profilesState, devicesState) =
-            await (uploadProbe, fsProbe, profilesProbe, devicesProbe)
+        // Upload, file browsing, and device management are one versioned plugin
+        // bundle, not independently installed features. Do not probe three routes
+        // that the mount already proved.
+        upload = mountState
+        fs = mountState
+        devices = mountState
+
+        // Multi-profile support belongs to the stock gateway and remains the one
+        // independent route probe.
+        let profilesState = await Self.probeProfiles(rest: rest)
         // The connection (and thus serverURL) may have changed while we awaited;
         // only apply if we're still probing the same server.
         guard probedServerURL == serverURL else { return }
-        upload = uploadState
-        fs = fsState
         profiles = profilesState
-        devices = devicesState
         persist()
     }
 
@@ -282,32 +275,6 @@ final class ServerCapabilities {
         }
     }
 
-    // MARK: - Upload probe
-
-    /// `POST /api/upload` with an empty body. The patched gateway rejects the
-    /// missing multipart field with `400`; a stock gateway has no such route and
-    /// returns `404`/`405`. No file is ever created, so this is side-effect-free.
-    private nonisolated static func probeUpload(rest: RestClient) async -> State {
-        switch await rest.probeUploadEndpoint() {
-        case .available: return .available
-        case .unavailable: return .unavailable
-        case .inconclusive: return .unknown
-        }
-    }
-
-    // MARK: - FS probe
-
-    /// `GET /api/fs/list` with NO `session_id`. The patched gateway rejects the
-    /// missing required param with `400`; a stock gateway has no such route and
-    /// returns `404`/`405`. No file is read, so this is side-effect-free.
-    private nonisolated static func probeFs(rest: RestClient) async -> State {
-        switch await rest.probeFsEndpoint() {
-        case .available: return .available
-        case .unavailable: return .unavailable
-        case .inconclusive: return .unknown
-        }
-    }
-
     // MARK: - Profiles probe (F4b)
 
     /// `GET /api/profiles/sessions` (the aggregate rail, NEW at the rebase — NOT
@@ -322,25 +289,6 @@ final class ServerCapabilities {
     /// `.available`).
     private nonisolated static func probeProfiles(rest: RestClient) async -> State {
         switch await rest.probeProfilesEndpoint() {
-        case .available: return .available
-        case .unavailable: return .unavailable
-        case .inconclusive: return .unknown
-        }
-    }
-
-    // MARK: - Devices probe (W3a)
-
-    /// `GET /api/devices` (the device-token list, NEW in W3a). A W3a server
-    /// returns `200` with a well-formed `{"devices":[…]}` body (route exists ⇒
-    /// available — even an EMPTY registry is a 200, so the panel renders with
-    /// zero rows); a stock gateway has no such route and returns `404`/`405`
-    /// (unavailable). The probe is a READ (side-effect-free). Mirrors
-    /// ``probeProfiles``/``probeFs``; the tri-state mapping is identical, so a
-    /// flaky probe leaves `devices` at `.unknown` and the Devices section stays
-    /// hidden (the visibility gate requires `.available`) AND no auto-upgrade
-    /// issue call fires (it too gates on `.available`).
-    private nonisolated static func probeDevices(rest: RestClient) async -> State {
-        switch await rest.probeDevicesEndpoint() {
         case .available: return .available
         case .unavailable: return .unavailable
         case .inconclusive: return .unknown

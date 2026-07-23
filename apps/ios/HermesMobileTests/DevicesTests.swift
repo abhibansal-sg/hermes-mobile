@@ -90,16 +90,7 @@ final class DevicesTests: XCTestCase {
         super.tearDown()
     }
 
-    // MARK: - Capability probe state machine
-
-    func testProbeDevicesEndpointInconclusiveOnUnreachableHost() async {
-        // A transport failure (nothing listening) must classify inconclusive,
-        // never throw — so a flaky probe leaves `devices` at `.unknown`, the
-        // Devices section stays hidden, AND no auto-upgrade issue call fires.
-        let rest = RestClient(baseURL: URL(string: "http://127.0.0.1:1")!, token: "t")
-        let result = await rest.probeDevicesEndpoint()
-        XCTAssertEqual(result, .inconclusive)
-    }
+    // MARK: - Capability state
 
     func testProbeClassificationByStatusAndBody() {
         // Pin the status→result classification the probe applies, incl. the body

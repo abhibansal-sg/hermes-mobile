@@ -35,10 +35,6 @@ final class DevicesLiveTests: XCTestCase {
     func testLiveIssueListRevokeRoundTrip() async throws {
         let client = try await liveClient()
 
-        // Probe must classify the W3a route as available (200 + {devices:[]}).
-        let probe = await client.probeDevicesEndpoint()
-        XCTAssertEqual(probe, .available, "W3a server should advertise /api/devices")
-
         // ISSUE — the token is returned exactly once.
         let issued = try await client.issueDevice(name: "W3A-A Live Roundtrip")
         XCTAssertFalse(issued.deviceId.isEmpty)

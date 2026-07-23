@@ -2,8 +2,8 @@ import Foundation
 
 // MARK: - F4A-A1 file-browser REST surface
 //
-// The two NEW session-cwd file endpoints (`GET /api/fs/list`, `GET /api/fs/read`)
-// plus their zero-side-effect capability probe. Kept on `RestClient` so they
+// The two session-cwd file endpoints (`GET /api/fs/list`, `GET /api/fs/read`).
+// Kept on `RestClient` so they
 // inherit the loopback `Host` override, the `X-Hermes-Session-Token` auth header,
 // the ephemeral session, and the 15s timeout (no cloned plumbing).
 //
@@ -11,34 +11,7 @@ import Foundation
 // classify the contract's meaningful non-2xx codes (403 sandbox escape, 404 not
 // a dir/file, 413 over the read cap) into typed `FSReadError`/`RestError` so the
 // viewer can show "Too large to preview" instead of a generic HTTP error. The
-// probe (`probeFsEndpoint`) never throws — it mirrors `probeUploadEndpoint`,
-// classifying the status of a deliberately-malformed request into the same
-// `UploadProbeResult` tri-state the `ServerCapabilities` `fs` field consumes.
 extension RestClient {
-
-    // MARK: - Capability probe (eager, side-effect-free)
-
-    /// Side-effect-free probe of `GET /api/fs/list`: request it with NO
-    /// `session_id`. The patched gateway returns `400 {"error":"session_id
-    /// required"}` (route exists ⇒ available); a stock gateway has no such route
-    /// and returns `404`/`405` (unavailable). No file is read. Never throws —
-    /// failures map to `.inconclusive`. Shapes its result as the SAME
-    /// ``UploadProbeResult`` the upload probe uses, so ``ServerCapabilities`` can
-    /// fold both with one switch.
-    func probeFsEndpoint() async -> UploadProbeResult {
-        let request = makeRequest(path: "\(mobileAPIPrefix)/fs/list", method: "GET")
-        do {
-            let (_, response) = try await session.data(for: request)
-            guard let http = response as? HTTPURLResponse else { return .inconclusive }
-            switch http.statusCode {
-            case 400: return .available
-            case 404, 405: return .unavailable
-            default: return .inconclusive
-            }
-        } catch {
-            return .inconclusive
-        }
-    }
 
     // MARK: - List a directory under the session cwd
 

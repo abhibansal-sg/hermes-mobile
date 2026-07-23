@@ -321,7 +321,7 @@ struct RestClient: Sendable {
         }
     }
 
-    /// Outcome of the zero-side-effect ``probeUploadEndpoint()`` capability check.
+    /// Outcome of the zero-side-effect plugin/profile capability checks.
     enum UploadProbeResult: Sendable, Equatable {
         /// `400` — the endpoint exists and rejected the missing multipart field.
         case available
@@ -334,8 +334,7 @@ struct RestClient: Sendable {
     /// Side-effect-free probe of the plugin mount itself (ABH-88): `GET
     /// /api/plugins/hermes-mobile/devices` — an ABSOLUTE path, independent of
     /// this client's ``pathStyle``. A de-patched gateway returns `200` with a
-    /// well-formed `{"devices":[…]}` body (mirrors ``probeDevicesEndpoint``'s
-    /// body check); a pre-de-patch gateway has no plugin mount and returns
+    /// well-formed `{"devices":[…]}` body; a pre-de-patch gateway has no plugin mount and returns
     /// `404`/`405`. Drives ``ServerCapabilities/pluginMount``, which selects
     /// the path family every OTHER mobile call uses.
     func probePluginMountEndpoint() async -> UploadProbeResult {
@@ -356,27 +355,6 @@ struct RestClient: Sendable {
                 return .unavailable
             default:
                 return .inconclusive
-            }
-        } catch {
-            return .inconclusive
-        }
-    }
-
-    /// Side-effect-free probe of `POST <prefix>/upload`: send an EMPTY body and
-    /// classify the status. The patched gateway rejects the absent multipart
-    /// field with `400`; a stock gateway has no route and returns `404`/`405`.
-    /// No file is ever created. Never throws — failures map to `.inconclusive`.
-    func probeUploadEndpoint() async -> UploadProbeResult {
-        let request = makeRequest(path: "\(mobileAPIPrefix)/upload", method: "POST")
-        // No body, no multipart Content-Type: the server sees a request missing
-        // the required `file` field and 400s without writing anything.
-        do {
-            let (_, response) = try await session.data(for: request)
-            guard let http = response as? HTTPURLResponse else { return .inconclusive }
-            switch http.statusCode {
-            case 400: return .available
-            case 404, 405: return .unavailable
-            default: return .inconclusive
             }
         } catch {
             return .inconclusive
