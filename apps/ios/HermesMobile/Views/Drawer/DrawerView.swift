@@ -803,14 +803,6 @@ struct DrawerView: View {
     /// not visible when the drawer opens, but a pull-down exposes it.
     private let drawerListTopAnchor = "hermes.drawer.list.top"
 
-    /// Infinite-scroll prefetch distance (rows). When a recents row within this
-    /// many rows of the end scrolls into view, `loadMore()` is kicked so the next
-    /// ~30-row batch is loading BEFORE the user reaches the bottom — the user spec
-    /// ("auto-load … as the person is about to reach the bottom", ≥30 per batch).
-    /// ~1 screenful of drawer rows; the tail `loadMoreSentinel` stays as a backstop
-    /// for short lists and the grouped path.
-    private static let loadMorePrefetchDistance = 12
-
     /// The drawer's scrolling body, now a system `List(.plain)`. Sections are
     /// system `Section`s; the cells are built from `Label`/`Button`/`Text`/`Image`
     /// system primitives. The List replaces the prior `ScrollView` +
@@ -896,9 +888,6 @@ struct DrawerView: View {
             // open animation so the final resting state is correct.
             .onAppear {
                 listProxy.scrollTo(drawerListTopAnchor, anchor: .top)
-                // UX1: also trigger an immediate first-page refresh when the drawer
-                // opens so the list is up-to-date without waiting for the next tick.
-                sessions.drawerOpenRefresh()
                 // DC-01: drawer open haptic — bump trigger so sensoryFeedback fires.
                 drawerOpenFeedbackTrigger = UUID()
             }
@@ -1068,13 +1057,10 @@ struct DrawerView: View {
                         }
                     }
                 }
-                // Infinite scroll sentinel / loading row (UX1), after all static
-                // source groups so every group's rows remain reachable.
-                loadMoreSentinel
             }
         }
         // DC-02: latch didCompleteFirstLoad once sessions arrive so the skeleton
-        // is replaced exactly once and never re-shown during a heartbeat refresh.
+        // is replaced exactly once and never re-shown during later refreshes.
         // Latched off the backing array rather than human Recents so old cached
         // non-drawer rows still prove the fetch completed and do not leave the
         // drawer stuck in skeleton state.
@@ -1128,7 +1114,6 @@ struct DrawerView: View {
             let previewCount = SessionStore.drawerCollapsedProfilePreviewCount
             ForEach(group.sessions.prefix(previewCount), id: \.scopedIdentity) { summary in
                 sessionRow(summary, pinned: false)
-                    .onAppear { maybePrefetchMore(rowId: summary.id) }
             }
             if group.sessions.count > previewCount {
                 profileGroupExpandRow(group, hiddenCount: group.sessions.count - previewCount)
@@ -1181,7 +1166,6 @@ struct DrawerView: View {
         } else {
             ForEach(group.sessions, id: \.scopedIdentity) { summary in
                 sessionRow(summary, pinned: false)
-                    .onAppear { maybePrefetchMore(rowId: summary.id) }
             }
         }
     }
@@ -1203,7 +1187,6 @@ struct DrawerView: View {
         } else {
             ForEach(group.sessions, id: \.scopedIdentity) { summary in
                 sessionRow(summary, pinned: false)
-                    .onAppear { maybePrefetchMore(rowId: summary.id) }
             }
         }
     }
@@ -1229,7 +1212,6 @@ struct DrawerView: View {
             if !isCollapsed {
                 ForEach(workspace.sessions, id: \.scopedIdentity) { summary in
                     sessionRow(summary, pinned: false)
-                        .onAppear { maybePrefetchMore(rowId: summary.id) }
                 }
             }
         }
@@ -1305,113 +1287,6 @@ struct DrawerView: View {
         }
     }
 
-    /// The "Load more" row (UX1). Replaces the former zero-height `Color.clear`
-    /// sentinel that failed to fire `.onAppear` reliably on cold launch because
-    /// SwiftUI lazy lists do not guarantee off-screen `.onAppear` delivery.
-    ///
-    /// Design: an always-tappable `Button` with real, measurable height (minimum
-    /// 36 pt) mirroring the desktop `SidebarLoadMoreRow` (sidebar/index.tsx:1159).
-    /// The button calls `loadMore()` explicitly so pagination never depends on a
-    /// re-render. An `.onAppear` is retained as a bonus auto-trigger for when the
-    /// row scrolls into view naturally.
-    ///
-    /// The row is hidden once `loadedOffset ≥ totalSessions` (server exhausted).
-    /// A stable `.id("loadMoreRow")` prevents the List from fusing it with the
-    /// ForEach above and losing the `.onAppear` on first insertion.
-    /// Near-bottom prefetch trigger for infinite scroll. Called from each recents
-    /// row's `.onAppear` (both the flat list AND the grouped-workspace layout);
-    /// when the appearing row is within ``loadMorePrefetchDistance`` of the end of
-    /// the unpinned list it kicks `loadMore()` (which pages until ≥30 NEW visible
-    /// rows land or the server is exhausted). Fires EARLY — before the user hits
-    /// the bottom — so the next batch is already arriving as they scroll into it.
-    ///
-    /// The row's position is resolved LIVE by its stable `id` against the current
-    /// `unpinnedSessions`, not a captured enumeration index — so a re-sort /
-    /// filter / pin change between render and `.onAppear` can't desync the index
-    /// from the count. Measuring against the flat `unpinnedSessions` is correct
-    /// for the grouped layout too, since grouping only reorders the same rows.
-    /// Guards against re-entrancy (`isLoadingMore`) and server-exhaustion.
-    private func maybePrefetchMore(rowId: SessionSummary.ID) {
-        guard !sessions.isLoadingMore else { return }
-        if let total = sessions.totalSessions, sessions.loadedOffset >= total { return }
-        let list = sessions.drawerSourceGroups().flatMap(\.sessions)
-        guard let index = list.firstIndex(where: { $0.id == rowId }) else { return }
-        guard index >= list.count - Self.loadMorePrefetchDistance else { return }
-        Task { await sessions.loadMore() }
-    }
-
-    @ViewBuilder
-    private var loadMoreSentinel: some View {
-        let isAtEnd: Bool = {
-            guard let total = sessions.totalSessions else { return false }
-            return sessions.loadedOffset >= total
-        }()
-        if !isAtEnd {
-            plainRow {
-                // INFINITE SCROLL (no "Load more" button): an invisible probe at the
-                // list tail. When it scrolls into view (the user nears the bottom) it
-                // auto-loads the next page — no tap. A small spinner shows only while
-                // a fetch is in flight. The `.id` is keyed on `loadedCount` so that
-                // after each page lands the probe gets a FRESH identity and its
-                // `.onAppear` RE-FIRES if it is still on screen — that is what makes
-                // it keep loading continuously as the user scrolls (the old static
-                // id fired `.onAppear` only once, so it stalled after one page).
-                HStack {
-                    Spacer(minLength: 0)
-                    if sessions.isLoadingMore {
-                        ProgressView().scaleEffect(0.7)
-                    }
-                    Spacer(minLength: 0)
-                }
-                .frame(maxWidth: .infinity, minHeight: 28)
-                .contentShape(Rectangle())
-                .accessibilityHidden(true)
-                .onAppear {
-                    guard !sessions.isLoadingMore else { return }
-                    Task { await sessions.loadMore() }
-                }
-            }
-            .id("loadMoreRow-\(sessions.loadedCount)")
-        }
-    }
-
-    /// The Recents section header title, updated for UX1 filter honesty.
-    ///
-    /// Shows one of:
-    /// - "Recents" — single page, no filters hiding rows, nothing to explain.
-    /// - "Recents · N shown · M loaded of TOTAL" — client filters (hideCron etc.)
-    ///   are hiding some fetched rows AND more pages remain on the server.
-    /// - "Recents · N shown of M loaded" — filters are hiding rows within the
-    ///   loaded set, but all server rows are loaded.
-    /// - "Recents · M of TOTAL" — no rows are hidden by filters, but more pages
-    ///   remain on the server (the original ABH-86 item 6 display).
-    ///
-    /// "loaded" = server rows fetched (`sessions.loadedCount`); "shown" = rows
-    /// visible after filters (`sessions.filteredCount`). This pairing is always
-    /// honest: hidden rows are never a mystery to the user.
-    private var recentsHeaderTitle: String {
-        let loaded = sessions.loadedCount
-        let shown  = sessions.filteredCount
-        let total  = sessions.totalSessions
-
-        let hasMoreOnServer = total.map { $0 > loaded } ?? false
-        let filtersHidingRows = loaded > 0 && shown < loaded
-
-        switch (filtersHidingRows, hasMoreOnServer) {
-        case (true, true):
-            // Filters active AND more pages available.
-            return "Recents · \(shown) shown · \(loaded) loaded of \(total!)"
-        case (true, false):
-            // Filters active, all pages loaded.
-            return "Recents · \(shown) shown of \(loaded) loaded"
-        case (false, true):
-            // No filters hiding rows, more pages remain.
-            return "Recents · \(loaded) of \(total!)"
-        case (false, false):
-            return "Recents"
-        }
-    }
-
     /// The Recents "…" filter menu. Holds the "Group by workspace" checkmark
     /// item (H2). Kept as a menu so future filters (e.g. surfacing the cron
     /// toggle here) have a home, matching the desktop sidebar's header action.
@@ -1434,54 +1309,6 @@ struct DrawerView: View {
         .buttonStyle(.plain)
         .accessibilityIdentifier("drawerRecentsFilter")
         .accessibilityLabel("Recents filter")
-    }
-
-    /// Recents grouped into per-workspace subgroups (H2). Each group renders a
-    /// collapsible folder subheader (label + chevron) as a plain row followed by
-    /// its session rows. Tapping the header collapses/expands the group; the
-    /// collapsed state is persisted in ``SessionStore`` backed by UserDefaults.
-    /// A long-press context menu on the header allows pinning/unpinning the group
-    /// to the top of the list (also persisted). Section order = pinned first,
-    /// then recency; rows within a section = `startedAt` DESC — the desktop's
-    /// exact ordering (see `SessionStore.workspaceGroups()`).
-    ///
-    /// The grouping subheaders ride INSIDE the single Recents `Section` (as plain
-    /// rows) rather than as nested `Section`s, preserving the prior two-level
-    /// hierarchy (all-caps "RECENTS" header + folder subheaders) — a `List`
-    /// cannot nest `Section`s, so the subheaders stay as `DrawerWorkspaceHeader`
-    /// rows exactly as before.
-    @ViewBuilder
-    private var groupedRecents: some View {
-        ForEach(sessions.workspaceGroups()) { group in
-            let isCollapsed = sessions.collapsedWorkspaces.contains(group.id)
-            let isPinned    = sessions.pinnedWorkspaceKeys.contains(group.id)
-            plainRow {
-                DrawerWorkspaceHeader(
-                    label: group.label,
-                    isCollapsed: isCollapsed,
-                    isPinned: isPinned
-                ) {
-                    // Collapse/expand tap: persist via store.
-                    withAnimation(.easeInOut(duration: 0.2)) {
-                        sessions.toggleCollapsed(workspaceKey: group.id)
-                    }
-                } onPin: {
-                    // Pin/unpin: also persisted via store.
-                    sessions.togglePinnedWorkspace(group.id)
-                }
-            }
-            if !isCollapsed {
-                ForEach(group.sessions, id: \.scopedIdentity) { summary in
-                    sessionRow(summary, pinned: false)
-                        // Grouped layout gets the same near-bottom prefetch as
-                        // the flat list (resolved by id against the flat
-                        // unpinned list).
-                        .onAppear { maybePrefetchMore(rowId: summary.id) }
-                }
-            }
-        }
-        // Infinite scroll sentinel — appended after all groups (UX1).
-        loadMoreSentinel
     }
 
     /// DC-02: skeleton placeholder shown during the 100–400 ms cold-load window.

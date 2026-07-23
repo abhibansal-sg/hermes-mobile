@@ -1364,10 +1364,6 @@ final class ConnectionStore {
         deviceIssueLimitReachedServers.remove(trimmedURL)
         deviceLimitAdvisory = nil
 
-        // Reset the initial-fill guard so the next refresh() after this
-        // configure re-runs the fill-to-30 loop for the new server.
-        sessionStore.resetInitialFill()
-
         phase = .connecting
 
         // S3: arm the network-path monitor BEFORE the REST probe. A cold-launch-

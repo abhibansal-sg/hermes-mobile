@@ -609,7 +609,6 @@ final class StateFlushCoordinatorTests: XCTestCase {
             dependencies: .init(
                 flushDraft: { order.append("draft") },
                 suspendOutbox: { order.append("outbox") },
-                flushSyncCursor: { order.append("cursor") },
                 flushWidgetSnapshot: { order.append("widget") },
                 flushPendingNavigation: { order.append("navigation") }
             )
@@ -620,7 +619,7 @@ final class StateFlushCoordinatorTests: XCTestCase {
         await coordinator.waitUntilIdleForTesting()
 
         XCTAssertNotNil(expiration)
-        XCTAssertEqual(order, ["draft", "outbox", "cursor", "widget", "navigation"])
+        XCTAssertEqual(order, ["draft", "outbox", "widget", "navigation"])
         XCTAssertEqual(ended, [token])
     }
 
@@ -636,7 +635,6 @@ final class StateFlushCoordinatorTests: XCTestCase {
             dependencies: .init(
                 flushDraft: { try? await Task.sleep(for: .seconds(30)) },
                 suspendOutbox: {},
-                flushSyncCursor: {},
                 flushWidgetSnapshot: {},
                 flushPendingNavigation: {}
             )

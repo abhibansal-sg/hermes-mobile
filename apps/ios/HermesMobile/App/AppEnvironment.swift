@@ -399,9 +399,6 @@ final class AppEnvironment {
             suspendOutbox: { [weak queueStore] in
                 await queueStore?.suspendForBackground()
             },
-            flushSyncCursor: { [weak sessionStore] in
-                sessionStore?.flushSessionListDeltaCursors()
-            },
             flushWidgetSnapshot: { [weak connectionStore] in
                 var patch = WidgetSnapshotWriter.Patch()
                 if case .connected = connectionStore?.phase {
