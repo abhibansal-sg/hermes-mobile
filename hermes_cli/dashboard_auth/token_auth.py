@@ -65,6 +65,9 @@ TOKEN_AUTHENTICATORS: List[
 ] = []
 IDENTITY_VALIDATORS: List[Callable[[Dict[str, Any]], bool]] = []
 SOCKET_OBSERVERS: List[Callable[[str, Dict[str, Any], Any], None]] = []
+SESSION_OWNERSHIP_CHECKERS: List[
+    Callable[[Dict[str, Any], str], Optional[bool]]
+] = []
 
 
 def match_token(token: str) -> Optional[Dict[str, Any]]:
@@ -102,6 +105,21 @@ def notify_socket(action: str, identity: Dict[str, Any], ws: Any) -> None:
             observer(action, identity, ws)
         except Exception:
             _log.debug("socket observer errored", exc_info=True)
+
+
+def identity_owns_session(identity: Any, session_id: str) -> bool:
+    """Ask the identity provider whether *identity* owns *session_id*."""
+    if not isinstance(identity, dict) or not session_id:
+        return False
+    for checker in list(SESSION_OWNERSHIP_CHECKERS):
+        try:
+            result = checker(identity, session_id)
+        except Exception:
+            _log.debug("session ownership checker errored", exc_info=True)
+            continue
+        if result is not None:
+            return bool(result)
+    return False
 
 
 def register_token_route(path: str) -> None:

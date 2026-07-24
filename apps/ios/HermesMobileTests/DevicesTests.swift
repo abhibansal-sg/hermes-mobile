@@ -507,26 +507,6 @@ final class DevicesTests: XCTestCase {
         XCTAssertNil(parsed?.deviceId)
     }
 
-    func testRelayPairingLinkParsesWithoutUsingDashboardTokenPath() {
-        let payload = "hermesapp://pair?relay=https%3A%2F%2Frelay.example.test%2Froot&agent=agent_123&pairing=pair_secret_456&kind=relay"
-        let parsed = HermesURLRouter.parsePairPayload(payload)
-
-        XCTAssertEqual(parsed?.relayPair?.relayURL, "https://relay.example.test/root")
-        XCTAssertEqual(parsed?.relayPair?.agentID, "agent_123")
-        XCTAssertEqual(parsed?.relayPair?.pairingSecret, "pair_secret_456")
-        XCTAssertEqual(parsed?.isRelayPairing, true)
-        XCTAssertEqual(parsed?.isDeviceToken, false)
-    }
-
-    func testRelayPairingLinkRejectsMissingFields() {
-        XCTAssertNil(HermesURLRouter.parsePairPayload(
-            "hermesapp://pair?kind=relay&agent=agent_123&pairing=pair_secret_456"
-        ))
-        XCTAssertNil(HermesURLRouter.parsePairPayload(
-            "hermesapp://pair?kind=relay&relay=https%3A%2F%2Frelay.example.test&agent=agent_123"
-        ))
-    }
-
     func testQRRejectsMissingRequiredFields() {
         XCTAssertNil(HermesURLRouter.parsePairPayload("hermesapp://pair?url=https%3A%2F%2Fh"))
         XCTAssertNil(HermesURLRouter.parsePairPayload("hermesapp://pair?token=t"))

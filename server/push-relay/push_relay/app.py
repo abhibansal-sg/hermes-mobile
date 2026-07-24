@@ -33,9 +33,9 @@ _CATEGORY_COLUMN = {
     "proactive": "notify_proactive",
 }
 _GENERIC_COPY: dict[PushKind, tuple[str, str]] = {
-    "replies": ("Hermes replied", "Open Fetch to continue."),
-    "attention": ("Hermes needs your attention", "Open Fetch to continue."),
-    "proactive": ("Hermes update", "Open Fetch to view the update."),
+    "replies": ("Hermes replied", "Open Hermes Mobile to continue."),
+    "attention": ("Hermes needs your attention", "Open Hermes Mobile to continue."),
+    "proactive": ("Hermes update", "Open Hermes Mobile to view the update."),
 }
 # STR-10A: the direct-APNs `aps.category` values, keyed by Hermes `event_type`.
 # This is the ONLY source `_payload()` trusts for `aps.category` — a relay
@@ -160,7 +160,7 @@ class TooManyDevicesError(Exception):
 
 
 class RegisterAgentBody(BaseModel):
-    app: str = Field(default="fetch-ios", max_length=80)
+    app: str = Field(default="hermes-ios", max_length=80)
     agent_version: str | None = Field(default=None, max_length=80)
     attestation: str | None = Field(default=None, max_length=8192)
     key_id: str | None = Field(default=None, max_length=128)

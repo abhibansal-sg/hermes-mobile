@@ -131,7 +131,7 @@ def test_push_flow_uses_generic_copy_when_custom_body_disabled() -> None:
     assert push_res.status_code == 200
     assert push_res.json()["sent"] == 1
     assert fake_apns.sent[0]["payload"]["aps"]["alert"]["title"] == "Hermes replied"
-    assert fake_apns.sent[0]["payload"]["aps"]["alert"]["body"] == "Open Fetch to continue."
+    assert fake_apns.sent[0]["payload"]["aps"]["alert"]["body"] == "Open Hermes Mobile to continue."
 
 
 def test_agent_auth_required() -> None:
@@ -268,8 +268,8 @@ def test_register_agent_records_key_and_counts(tmp_path):
     from push_relay.app import RelayStore
     store = RelayStore(tmp_path / "relay.db", secret_pepper="p", max_devices_per_agent=50)
     assert store.count_agents_for_key("k1") == 0
-    a1, s1 = store.register_agent(app="fetch-ios", agent_version=None, attest_key_id="k1")
-    a2, s2 = store.register_agent(app="fetch-ios", agent_version=None, attest_key_id="k1")
+    a1, s1 = store.register_agent(app="hermes-ios", agent_version=None, attest_key_id="k1")
+    a2, s2 = store.register_agent(app="hermes-ios", agent_version=None, attest_key_id="k1")
     assert a1 != a2 and s1 != s2
     assert store.count_agents_for_key("k1") == 2
     assert store.count_agents_for_key("other") == 0
@@ -311,14 +311,14 @@ def test_attested_enrollment_mints_credentials(tmp_path):
     client = TestClient(app)
     challenge = client.get("/v1/attest/challenge").json()["challenge"]
     res = client.post("/v1/agents/register", json={
-        "app": "fetch-ios", "attestation": "AAAA", "key_id": "k1", "challenge": challenge})
+        "app": "hermes-ios", "attestation": "AAAA", "key_id": "k1", "challenge": challenge})
     assert res.status_code == 200
     assert res.json()["agent_id"] and res.json()["agent_secret"]
 
 
 def test_enrollment_requires_attestation_when_flagged(tmp_path):
     app, _ = _attest_app(tmp_path, _FakeVerifier(ok=True))
-    res = TestClient(app).post("/v1/agents/register", json={"app": "fetch-ios"})
+    res = TestClient(app).post("/v1/agents/register", json={"app": "hermes-ios"})
     assert res.status_code == 400  # missing attestation fields
 
 
@@ -326,7 +326,7 @@ def test_enrollment_rejects_replayed_challenge(tmp_path):
     app, _ = _attest_app(tmp_path, _FakeVerifier(ok=True))
     client = TestClient(app)
     challenge = client.get("/v1/attest/challenge").json()["challenge"]
-    body = {"app": "fetch-ios", "attestation": "AAAA", "key_id": "k1", "challenge": challenge}
+    body = {"app": "hermes-ios", "attestation": "AAAA", "key_id": "k1", "challenge": challenge}
     assert client.post("/v1/agents/register", json=body).status_code == 200
     assert client.post("/v1/agents/register", json=body).status_code == 400  # reused challenge
 
@@ -336,7 +336,7 @@ def test_enrollment_rejects_invalid_attestation(tmp_path):
     client = TestClient(app)
     challenge = client.get("/v1/attest/challenge").json()["challenge"]
     res = client.post("/v1/agents/register", json={
-        "app": "fetch-ios", "attestation": "AAAA", "key_id": "k1", "challenge": challenge})
+        "app": "hermes-ios", "attestation": "AAAA", "key_id": "k1", "challenge": challenge})
     assert res.status_code == 403
 
 
@@ -346,7 +346,7 @@ def test_enrollment_enforces_per_key_cap(tmp_path):
     for expected in (200, 429):
         challenge = client.get("/v1/attest/challenge").json()["challenge"]
         res = client.post("/v1/agents/register", json={
-            "app": "fetch-ios", "attestation": "AAAA", "key_id": "k1", "challenge": challenge})
+            "app": "hermes-ios", "attestation": "AAAA", "key_id": "k1", "challenge": challenge})
         assert res.status_code == expected
 
 

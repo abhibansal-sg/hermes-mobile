@@ -1,7 +1,6 @@
 """Shared client for the hermes-mobile opt-in push relay.
 
-Adapted from Fetch's ``_relay.py`` for ABH-208 Slice B. The relay holds APNs
-credentials and fans out to registered devices. This host stores only an
+The relay holds APNs credentials and fans out to registered devices. This host stores only an
 anonymous per-agent ``agent_id`` + ``agent_secret`` minted on first relay use.
 
 Relay mode is deliberately opt-in: no hosted relay URL is compiled in. Set
@@ -168,8 +167,7 @@ class RelayCredentials:
     agent_secret: str
     # App-tunnel pairing capability token (plaintext). Minted by the relay and
     # returned once at registration; the relay keeps only its hash, so this is
-    # the agent's only copy. None for agents enrolled before pairing capture
-    # existed — re-minted on demand via ``relay_pairing()``.
+    # the agent's only copy.
     pairing: str | None = None
 
 
@@ -372,13 +370,6 @@ class RelayClient:
         # identity won the atomic file write.
         return self._read_credentials() or creds
 
-    async def relay_pairing(self) -> tuple[str, str, str]:
-        """Return ``(relay_url, agent_id, pairing)`` for a relay setup link."""
-        await self._credentials()
-        pairing = await self._mint_pairing()
-        creds = await self._credentials()
-        return self.relay_url, creds.agent_id, pairing
-
     async def tunnel_status(self) -> dict:
         """Return tunnel readiness when ABH-202 adds the relay status surface."""
         # ABH-202 owns the real reverse-tunnel status contract. Until that server
@@ -403,23 +394,6 @@ class RelayClient:
             if time.monotonic() >= deadline:
                 return last
             await asyncio.sleep(max(0.1, interval_s))
-
-    async def _mint_pairing(self) -> str:
-        """Rotate + fetch a fresh pairing token for an already-enrolled agent."""
-        response = await self._post("/v1/agents/pairing", {}, authenticated=True)
-        pairing = str(response.json()["pairing_secret"])
-        creds = await self._credentials()
-        # Persist alongside the existing identity so the file stays a valid
-        # pairing record (drives setup / tunnel autostart in later slices).
-        self._write_credentials(
-            RelayCredentials(
-                relay_url=creds.relay_url,
-                agent_id=creds.agent_id,
-                agent_secret=creds.agent_secret,
-                pairing=pairing,
-            )
-        )
-        return pairing
 
     def _read_credentials(self) -> RelayCredentials | None:
         try:
@@ -595,43 +569,6 @@ def unregister_device_background(
         daemon=True,
         name="hermes-mobile-relay-unregister",
     ).start()
-
-
-def send_live_activity_background(
-    *,
-    session_id: str,
-    content_state: dict[str, Any],
-    end: bool = False,
-    hermes_home: Path | None = None,
-) -> None:
-    """Relay-mode fallback for ActivityKit updates.
-
-    The relay contract is alert-event based, not a direct ActivityKit remote
-    update API. Keep the branch non-blocking and map user-visible attention
-    states into the relay's category vocabulary so relay-mode hosts still emit a
-    best-effort phone wake-up without touching the direct APNs implementation.
-    """
-    phase = str(content_state.get("phase") or "update")
-    if end:
-        relay_kind = "replies"
-        title = "Hermes finished"
-        body = "Turn finished"
-    elif bool(content_state.get("needsApproval")) or phase == "waiting":
-        relay_kind = "attention"
-        title = "Hermes needs your attention"
-        body = "Review this request in Hermes"
-    else:
-        relay_kind = "proactive"
-        title = "Hermes update"
-        body = f"Current phase: {phase}"
-    send_event_background(
-        kind=relay_kind,
-        session_id=session_id,
-        title=title,
-        body=body,
-        source="live_activity",
-        hermes_home=hermes_home,
-    )
 
 
 def _send_sync(

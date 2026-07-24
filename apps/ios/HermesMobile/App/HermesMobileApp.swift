@@ -232,8 +232,12 @@ struct HermesMobileApp: App {
                             connection: environment.connectionStore
                         )
                     }
-                    appDelegate.notificationCoordinator.attachActionCompletionHandler {
-                        Task { await environment.inboxStore.refresh() }
+                    appDelegate.notificationCoordinator.attachReconciliationHandler {
+                        Task {
+                            await environment.inboxStore.refresh()
+                            await environment.chatStore.backfill()
+                            await environment.sessionStore.refresh()
+                        }
                     }
                     #if DEBUG
                     // Inc-3b UITest seam: HERMES_UITEST_DEEPLINK fires a deep link

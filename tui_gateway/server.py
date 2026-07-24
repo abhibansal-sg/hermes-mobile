@@ -417,19 +417,16 @@ def _notify_session_boundary(
     event_type: str,
     session_id: str | None,
     platform: str | None = None,
-    runtime_session_id: str | None = None,
 ) -> None:
     """Fire session lifecycle hooks with CLI parity."""
     try:
         from hermes_cli.plugins import invoke_hook as _invoke_hook
 
-        kwargs = {
-            "session_id": session_id,
-            "platform": _resolve_agent_platform(platform),
-        }
-        if runtime_session_id:
-            kwargs["runtime_session_id"] = runtime_session_id
-        _invoke_hook(event_type, **kwargs)
+        _invoke_hook(
+            event_type,
+            session_id=session_id,
+            platform=_resolve_agent_platform(platform),
+        )
     except Exception:
         pass
 
@@ -630,12 +627,7 @@ def _finalize_session(session: dict | None, end_reason: str = "tui_close") -> No
 
     session_key = session.get("session_key")
     session_id = getattr(agent, "session_id", None) or session_key
-    _notify_session_boundary(
-        "on_session_finalize",
-        session_id,
-        _session_source(session),
-        runtime_session_id=str(session.get("_sid") or "") or None,
-    )
+    _notify_session_boundary("on_session_finalize", session_id, _session_source(session))
 
     # Mark session ended in DB so it doesn't linger as a ghost row in /resume.
     # Use session_id (from agent.session_id) not session_key — after compression,
@@ -1135,62 +1127,6 @@ def _default_session_cwd() -> str:
     return _launch_configured_cwd() or os.getenv("TERMINAL_CWD") or os.getcwd()
 
 
-def _notify_gateway_observers(hook: str, **kwargs) -> None:
-    """Fire a gateway observer hook best-effort; never break gateway I/O."""
-    try:
-        from hermes_cli.plugins import invoke_hook
-
-        invoke_hook(hook, **kwargs)
-    except Exception:
-        logger.debug("gateway observer hook %s failed", hook, exc_info=True)
-
-
-def _transform_gateway_event_payload(
-    event: str, sid: str, payload: dict | None
-) -> dict | None:
-    """Apply registered pre-emit payload enrichers without changing routing."""
-    try:
-        from hermes_cli.plugins import invoke_hook
-
-        current = payload
-        for result in invoke_hook(
-            "pre_emit_event", event=event, session_id=sid, payload=current
-        ):
-            if isinstance(result, dict) and "payload" in result:
-                candidate = result["payload"]
-                if candidate is None or isinstance(candidate, dict):
-                    current = candidate
-        return current
-    except Exception:
-        logger.debug("gateway pre-emit transform failed", exc_info=True)
-        return payload
-
-
-_OBSERVER_POOL: concurrent.futures.ThreadPoolExecutor | None = None
-_OBSERVER_POOL_LOCK = threading.Lock()
-
-
-def _notify_gateway_observers_nowait(hook: str, **kwargs) -> None:
-    """Fire an observer off the caller's event loop, preserving FIFO order."""
-    try:
-        from hermes_cli.plugins import get_plugin_manager
-
-        manager = get_plugin_manager()
-        if manager is None or not manager.has_hook(hook):
-            return
-    except Exception:
-        return
-
-    global _OBSERVER_POOL
-    with _OBSERVER_POOL_LOCK:
-        if _OBSERVER_POOL is None:
-            _OBSERVER_POOL = concurrent.futures.ThreadPoolExecutor(
-                max_workers=1,
-                thread_name_prefix="gw-observer",
-            )
-    _OBSERVER_POOL.submit(_notify_gateway_observers, hook, **kwargs)
-
-
 def write_json(obj: dict) -> bool:
     """Emit one JSON frame. Routes via the most-specific transport available.
 
@@ -1207,30 +1143,16 @@ def write_json(obj: dict) -> bool:
     if obj.get("method") == "event":
         sid = ((obj.get("params") or {}).get("session_id")) or ""
         if sid and (t := (_sessions.get(sid) or {}).get("transport")) is not None:
-            ok = t.write(obj)
-            _notify_gateway_observers(
-                "post_frame_write",
-                frame=obj,
-                session_id=sid,
-                owner_transport=t,
-            )
-            return ok
+            return t.write(obj)
 
     return (current_transport() or _stdio_transport).write(obj)
 
 
 def _emit(event: str, sid: str, payload: dict | None = None):
-    payload = _transform_gateway_event_payload(event, sid, payload)
     params = {"type": event, "session_id": sid}
     if payload is not None:
         params["payload"] = payload
     write_json({"jsonrpc": "2.0", "method": "event", "params": params})
-    _notify_gateway_observers(
-        "post_emit_event",
-        event=event,
-        session_id=sid,
-        payload=payload,
-    )
 
 
 def _emit_approval_request(sid: str, data: dict | None) -> None:
@@ -8216,14 +8138,6 @@ def _(rid, params: dict) -> dict:
 
 @method("session.status")
 def _(rid, params: dict) -> dict:
-    """Return the human status report plus machine-readable runtime truth.
-
-    ``running`` comes directly from the live gateway session record; callers
-    must not infer it from ``output``.  Model/provider/usage are null until an
-    agent exists (for example, for a newly-created lazy session).  Once an
-    agent exists, usage is the canonical ``_get_usage`` object and may omit
-    optional measurements such as context-window occupancy when unavailable.
-    """
     session, err = _sess_nowait(params, rid)
     if err:
         return err
@@ -8255,15 +8169,9 @@ def _(rid, params: dict) -> dict:
             updated = _dt(meta.get(field), created)
             break
 
-    usage = _get_usage(agent) if agent is not None else None
-    raw_provider = getattr(agent, "provider", None) if agent is not None else None
-    raw_model = getattr(agent, "model", None) if agent is not None else None
-    structured_provider = str(raw_provider) if raw_provider else None
-    structured_model = str(raw_model) if raw_model else None
-    # Preserve the established human-readable fallbacks byte-for-byte for TUI
-    # and CLI consumers while exposing honest nulls to structured clients.
-    provider = raw_provider or "unknown"
-    model = raw_model or "(unknown)"
+    usage = _get_usage(agent) if agent is not None else {}
+    provider = getattr(agent, "provider", None) or "unknown"
+    model = getattr(agent, "model", None) or "(unknown)"
     lines = [
         "Hermes TUI Status",
         "",
@@ -8282,16 +8190,7 @@ def _(rid, params: dict) -> dict:
             f"Agent Running: {'Yes' if session.get('running') else 'No'}",
         ]
     )
-    return _ok(
-        rid,
-        {
-            "output": "\n".join(lines),
-            "running": bool(session.get("running")),
-            "model": structured_model,
-            "provider": structured_provider,
-            "usage": usage,
-        },
-    )
+    return _ok(rid, {"output": "\n".join(lines)})
 
 
 @method("session.history")
@@ -10709,19 +10608,9 @@ def _ws_device_identity() -> Optional[dict]:
 
 def _ws_device_owns_session(device: dict, session_id: str) -> bool:
     """Fail-closed ownership check for device-authenticated WS RPCs."""
-    device_id = device.get("device_id") if isinstance(device, dict) else None
-    if not device_id:
-        return False
-    try:
-        import importlib
+    from hermes_cli.dashboard_auth.token_auth import identity_owns_session
 
-        device_tokens = importlib.import_module(
-            "hermes_plugins.hermes_mobile.device_tokens"
-        )
-        owner = device_tokens.device_identity_for_session(session_id)
-    except Exception:
-        return False
-    return isinstance(owner, dict) and owner.get("device_id") == device_id
+    return identity_owns_session(device, session_id)
 
 
 def _ws_resolve_audit(session_id: str, session_key: str) -> dict:

@@ -109,7 +109,7 @@ class TestFinalizeSessionUsesAgentSessionId:
         assert boundary_calls == [
             (
                 ("on_session_finalize", "continuation-session", "tui"),
-                {"runtime_session_id": "runtime-session"},
+                {},
             )
         ]
 

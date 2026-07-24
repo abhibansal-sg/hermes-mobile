@@ -422,7 +422,7 @@ final class ChatStore {
     ///
     /// Semantics: this reflects occupancy of the **last API prompt** — it updates
     /// once per completed turn (`message.complete`), not per streamed token, and
-    /// is seeded once from `session.status` after a resume so a reopened session
+    /// is seeded once from `session.usage` after a resume so a reopened session
     /// shows occupancy before its first new turn. Reset to `nil` on open/draft.
     private(set) var contextUsage: (used: Int, max: Int, percent: Int, compressions: Int)?
 
@@ -1419,23 +1419,21 @@ final class ChatStore {
                         compressions: usage.compressions ?? 0)
     }
 
-    /// Seed `contextUsage` once from `session.status` after a resume, so a
+    /// Seed `contextUsage` once from `session.usage` after a resume, so a
     /// reopened session shows its occupancy *before* the first new turn lands
-    /// (the status result's `usage` carries the same context fields the
-    /// `message.complete` usage does). No-op while a turn is streaming (a live
-    /// turn's own `message.complete` is the fresher source) and when the status
-    /// usage omits the context fields. Callers pass the runtime id they just
+    /// (the result carries the same context fields the `message.complete`
+    /// usage does). No-op while a turn is streaming (a live turn's own
+    /// `message.complete` is the fresher source) and when the usage result
+    /// omits the context fields. Callers pass the runtime id they just
     /// resumed; a mismatch with the now-active session means a newer open
     /// superseded this one, so the seed is dropped.
-    func seedContextUsageFromStatus(runtimeId: String) async {
+    func seedContextUsage(runtimeId: String) async {
         guard !isStreaming else { return }
         guard let client else { return }
         // `session.usage` returns the usage dict FLAT as the RPC result —
         // including `context_used`/`context_max`/`context_percent` when the
         // agent has a context compressor (`tui_gateway/server.py` `_get_usage`)
-        // — which is exactly the UsageStats shape. `session.status` nests a
-        // usage block too, but the flat RPC is the canonical occupancy source
-        // (ABH-46 item 3) and avoids decoding the unrelated status metadata.
+        // — which is exactly the UsageStats shape.
         let usage: UsageStats? = try? await client.request(
             "session.usage",
             params: .object(["session_id": .string(runtimeId)]),
@@ -1452,8 +1450,7 @@ final class ChatStore {
     /// (for example, the user re-enters a chat whose turn was started elsewhere or
     /// before navigating away). The REST transcript only contains persisted rows;
     /// it does NOT prove the current runtime is idle. After the open seed has
-    /// landed, consume the resume snapshot when available; older gateways fall
-    /// back to `session.status`. If either reports `running`,
+    /// landed, consume the stock resume snapshot. If it reports `running`,
     /// re-create the local in-flight UI state: a streaming assistant placeholder,
     /// the global `isStreaming` flag, the local-turn ownership token (so mutable
     /// actions are disabled), and the Stop target (`activeSessionId`).
@@ -1467,19 +1464,8 @@ final class ChatStore {
         inflight: SessionInflightTurn? = nil
     ) async {
         guard runtimeId == activeSessionId else { return }
-        if let snapshotRunning {
-            guard snapshotRunning else { return }
-            restoreInflightTurn(inflight)
-            return
-        }
-        guard let fetch = resolvedLiveTurnStatusFetch else { return }
-        let status = try? await fetch(runtimeId)
-        guard runtimeId == activeSessionId else { return }
-        if let usage = status?.usage, !isStreaming {
-            applyContextUsage(from: usage)
-        }
-        guard status?.running == true else { return }
-        restoreInflightTurn(nil)
+        guard snapshotRunning == true else { return }
+        restoreInflightTurn(inflight)
     }
 
     private func restoreInflightTurn(_ inflight: SessionInflightTurn?) {
@@ -1512,22 +1498,6 @@ final class ChatStore {
         while index >= 0, messages[index].role != .user { index -= 1 }
         guard index >= 0 else { return false }
         return messages[index].text == user
-    }
-
-    /// Injectable seam for `reconcileLiveTurnStatus` tests. The live path uses the
-    /// gateway `session.status` RPC; tests can answer synchronously without a socket.
-    var liveTurnStatusFetch: ((String) async throws -> SessionStatusResult)?
-
-    private var resolvedLiveTurnStatusFetch: ((String) async throws -> SessionStatusResult)? {
-        if let liveTurnStatusFetch { return liveTurnStatusFetch }
-        guard let client else { return nil }
-        return { runtimeId in
-            try await client.request(
-                "session.status",
-                params: .object(["session_id": .string(runtimeId)]),
-                timeout: .seconds(30)
-            )
-        }
     }
 
     private func handleApprovalRequest(_ event: GatewayEvent) {
@@ -4602,7 +4572,7 @@ final class ChatStore {
         resetSubagentTree()
         lastError = nil
         // Occupancy belongs to the session being torn down (H1); the next
-        // session re-seeds from its own session.status / first turn.
+        // session re-seeds from its own session.usage / first turn.
         contextUsage = nil
         // A backfill/seed failure belongs to the session being torn down too —
         // a stale error must not render in the next session's empty-transcript

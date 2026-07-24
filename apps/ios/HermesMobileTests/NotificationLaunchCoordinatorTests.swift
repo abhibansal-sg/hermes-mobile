@@ -98,4 +98,17 @@ final class NotificationLaunchCoordinatorTests: XCTestCase {
 
         XCTAssertEqual(routed, [tap])
     }
+
+    func testForegroundPushRequestsOneReconciliation() {
+        let coordinator = NotificationLaunchCoordinator()
+        var reconciliations = 0
+
+        coordinator.receiveForegroundPush(.turnComplete(sessionId: "active"))
+        coordinator.receiveForegroundPush(nil)
+        coordinator.attachReconciliationHandler { reconciliations += 1 }
+
+        XCTAssertEqual(reconciliations, 1)
+        coordinator.receiveForegroundPush(.attention(sessionId: "active"))
+        XCTAssertEqual(reconciliations, 2)
+    }
 }

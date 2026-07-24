@@ -57,24 +57,6 @@ final class ContextMeterTests: XCTestCase {
         XCTAssertEqual(complete.usage?.compressions, 0)
     }
 
-    func testSessionStatusResultCarriesContextUsage() throws {
-        // The resume-seed source: session.status's usage block.
-        let value: JSONValue = [
-            "running": true,
-            "model": "claude-x",
-            "usage": [
-                "context_used": 600_000,
-                "context_max": 1_000_000,
-                "context_percent": 60,
-                "compressions": 3
-            ]
-        ]
-        let status = try XCTUnwrap(value.decoded(as: SessionStatusResult.self))
-        XCTAssertEqual(status.usage?.contextUsed, 600_000)
-        XCTAssertEqual(status.usage?.contextPercent, 60)
-        XCTAssertEqual(status.usage?.compressions, 3)
-    }
-
     // MARK: - formatK
 
     func testFormatKContractExamples() {

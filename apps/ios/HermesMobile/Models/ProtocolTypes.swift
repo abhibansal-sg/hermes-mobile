@@ -185,8 +185,8 @@ struct SessionOpenResult: Decodable, Sendable {
     let messages: [StoredMessage]
     let info: SessionRuntimeInfo?
     /// Root-level live truth returned by current gateway resume/activate paths.
-    /// Older gateways omit these fields, in which case the client falls back to
-    /// `session.status` without inventing an idle state.
+    /// Older gateways may omit these fields, in which case the client leaves
+    /// the live state unchanged rather than inventing an idle state.
     let running: Bool?
     let status: String?
     let inflight: SessionInflightTurn?
@@ -270,7 +270,7 @@ struct SessionInflightTurn: Decodable, Sendable, Equatable {
     let streaming: Bool
 }
 
-/// `info` block returned by session.create/resume and session.status.
+/// `info` block returned by session.create/resume.
 struct SessionRuntimeInfo: Decodable, Sendable {
     let model: String?
     let provider: String?
@@ -287,20 +287,6 @@ struct SessionRuntimeInfo: Decodable, Sendable {
     let serviceTier: String?
     /// Effective approval-bypass state for this session.
     let yolo: Bool?
-}
-
-/// Result of `session.status`.
-///
-/// `running` is authoritative only when it is exactly `true`; it stays optional
-/// so the app remains compatible with older gateways that returned only the
-/// human-readable `output`. `model`, `provider`, and `usage` are nil before a
-/// lazy session has built its agent. A non-nil usage object may still omit
-/// measurements the active provider/runtime cannot report.
-struct SessionStatusResult: Decodable, Sendable {
-    let running: Bool?
-    let model: String?
-    let provider: String?
-    let usage: UsageStats?
 }
 
 /// A stored transcript message (REST `/api/sessions/{id}/messages` and the
@@ -471,7 +457,7 @@ struct UsageStats: Decodable, Sendable, Equatable {
     //
     // The gateway's `_get_usage` (tui_gateway/server.py:1587) attaches the
     // context-window occupancy of the *last API prompt* to every `usage` dict —
-    // on `message.complete` and on `session.status`. These describe per-turn
+    // on `message.complete` and `session.usage`. These describe per-turn
     // occupancy (how full the prompt that produced this turn was), NOT a
     // per-streamed-token running total, and the app had been dropping them.
     // snake_case → camelCase decode is automatic (JSONValue.decoded / RestClient

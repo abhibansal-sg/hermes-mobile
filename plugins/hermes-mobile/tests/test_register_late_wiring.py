@@ -15,8 +15,6 @@ def plugin_and_ctx():
     from hermes_cli.dashboard_auth import token_auth
     from hermes_cli.plugins import PluginContext, PluginManager, PluginManifest
     from tools import approval as _approval
-    from tui_gateway import server, ws
-
     load_plugin_module("device_tokens")
     plugin = sys.modules[_PLUGIN_PKG]
 
@@ -29,13 +27,11 @@ def plugin_and_ctx():
             "TOKEN_AUTHENTICATORS": getattr(token_auth, "TOKEN_AUTHENTICATORS", None),
             "IDENTITY_VALIDATORS": getattr(token_auth, "IDENTITY_VALIDATORS", None),
             "SOCKET_OBSERVERS": getattr(token_auth, "SOCKET_OBSERVERS", None),
+            "SESSION_OWNERSHIP_CHECKERS": getattr(
+                token_auth, "SESSION_OWNERSHIP_CHECKERS", None
+            ),
         },
         _approval: {"_RESOLVE_OBSERVERS": getattr(_approval, "_RESOLVE_OBSERVERS", None)},
-        server: {
-            "_EVENT_FANOUT_SUBSCRIBERS": getattr(server, "_EVENT_FANOUT_SUBSCRIBERS", None),
-            "_EMIT_OBSERVERS": getattr(server, "_EMIT_OBSERVERS", None),
-        },
-        ws: {"TRANSPORT_OBSERVERS": getattr(ws, "TRANSPORT_OBSERVERS", None)},
     }
     list_snapshots = {
         (module, name): list(value)
@@ -73,35 +69,17 @@ def test_register_late_wires_every_core_seam_after_attrs_restore(
     seams behind the authenticator membership check.
     """
     from hermes_cli.dashboard_auth import token_auth
-    from hermes_cli import plugins as plugin_core
     from tools import approval as _approval
-    from tui_gateway import server, ws
 
     plugin, ctx, manager = plugin_and_ctx
     device_tokens = load_plugin_module("device_tokens")
     push_engine = load_plugin_module("push_engine")
-    broadcast = load_plugin_module("broadcast")
-
-    # Exercise the compatibility fallback intentionally: this stock core has
-    # first-class hooks, so hide them for the duration of this older-core test.
-    for hook in (
-        "post_emit_event",
-        "post_frame_write",
-        "on_ws_transport_change",
-    ):
-        monkeypatch.setattr(
-            plugin_core,
-            "VALID_HOOKS",
-            plugin_core.VALID_HOOKS - {hook},
-        )
 
     delayed_lists = [
         (token_auth, "IDENTITY_VALIDATORS"),
         (token_auth, "SOCKET_OBSERVERS"),
+        (token_auth, "SESSION_OWNERSHIP_CHECKERS"),
         (_approval, "_RESOLVE_OBSERVERS"),
-        (server, "_EVENT_FANOUT_SUBSCRIBERS"),
-        (server, "_EMIT_OBSERVERS"),
-        (ws, "TRANSPORT_OBSERVERS"),
     ]
     for module, name in delayed_lists:
         monkeypatch.delattr(module, name, raising=False)
@@ -122,52 +100,17 @@ def test_register_late_wires_every_core_seam_after_attrs_restore(
     assert device_tokens.match in token_auth.TOKEN_AUTHENTICATORS
     assert _contains_named(token_auth.IDENTITY_VALIDATORS, "_validate_device")
     assert _contains_named(token_auth.SOCKET_OBSERVERS, "_observe_socket")
+    assert _contains_named(
+        token_auth.SESSION_OWNERSHIP_CHECKERS, "_identity_owns_session"
+    )
     assert _contains_named(_approval._RESOLVE_OBSERVERS, "_audit_resolution")
-    assert broadcast.on_owner_write in server._EVENT_FANOUT_SUBSCRIBERS
-    assert push_engine.handle_gateway_event in server._EMIT_OBSERVERS
-    assert broadcast.on_transport in ws.TRANSPORT_OBSERVERS
+    assert push_engine.handle_turn_start in manager._hooks["pre_llm_call"]
+    assert push_engine.handle_turn_reply in manager._hooks["post_llm_call"]
+    assert push_engine.handle_pre_tool_call in manager._hooks["pre_tool_call"]
+    assert push_engine.handle_approval_request in manager._hooks[
+        "pre_approval_request"
+    ]
     assert "mobile-pair" in manager._cli_commands
-
-    monkeypatch.setenv("HERMES_GATEWAY_BROADCAST", "1")
-
-    class _SpyTransport:
-        def __init__(self):
-            self.broadcasts = []
-            self.writes = []
-            self._closed = False
-
-        def broadcast(self, obj):
-            self.broadcasts.append(obj)
-            return True
-
-        def write(self, obj):
-            self.writes.append(obj)
-            return True
-
-    owner = _SpyTransport()
-    mirror = _SpyTransport()
-    monkeypatch.setattr(broadcast, "live_transports", lambda: [owner, mirror])
-    monkeypatch.setattr(broadcast, "enqueue", lambda transport, obj: transport.broadcast(obj))
-    server._sessions["late-wire-sid"] = {
-        "session_key": "stored-late-wire",
-        "transport": owner,
-    }
-    try:
-        frame = {
-            "jsonrpc": "2.0",
-            "method": "event",
-            "params": {"type": "message.delta", "session_id": "late-wire-sid"},
-        }
-        assert owner.write(frame) is True
-        for subscriber in server._EVENT_FANOUT_SUBSCRIBERS:
-            subscriber(frame, "late-wire-sid", owner)
-    finally:
-        server._sessions.pop("late-wire-sid", None)
-
-    assert len(owner.writes) == 1
-    assert owner.broadcasts == []
-    assert len(mirror.broadcasts) == 1
-    assert mirror.broadcasts[0]["params"]["stored_session_id"] == "stored-late-wire"
 
     warnings = [record.message for record in caplog.records if record.levelname == "WARNING"]
     assert not any("hermes-mobile:" in message for message in warnings)

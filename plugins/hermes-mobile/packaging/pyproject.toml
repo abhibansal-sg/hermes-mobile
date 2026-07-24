@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "hermes-mobile-plugin"
 version = "0.1.0"
-description = "HermesMobile iOS companion plugin for Hermes Agent: APNs push, multi-client broadcast, device pairing."
+description = "HermesMobile iOS companion plugin for Hermes Agent: stock-hook APNs push and device pairing."
 readme = "README-pypi.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }

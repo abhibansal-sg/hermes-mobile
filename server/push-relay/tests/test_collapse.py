@@ -27,7 +27,7 @@ def service(tmp_path):
         allow_custom_body=True,
     )
     store = RelayStore(settings.database_path)
-    agent_id, _secret = store.register_agent(app="fetch-ios", agent_version=None)
+    agent_id, _secret = store.register_agent(app="hermes-ios", agent_version=None)
     store.upsert_device(
         agent_id=agent_id,
         token="tok-1",

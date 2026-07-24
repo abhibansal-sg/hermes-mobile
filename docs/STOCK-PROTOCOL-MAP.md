@@ -31,7 +31,7 @@ ephemeral `runtimeID` for RPCs and event routing; `mode` (`drive` or `watch`); a
 | Inspect live sessions | `session.active_list` with optional `current_session_id` | Read-only `sessions[]`; each row has runtime `id`, stored `session_key`, `status` in `idle|starting|waiting|working`, plus `last_active`, `message_count`, `model`, `preview`, `started_at`, `title`, `current`. It does not rebind transport. | Present at `:6499`; same structured shape. Use a version guard like stock desktop `use-background-sync.ts`: unsupported RPC leaves current state untouched. This is the drive/watch preflight. |
 | Resume for driving | `session.resume` with stored `session_id`; optional `cols`, `profile`, `source` | Returns runtime `session_id`, stored target as both `resumed` and `session_key`, full `messages[]`, `message_count`, `info`, `running`, `status`, `started_at`, optional `inflight`, and in v0.19 optional `queued`. **If already live, `_live_session_payload(... transport=current_transport())` rebinds the session to the caller.** | Present at `:5972`; same ownership-rebind. Fork main omits v0.19's `queued` resume snapshot. Never call resume for passive open; call only after `active_list` says no live runtime, or when deliberately reclaiming for queued work. |
 | Submit | `prompt.submit` with runtime `session_id`, `text`, optional `truncate_before_user_ordinal`, and fork S11 `client_message_id` | Stock success is `{"status":"streaming"}` (or busy-policy `queued`/`steered`) and the request rebinds `session["transport"]` to the caller before the turn. Stock has no `client_message_id`. | Present at `:8910`. Fork S11 adds `accepted`, echoed `client_message_id`, and `deduplicated` only when an id is supplied; legacy shape stays stock. WorkRepository deletes an outbox row only after that acceptance proof. |
-| Human status fallback | `session.status` with runtime `session_id` | v0.19 returns only human `output`; it is not machine liveness. | Present at `:8217`; fork adds nullable `running`, `model`, `provider`, `usage`. Do not parse `output`; normal drive/watch uses `active_list`. |
+| Human status command | `session.status` with runtime `session_id` | Returns human `output`; it is not machine liveness. | Same stock shape. Do not parse `output`; drive/watch uses resume snapshots and `active_list`. |
 | Full live history | `session.history` with runtime `session_id` | `count` plus full `messages[]`; not paginated. | Present at `:8297`; same shape. Use only when a live-runtime read is specifically required, not for scrollback. |
 
 ## Authoritative transcript read and pagination
@@ -75,7 +75,7 @@ Every session-scoped event routes by runtime `session_id`; unknown additions are
 2. Decode stored resume identity from `session_key` as well as `resumed`; keep `inflight`; tolerate
    v0.19 `queued` and its absence on fork main.
 3. Add a typed `session.active_list` response and treat only its four structured status strings as
-   liveness. Do not use fork-only structured `session.status` as the normal decision source.
+   liveness. Do not parse the human `session.status` output as a decision source.
 4. Preserve the stock ownership rule: resume and submit drive/rebind; `active_list` and HTTP reads
    watch without rebinding.
 5. Required baseline events above are present on both trees. The fork is a superset of this required
