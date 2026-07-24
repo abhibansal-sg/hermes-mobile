@@ -21,7 +21,7 @@ either already upstream or no longer consumed by `plugins/hermes-mobile` / iOS.
 |---|---|---|
 | S1 | REMOVED | Foreign-frame fan-out was a second delivery system. The phone uses the transparent relay as a normal stock gateway client; foreign sessions reconcile from stock history instead of receiving mirrored private frames. |
 | S2 | REMOVED | Push intake uses stock v0.19 lifecycle hooks (`pre_llm_call`, `post_llm_call`, `on_session_end`, tool and approval hooks). No frame observer or payload transform remains. |
-| S3 | SUPERSEDED | Upstream `_session_info` already includes provider. Finalize cleanup derives runtime aliases from the live stock session table; no extra hook metadata is required. |
+| S3 | SUPERSEDED | Upstream `_session_info` already includes provider. The stock finalize hook supplies the durable stored ID; the plugin uses it as a fallback Live Activity teardown key while the phone owns runtime-keyed ActivityKit teardown. No extra hook metadata is required. |
 | S4 | STILL-NEEDED (small) | Reasoning is already session-scoped upstream. Only `config.set/get fast` needed adaptation to `create_service_tier_override`. |
 | S5 | STILL-NEEDED | The stock provider registry covers exact Bearer-token REST routes, but not rich device metadata, plugin routes, WS tickets, live revocation, socket indexing, or resolver audit identity. Generic registries and guarded call sites remain. Every device-capable dashboard WS route now enters one shared lifecycle that indexes only active device identities and closes revoke/register races (ABH-449). |
 | S6 | STILL-NEEDED | Stock `session.delete` still returned 4023 for a live row. It now interrupts a running turn, releases prompts/approvals, tears down, deletes, and reports `evicted`. |
@@ -62,7 +62,7 @@ Modules (moved or already-new):
 ## 2. Irreducible seams (each = an upstream-PR candidate)
 S1 removed — stock owner routing remains the only frame-delivery path.
 S2 removed — stock lifecycle hooks are the notification input.
-S3 removed — stock session metadata and live-table lookup are sufficient.
+S3 removed — stock session metadata plus phone-owned runtime teardown are sufficient.
 S4 config.set session-scoping for reasoning/fast (~120 lines today) — REWRITE
    smaller by following upstream's accepted `session["model_override"]` pattern
    (session_overrides dict consulted at agent build). PR: "session-scoped
