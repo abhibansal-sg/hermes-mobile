@@ -1,15 +1,15 @@
 """
-hermes-mobile plugin — gateway-event push adapter.
+hermes-mobile plugin — stock lifecycle notification adapter.
 
-Moved verbatim from ``hermes_cli/push_notify.py`` (ABH-88 de-patch, W1) plus
-the gateway event-intake block moved from ``tui_gateway/server.py``. The
-``/push/*`` REST routes live in this plugin's ``dashboard/api.py`` (mounted at
-``/api/plugins/hermes-mobile/push/...``); event intake rides the gateway's S2
-emit-observer seam (see CONTRACT-DEPATCH.md), wired by :func:`activate`.
+Notification intake uses only public Hermes v0.19 plugin hooks. The adapter
+normalizes those lifecycle callbacks into the event shapes already consumed by
+this module; alert delivery remains owned by the hosted push relay through
+``relay_client``. No gateway frame-observer or event-fan-out seam is required
+for notification delivery.
 
-Alert delivery is owned by the hosted push relay: this module translates stock
-gateway events and queues them through :mod:`relay_client`. It deliberately
-does not keep a second device-token registry or a second alert APNs sender.
+The ``/push/*`` REST routes live in this plugin's ``dashboard/api.py`` mounted
+at ``/api/plugins/hermes-mobile/push/...``. This module deliberately does not
+keep a second device-token registry or a second alert APNs sender.
 
 Direct APNs remains only for ActivityKit remote updates because the relay does
 not yet expose a Live Activity token/update contract. That path is dormant
@@ -273,15 +273,6 @@ def enrich_correlated_event(event: str, sid: str, payload: dict | None) -> dict 
         # the push worker directly and bypasses the pre-emit transform.
         data.setdefault("turn_id", identity)
     return data
-
-
-def _hook_pre_emit(event=None, session_id=None, payload=None, **_kwargs):
-    if not isinstance(event, str) or not isinstance(session_id, str):
-        return None
-    enriched = enrich_correlated_event(event, session_id, payload)
-    if enriched is payload:
-        return None
-    return {"payload": enriched}
 
 
 def build_manifest_invalidation_payload(
@@ -821,10 +812,8 @@ def notify_live_activity(
 
 
 # ===========================================================================
-# Gateway event intake — moved verbatim from ``tui_gateway/server.py``
-# (ABH-88 de-patch, W1). The gateway's ``_emit`` / finalize / interrupt paths
-# notify the S2 emit-observer seam; :func:`handle_gateway_event` is the
-# observer this plugin registers there (see :func:`activate`).
+# Existing event formatter/delivery machinery, now fed by stock lifecycle
+# hooks instead of the gateway's frame-emission path.
 #
 # ``_gw_sessions()`` is the one adaptation: the moved code read the gateway's
 # module-global ``_sessions`` directly; here it is resolved lazily so this
@@ -1039,7 +1028,9 @@ def _push_approval_enrichment(sid: str, data: dict) -> dict:
 def _push_route_context(sid: str, data: dict) -> dict:
     """Shared APNs route/correlation context for clarify and turn completion."""
     context: dict = {"session_id": sid}
-    stored = (_gw_sessions().get(sid) or {}).get("session_key")
+    stored = data.get("stored_session_id") or (
+        _gw_sessions().get(sid) or {}
+    ).get("session_key")
     if stored:
         context["stored_session_id"] = stored
     for key in ("event_id", "gateway_scope", "turn_id", "request_id", "approval_id"):
@@ -1206,8 +1197,7 @@ def _live_activity_hook(
             return
 
         session = _gw_sessions().get(sid)
-        # Keep the worker safe for direct callers as well as the normal
-        # pre_emit_event path.  This is idempotent for already enriched data.
+        # Keep the worker safe for direct callers and lifecycle-hook intake.
         data = enrich_correlated_event(event, sid, payload) or {}
         is_end = event in ("message.complete", "session.interrupt")
         now = event_time or time.time()
@@ -1322,7 +1312,13 @@ def _live_activity_hook(
         _log.debug("live activity hook failed", exc_info=True)
 
 
-def _push_hook(event: str, sid: str, payload: dict | None) -> None:
+def _push_hook(
+    event: str,
+    sid: str,
+    payload: dict | None,
+    *,
+    turn_started: float | None = None,
+) -> None:
     """Queue attention-worthy events for APNs (hermes-mobile plugin).
 
     This hook performs only cheap in-memory work on the emit path. APNs sends
@@ -1334,7 +1330,8 @@ def _push_hook(event: str, sid: str, payload: dict | None) -> None:
         if event == "message.start":
             if session is not None:
                 session["_push_turn_started"] = event_time
-        turn_started = (session or {}).get("_push_turn_started")
+        if turn_started is None:
+            turn_started = (session or {}).get("_push_turn_started")
         # ABH-204: a dispatched kanban worker's internal turn / tool / status /
         # message.complete events must not enqueue a phone push. Approval
         # requests still enqueue (and push) so the user can act on them. The
@@ -1379,8 +1376,7 @@ def _process_push_event(
         if event not in _PUSH_ALERT_EVENTS:
             return
 
-        # Keep the worker safe for direct callers as well as the normal
-        # pre_emit_event path. This is idempotent for already enriched data.
+        # Keep the worker safe for direct callers and lifecycle-hook intake.
         data = enrich_correlated_event(event, sid, payload) or {}
         excluded_devices = _foreground_phone_devices(sid, _gw_sessions().get(sid))
         if event == "approval.request":
@@ -1502,24 +1498,239 @@ def unregister_live_activity_tokens(*session_ids: object) -> None:
     end_live_activity_sessions(*session_ids)
 
 
-def handle_gateway_event(event: str, sid: str, payload: dict | None = None) -> None:
-    """S2 emit-observer entry point (see CONTRACT-DEPATCH.md seam S2).
+_STOCK_PUSH_PLATFORMS = frozenset({"cli", "desktop", "tui"})
+_STOCK_TURNS: dict[tuple[str, str], float] = {}
 
-    The gateway notifies observers for every emitted event plus three
-    synthetic boundary events that never ride ``_emit``:
 
-    * ``session.finalize`` — sid is the runtime sid; payload carries
-      ``session_id`` / ``session_key`` (Live Activity cleanup wants all three).
-    * ``session.deleted`` — sid is the STORED session id being deleted.
-    * ``session.interrupt`` — mirrors the old explicit ``_push_hook`` call in
-      the ``session.interrupt`` RPC handler (ends any in-flight Live Activity).
-    """
+def _stock_turn_key(session_id: object, turn_id: object) -> tuple[str, str]:
+    return str(session_id or "").strip(), str(turn_id or "").strip()
+
+
+def _stock_started(session_id: object, turn_id: object) -> float | None:
+    key = _stock_turn_key(session_id, turn_id)
+    return _STOCK_TURNS.get(key) if all(key) else None
+
+
+def _delivery_sid(stored_session_id: str) -> str:
+    """Use the live runtime id when ActivityKit has registered one."""
+    for runtime_id, session in _gw_sessions().items():
+        if not isinstance(session, dict):
+            continue
+        agent = session.get("agent")
+        if stored_session_id in {
+            str(session.get("session_key") or ""),
+            str(session.get("session_id") or ""),
+            str(getattr(agent, "session_id", "") or ""),
+        }:
+            return str(runtime_id)
+    return stored_session_id
+
+
+def _stock_platform_allowed(platform: object) -> bool:
+    return str(platform or "").strip().lower() in _STOCK_PUSH_PLATFORMS
+
+
+def _invalidate_stock_event(event: str, sid: str, payload: dict | None) -> None:
     try:
         from .manifest_invalidation import handle_gateway_event as invalidate_event
 
         invalidate_event(event, sid, payload)
     except Exception:
         _log.warning("manifest invalidation journal failed", exc_info=True)
+
+
+def _emit_stock_event(
+    event: str,
+    stored_session_id: str,
+    payload: dict | None = None,
+    *,
+    turn_started: float | None = None,
+) -> None:
+    """Feed one upstream lifecycle callback into the existing push pipeline."""
+    data = dict(payload or {})
+    data.setdefault("stored_session_id", stored_session_id)
+    sid = _delivery_sid(stored_session_id)
+    _invalidate_stock_event(event, sid, data)
+    _push_hook(event, sid, data, turn_started=turn_started)
+
+
+def handle_turn_start(
+    *,
+    session_id: str = "",
+    task_id: str = "",
+    turn_id: str = "",
+    platform: str = "",
+    **_kwargs,
+) -> None:
+    """Translate stock ``pre_llm_call`` into one turn-start event."""
+    stored = str(session_id or task_id or "").strip()
+    key = _stock_turn_key(stored, turn_id)
+    if not all(key) or not _stock_platform_allowed(platform):
+        return
+    started = time.time()
+    if len(_STOCK_TURNS) >= 512:
+        _STOCK_TURNS.pop(next(iter(_STOCK_TURNS)))
+    _STOCK_TURNS[key] = started
+    _emit_stock_event(
+        "message.start",
+        stored,
+        {"turn_id": str(turn_id), "platform": str(platform)},
+        turn_started=started,
+    )
+
+
+def handle_turn_reply(
+    *,
+    session_id: str = "",
+    task_id: str = "",
+    turn_id: str = "",
+    assistant_response: str = "",
+    platform: str = "",
+    **_kwargs,
+) -> None:
+    """Translate stock ``post_llm_call`` into one reply-ready event."""
+    stored = str(session_id or task_id or "").strip()
+    if not stored or not _stock_platform_allowed(platform):
+        return
+    _emit_stock_event(
+        "message.complete",
+        stored,
+        {
+            "text": str(assistant_response or ""),
+            "status": "complete",
+            "turn_id": str(turn_id or ""),
+            "platform": str(platform),
+        },
+        turn_started=_stock_started(stored, turn_id),
+    )
+
+
+def handle_api_request_error(
+    *,
+    session_id: str = "",
+    task_id: str = "",
+    turn_id: str = "",
+    error: object = None,
+    reason: str | None = None,
+    retryable: bool | None = None,
+    **_kwargs,
+) -> None:
+    """Push only a provider error that stock classifies as non-retryable."""
+    stored = str(session_id or task_id or "").strip()
+    started = _stock_started(stored, turn_id)
+    if started is None or retryable is not False:
+        return
+    if isinstance(error, dict):
+        message = error.get("message") or error.get("type")
+    else:
+        message = error
+    _emit_stock_event(
+        "error",
+        stored,
+        {
+            "message": _push_safe_text(
+                message or reason, "Hermes could not finish this turn"
+            ),
+            "turn_id": str(turn_id or ""),
+        },
+        turn_started=started,
+    )
+
+
+def handle_turn_end(
+    *,
+    session_id: str = "",
+    task_id: str = "",
+    turn_id: str = "",
+    interrupted: bool = False,
+    **_kwargs,
+) -> None:
+    """End Live Activity state for interrupted turns and release turn tracking."""
+    stored = str(session_id or task_id or "").strip()
+    key = _stock_turn_key(stored, turn_id)
+    started = _STOCK_TURNS.pop(key, None)
+    if not stored or started is None or not interrupted:
+        return
+    _emit_stock_event(
+        "session.interrupt",
+        stored,
+        {"turn_id": str(turn_id or ""), "status": "interrupted"},
+        turn_started=started,
+    )
+
+
+def handle_pre_tool_call(
+    *,
+    tool_name: str = "",
+    args: dict | None = None,
+    session_id: str = "",
+    task_id: str = "",
+    turn_id: str = "",
+    tool_call_id: str = "",
+    **_kwargs,
+) -> None:
+    """Drive tool Live Activity state and clarification attention from stock hooks."""
+    stored = str(session_id or task_id or "").strip()
+    started = _stock_started(stored, turn_id)
+    if started is None:
+        return
+    safe_args = args if isinstance(args, dict) else {}
+    if tool_name == "clarify":
+        choices = safe_args.get("choices")
+        _emit_stock_event(
+            "clarify.request",
+            stored,
+            {
+                "question": str(safe_args.get("question") or "Input needed"),
+                "choices": (
+                    [str(choice) for choice in choices[:20]]
+                    if isinstance(choices, list)
+                    else []
+                ),
+                "tool_call_id": str(tool_call_id or ""),
+                "turn_id": str(turn_id or ""),
+            },
+            turn_started=started,
+        )
+        return
+    _emit_stock_event(
+        "tool.start",
+        stored,
+        {"name": str(tool_name or "tool"), "turn_id": str(turn_id or "")},
+        turn_started=started,
+    )
+
+
+def handle_post_tool_call(
+    *,
+    tool_name: str = "",
+    session_id: str = "",
+    task_id: str = "",
+    turn_id: str = "",
+    **_kwargs,
+) -> None:
+    """Close stock tool activity without copying tool results into push payloads."""
+    stored = str(session_id or task_id or "").strip()
+    started = _stock_started(stored, turn_id)
+    if started is None:
+        return
+    if tool_name == "clarify":
+        _invalidate_stock_event(
+            "clarify.resolved",
+            _delivery_sid(stored),
+            {"stored_session_id": stored, "turn_id": str(turn_id or "")},
+        )
+    _emit_stock_event(
+        "tool.complete",
+        stored,
+        {"name": str(tool_name or "tool"), "turn_id": str(turn_id or "")},
+        turn_started=started,
+    )
+
+
+def handle_gateway_event(event: str, sid: str, payload: dict | None = None) -> None:
+    """Compatibility intake for the authenticated external notification route."""
+    _invalidate_stock_event(event, sid, payload)
     if event == "session.finalize":
         data = payload or {}
         unregister_live_activity_tokens(
@@ -1543,10 +1754,15 @@ def handle_approval_request(
     surface: str = "",
     command: str = "",
     description: str = "",
+    turn_id: str = "",
+    tool_call_id: str = "",
     **_kwargs,
 ) -> None:
     """Turn the stock approval hook into one actionable mobile push."""
-    if surface != "gateway" or not session_key:
+    if surface == "smart" or not session_key:
+        return
+    started = _stock_started(session_key, turn_id)
+    if surface != "cli" and started is None:
         return
     sid = next(
         (
@@ -1585,8 +1801,43 @@ def handle_approval_request(
         "approval_id": request_id,
         "event_id": request_id,
         "choices": choices,
+        "turn_id": str(turn_id or ""),
+        "tool_call_id": str(tool_call_id or ""),
     }
-    _push_hook("approval.request", sid, payload)
+    _invalidate_stock_event("approval.request", sid, payload)
+    _push_hook(
+        "approval.request",
+        sid,
+        payload,
+        turn_started=started,
+    )
+
+
+def handle_approval_response(
+    *,
+    session_key: str = "",
+    surface: str = "",
+    turn_id: str = "",
+    **_kwargs,
+) -> None:
+    """Clear stock approval attention after approve, deny, or timeout."""
+    if surface == "smart" or not session_key:
+        return
+    started = _stock_started(session_key, turn_id)
+    if surface != "cli" and started is None:
+        return
+    _invalidate_stock_event(
+        "approval.resolved",
+        _delivery_sid(session_key),
+        {"stored_session_id": session_key, "turn_id": str(turn_id or "")},
+    )
+    if started is not None:
+        _emit_stock_event(
+            "status.update",
+            session_key,
+            {"kind": "thinking", "turn_id": str(turn_id or "")},
+            turn_started=started,
+        )
 
 
 def handle_session_finalize(
@@ -1614,34 +1865,16 @@ def handle_session_finalize(
 
 
 def activate(ctx=None) -> None:
-    """Wire the push engine into the gateway.
-
-    Preferred path: the first-class ``post_emit_event`` plugin hook (stock
-    VALID_HOOKS as of the de-patch). Fallback (older cores): the S2
-    ``_EMIT_OBSERVERS`` module-level seam. Exactly ONE path is wired — the
-    gateway fires the hook in addition to the seam, so registering both
-    would double-send every push.
-    """
-    if ctx is not None:
-        try:
-            from hermes_cli.plugins import VALID_HOOKS
-
-            if "post_emit_event" in VALID_HOOKS:
-                def _hook_emit(event=None, session_id=None, payload=None, **_kw):
-                    if isinstance(event, str) and isinstance(session_id, str):
-                        handle_gateway_event(event, session_id, payload)
-
-                ctx.register_hook("pre_emit_event", _hook_pre_emit)
-                ctx.register_hook("post_emit_event", _hook_emit)
-                ctx.register_hook("pre_approval_request", handle_approval_request)
-                ctx.register_hook("on_session_finalize", handle_session_finalize)
-                sweep_dead_live_activity_tokens()
-                return
-        except Exception:
-            pass
-    from . import _append_unique
-    from tui_gateway import server as _server
-
-    wired = _append_unique(_server, "_EMIT_OBSERVERS", handle_gateway_event, "push")
-    if wired:
-        sweep_dead_live_activity_tokens()
+    """Wire notification intake exclusively through stock Hermes v0.19 hooks."""
+    if ctx is None:
+        return
+    ctx.register_hook("pre_llm_call", handle_turn_start)
+    ctx.register_hook("post_llm_call", handle_turn_reply)
+    ctx.register_hook("on_session_end", handle_turn_end)
+    ctx.register_hook("pre_tool_call", handle_pre_tool_call)
+    ctx.register_hook("post_tool_call", handle_post_tool_call)
+    ctx.register_hook("api_request_error", handle_api_request_error)
+    ctx.register_hook("pre_approval_request", handle_approval_request)
+    ctx.register_hook("post_approval_response", handle_approval_response)
+    ctx.register_hook("on_session_finalize", handle_session_finalize)
+    sweep_dead_live_activity_tokens()

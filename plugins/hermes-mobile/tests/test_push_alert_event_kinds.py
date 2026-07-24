@@ -147,7 +147,12 @@ def test_approval_push_originates_from_stock_hook(monkeypatch, tmp_path):
     monkeypatch.setattr(
         push,
         "_gw_sessions",
-        lambda: {"runtime-1": {"session_key": "stored-1"}},
+        lambda: {
+            "runtime-1": {
+                "session_key": "stored-1",
+                "agent": type("_Agent", (), {"platform": "desktop"})(),
+            }
+        },
     )
     monkeypatch.setattr(
         approval_module,
@@ -165,10 +170,12 @@ def test_approval_push_originates_from_stock_hook(monkeypatch, tmp_path):
     monkeypatch.setattr(
         push, "_push_hook", lambda *args, **kwargs: calls.append((args, kwargs))
     )
+    push._STOCK_TURNS[("stored-1", "turn-1")] = 10.0
 
     push.handle_approval_request(
         session_key="stored-1",
         surface="gateway",
+        turn_id="turn-1",
         command="rm file --token secret-value",
         description="Delete file using token secret-value",
     )
@@ -176,3 +183,99 @@ def test_approval_push_originates_from_stock_hook(monkeypatch, tmp_path):
     assert calls[0][0][0:2] == ("approval.request", "runtime-1")
     assert calls[0][0][2]["request_id"] == "request-1"
     assert calls[0][0][2]["description"] == "Delete the selected file"
+
+
+def test_stock_turn_hooks_emit_one_reply_without_gateway_observer(monkeypatch, tmp_path):
+    _isolate_home(monkeypatch, tmp_path)
+    push = load_plugin_module("push_engine")
+    push._STOCK_TURNS.clear()
+    events = []
+    monkeypatch.setattr(
+        push,
+        "_emit_stock_event",
+        lambda *args, **kwargs: events.append((args, kwargs)),
+    )
+
+    push.handle_turn_start(
+        session_id="stored-1",
+        turn_id="turn-1",
+        platform="desktop",
+    )
+    push.handle_turn_reply(
+        session_id="stored-1",
+        turn_id="turn-1",
+        platform="desktop",
+        assistant_response="Done",
+    )
+    push.handle_turn_end(
+        session_id="stored-1",
+        turn_id="turn-1",
+        platform="desktop",
+        completed=True,
+    )
+
+    assert [args[0] for args, _kwargs in events] == [
+        "message.start",
+        "message.complete",
+    ]
+    assert events[1][0][2]["text"] == "Done"
+    assert push._STOCK_TURNS == {}
+
+
+def test_stock_clarify_hook_uses_tool_identity_but_not_fake_reply_id(
+    monkeypatch, tmp_path
+):
+    _isolate_home(monkeypatch, tmp_path)
+    push = load_plugin_module("push_engine")
+    push._STOCK_TURNS.clear()
+    events = []
+    monkeypatch.setattr(
+        push,
+        "_emit_stock_event",
+        lambda *args, **kwargs: events.append((args, kwargs)),
+    )
+
+    push.handle_turn_start(
+        session_id="stored-1",
+        turn_id="turn-1",
+        platform="cli",
+    )
+    push.handle_pre_tool_call(
+        tool_name="clarify",
+        args={"question": "Which branch?", "choices": ["main", "release"]},
+        session_id="stored-1",
+        turn_id="turn-1",
+        tool_call_id="tool-1",
+    )
+
+    clarify = events[-1][0][2]
+    assert events[-1][0][0] == "clarify.request"
+    assert clarify["question"] == "Which branch?"
+    assert clarify["tool_call_id"] == "tool-1"
+    assert "request_id" not in clarify
+
+
+def test_stock_hooks_ignore_messaging_platform_turns(monkeypatch, tmp_path):
+    _isolate_home(monkeypatch, tmp_path)
+    push = load_plugin_module("push_engine")
+    push._STOCK_TURNS.clear()
+    events = []
+    monkeypatch.setattr(
+        push,
+        "_emit_stock_event",
+        lambda *args, **kwargs: events.append((args, kwargs)),
+    )
+
+    push.handle_turn_start(
+        session_id="telegram-session",
+        turn_id="turn-1",
+        platform="telegram",
+    )
+    push.handle_turn_reply(
+        session_id="telegram-session",
+        turn_id="turn-1",
+        platform="telegram",
+        assistant_response="Done",
+    )
+
+    assert events == []

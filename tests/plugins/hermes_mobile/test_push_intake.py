@@ -173,7 +173,7 @@ def test_push_register_surfaces_relay_enrollment_failure(monkeypatch):
 
 
 # ===========================================================================
-# F2-S S2 — push hook category + approval payload enrichment.
+# Push category, stock-hook intake, and approval payload enrichment.
 # These monkeypatch the push_engine senders so no APNs traffic is generated.
 # ===========================================================================
 
@@ -197,9 +197,7 @@ def _capture_notify(monkeypatch, pn):
     return calls
 
 
-def test_activate_registers_correlation_transform_before_push_observer(
-    monkeypatch, push_engine
-):
+def test_activate_registers_only_stock_notification_hooks(monkeypatch, push_engine):
     hooks = {}
 
     class _Context:
@@ -209,14 +207,19 @@ def test_activate_registers_correlation_transform_before_push_observer(
     monkeypatch.setattr(push_engine, "sweep_dead_live_activity_tokens", lambda: None)
     push_engine.activate(_Context())
 
-    assert list(hooks).index("pre_emit_event") < list(hooks).index("post_emit_event")
-    result = hooks["pre_emit_event"](
-        event="clarify.request",
-        session_id="sid-hook",
-        payload={"request_id": "request-stable", "question": "Which file?"},
-    )
-    assert result["payload"]["event_id"].startswith("evt_")
-    assert result["payload"]["gateway_scope"].startswith("gw_")
+    assert set(hooks) == {
+        "pre_llm_call",
+        "post_llm_call",
+        "on_session_end",
+        "pre_tool_call",
+        "post_tool_call",
+        "api_request_error",
+        "pre_approval_request",
+        "post_approval_response",
+        "on_session_finalize",
+    }
+    assert "pre_emit_event" not in hooks
+    assert "post_emit_event" not in hooks
 
 
 def test_push_hook_stamps_and_enqueues_without_sending(monkeypatch, push_engine):
@@ -1004,7 +1007,7 @@ def test_live_activity_hook_reuses_one_start_epoch_for_activity_lifetime(
 
 # ===========================================================================
 # Session-boundary integration — the gateway's synthetic "session.finalize" /
-# "session.deleted" events (S2 seam) must trigger Live Activity unregistration
+# Compatibility event intake can still clean up a deleted Live Activity token,
 # in the plugin. Driven through the same server RPC paths the originals used,
 # with the plugin's handle_gateway_event wired via the wired_gateway fixture.
 # ===========================================================================
@@ -1041,7 +1044,9 @@ def test_session_close_unregisters_live_activity_runtime(monkeypatch, wired_gate
     assert "sid-la-close" in removed
 
 
-def test_session_delete_unregisters_live_activity_id(monkeypatch, wired_gateway):
+def test_session_delete_does_not_require_notification_emit_observer(
+    monkeypatch, wired_gateway
+):
     server_mod, _ws, pn, _bc = wired_gateway
     removed = []
 
@@ -1061,4 +1066,4 @@ def test_session_delete_unregisters_live_activity_id(monkeypatch, wired_gateway)
     )
 
     assert resp["result"] == {"deleted": "old-2", "evicted": False}
-    assert removed == ["old-2"]
+    assert removed == []
