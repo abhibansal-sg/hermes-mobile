@@ -25,10 +25,9 @@ import UniformTypeIdentifiers
 /// **Too large** (`413`, over the 1 MB read cap)
 ///   - "Too large to preview (N MB)" with the formatted size.
 ///
-/// **Mention seam** — a "Use in Message" button (toolbar + swipe action) calls
-/// `onMentionFile(path)`. Default no-op; the integrator wires the closure so
-/// a `@file:<path>` token is inserted in the composer WITHOUT touching
-/// ChatView/ComposerView here.
+/// **Mention seam** — when the integrator supplies `onMentionFile`, a "Use in
+/// Message" button inserts a `@file:<path>` token in the composer without
+/// coupling this viewer to ChatView/ComposerView.
 ///
 /// **View modes** (STR-659/STR-701) — Source / Rendered (markdown-only) /
 /// Diff (only when a non-empty unified diff is available), picked via the
@@ -47,8 +46,6 @@ struct FileViewerView: View {
     let path: String
     /// Called when the user taps "Use in Message". Receives the relative path
     /// so the caller can insert a `@file:<path>` token in the composer.
-    /// Default no-op — wire this in the integrator/ChatView layer without
-    /// editing this file.
     var onMentionFile: ((String) -> Void)?
     /// Scope identity for the on-disk image-blob cache (P4 cache-on-access).
     /// `serverId` = trimmed `ConnectionStore.serverURLString`; `profileId` =
@@ -404,16 +401,15 @@ struct FileViewerView: View {
                     .accessibilityIdentifier("fileViewerExportMenu")
                 }
 
-                // "Use in Message" — the mention seam (audit finding). Default
-                // no-op; the integrator wires onMentionFile to inject a
-                // @file:<path> token in the composer.
-                Button {
-                    onMentionFile?(path)
-                } label: {
-                    Image(systemName: "at.badge.plus")
-                        .accessibilityLabel("Use in message")
+                if let onMentionFile {
+                    Button {
+                        onMentionFile(path)
+                    } label: {
+                        Image(systemName: "at.badge.plus")
+                            .accessibilityLabel("Use in message")
+                    }
+                    .accessibilityIdentifier("fileViewerUseInMessage")
                 }
-                .accessibilityIdentifier("fileViewerUseInMessage")
 
                 // Copy-contents button (only for text files with content).
                 if case .loaded(let result) = phase,
@@ -605,7 +601,10 @@ struct FileViewerView: View {
         switch action {
         case .share:
             do {
-                let url = try writeTempFile(bytes)
+                let name = fileName
+                let url = try await Task.detached {
+                    try Self.writeTempFile(bytes, fileName: name)
+                }.value
                 shareURL = IdentifiableFileURL(url: url)
             } catch {
                 exportError = "Couldn't prepare the file: \(error.localizedDescription)"
@@ -631,19 +630,22 @@ struct FileViewerView: View {
         // Prefer the original bytes: an inline data URL from the initial read, or a
         // fresh `format=data_url` fetch (images already have this; binaries get it
         // from the W25 gateway change).
-        if let dataURL = result.dataURL, let data = Self.decodeDataURLToData(dataURL) {
-            return data
+        if let dataURL = result.dataURL {
+            if let data = await Task.detached(operation: {
+                Self.decodeDataURLToData(dataURL)
+            }).value { return data }
         }
         if let fetched = try? await rest.fsReadAsDataURL(sessionId: sessionId, path: path),
-           let dataURL = fetched.dataURL,
-           let data = Self.decodeDataURLToData(dataURL) {
-            return data
+           let dataURL = fetched.dataURL {
+            if let data = await Task.detached(operation: {
+                Self.decodeDataURLToData(dataURL)
+            }).value { return data }
         }
 
         // Last resort for an image the viewer already decoded but whose original
         // bytes we couldn't re-fetch: re-encode the on-screen bitmap as PNG.
         if result.isImage, case .loaded(let image) = imagePhase {
-            return image.pngData()
+            return await Task.detached { image.pngData() }.value
         }
         return nil
     }
@@ -651,7 +653,7 @@ struct FileViewerView: View {
     /// Decode a `data:<mime>;base64,<payload>` URL (or a non-base64 `data:` URL)
     /// to its raw bytes. Unlike ``decodeDataURL`` this does not require the bytes
     /// to be a decodable image, so it works for arbitrary binary files.
-    static func decodeDataURLToData(_ dataURL: String) -> Data? {
+    nonisolated static func decodeDataURLToData(_ dataURL: String) -> Data? {
         guard let commaIndex = dataURL.firstIndex(of: ",") else { return nil }
         let meta = dataURL[dataURL.startIndex..<commaIndex]
         let payload = String(dataURL[dataURL.index(after: commaIndex)...])
@@ -666,7 +668,7 @@ struct FileViewerView: View {
 
     /// Write export bytes to a uniquely-named temp file so the Share sheet can
     /// present it with the real filename (and downstream apps get a proper name).
-    private func writeTempFile(_ data: Data) throws -> URL {
+    nonisolated private static func writeTempFile(_ data: Data, fileName: String) throws -> URL {
         let dir = FileManager.default.temporaryDirectory
             .appendingPathComponent("hermes-share", isDirectory: true)
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)

@@ -398,16 +398,20 @@ final class ArtifactsGalleryModel {
         galleryTotal = 0
         galleryOffset = 0
         generation &+= 1
+        let gen = generation
 
         do {
             let page = try await fetchOnePage(type: type, offset: 0, api: api)
+            guard generation == gen else { return }
             artifacts = assignIndices(page.results, startingAt: 0)
             galleryTotal = page.total
             galleryOffset = Self.pageLimit
             phase = .loaded
         } catch RestError.badStatus(404, _) {
+            guard generation == gen else { return }
             pluginUnavailable = true
         } catch {
+            guard generation == gen else { return }
             phase = .failed(
                 (error as? LocalizedError)?.errorDescription
                     ?? error.localizedDescription

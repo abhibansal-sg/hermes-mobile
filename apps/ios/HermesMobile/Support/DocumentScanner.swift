@@ -5,10 +5,8 @@ import VisionKit
 /// SwiftUI wrapper around VisionKit's `VNDocumentCameraViewController`.
 ///
 /// Presents the system document-camera UI (edge detection, multi-page capture,
-/// perspective correction) and hands the finished scan back as an array of
-/// baseline-JPEG `Data` — one entry per scanned page, in capture order. Each
-/// `Data` is ready to feed straight into `AttachmentStore.add(data:)`, which
-/// re-normalises it (downscale + re-encode) before upload.
+/// perspective correction) and hands the finished pages to `AttachmentStore`,
+/// which performs the single JPEG normalization pass off the main actor.
 ///
 /// Cancellation and scanner errors both resolve with an empty array via
 /// ``onError`` / ``onComplete`` so the caller can simply dismiss. Present this
@@ -19,19 +17,14 @@ import VisionKit
 /// Camera usage is already declared (`NSCameraUsageDescription`), shared with
 /// the existing photo-capture path.
 struct DocumentScanner: UIViewControllerRepresentable {
-    /// Pages from a successful scan, JPEG-encoded in capture order. Empty if the
-    /// user finished with no pages.
-    let onComplete: ([Data]) -> Void
+    /// Pages from a successful scan in capture order.
+    let onComplete: ([UIImage]) -> Void
     /// Called instead of ``onComplete`` when the scanner fails. The default
     /// presents nothing extra; callers typically just dismiss.
     var onError: ((Error) -> Void)? = nil
     /// Called when the user taps Cancel. Defaults to dismissing via ``onComplete``
     /// with an empty array if not provided.
     var onCancel: (() -> Void)? = nil
-
-    /// JPEG quality used to encode each scanned page. Generous because
-    /// `AttachmentStore` re-compresses; this just avoids losing fidelity early.
-    private static let jpegQuality: CGFloat = 0.9
 
     /// Whether the document camera is available on this device. Mirror this on
     /// the presenting control's `disabled`/visibility.
@@ -48,45 +41,30 @@ struct DocumentScanner: UIViewControllerRepresentable {
     func updateUIViewController(_ controller: VNDocumentCameraViewController, context: Context) {}
 
     func makeCoordinator() -> Coordinator {
-        Coordinator(
-            onComplete: onComplete,
-            onError: onError,
-            onCancel: onCancel,
-            jpegQuality: Self.jpegQuality
-        )
+        Coordinator(onComplete: onComplete, onError: onError, onCancel: onCancel)
     }
 
     /// Bridges the UIKit delegate callbacks back to the SwiftUI closures.
     final class Coordinator: NSObject, VNDocumentCameraViewControllerDelegate {
-        private let onComplete: ([Data]) -> Void
+        private let onComplete: ([UIImage]) -> Void
         private let onError: ((Error) -> Void)?
         private let onCancel: (() -> Void)?
-        private let jpegQuality: CGFloat
 
         init(
-            onComplete: @escaping ([Data]) -> Void,
+            onComplete: @escaping ([UIImage]) -> Void,
             onError: ((Error) -> Void)?,
-            onCancel: (() -> Void)?,
-            jpegQuality: CGFloat
+            onCancel: (() -> Void)?
         ) {
             self.onComplete = onComplete
             self.onError = onError
             self.onCancel = onCancel
-            self.jpegQuality = jpegQuality
         }
 
         func documentCameraViewController(
             _ controller: VNDocumentCameraViewController,
             didFinishWith scan: VNDocumentCameraScan
         ) {
-            var pages: [Data] = []
-            pages.reserveCapacity(scan.pageCount)
-            for index in 0..<scan.pageCount {
-                let image = scan.imageOfPage(at: index)
-                if let jpeg = image.jpegData(compressionQuality: jpegQuality) {
-                    pages.append(jpeg)
-                }
-            }
+            let pages = (0..<scan.pageCount).map { scan.imageOfPage(at: $0) }
             onComplete(pages)
         }
 
