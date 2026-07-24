@@ -27,6 +27,9 @@ def plugin_and_ctx():
             "TOKEN_AUTHENTICATORS": getattr(token_auth, "TOKEN_AUTHENTICATORS", None),
             "IDENTITY_VALIDATORS": getattr(token_auth, "IDENTITY_VALIDATORS", None),
             "SOCKET_OBSERVERS": getattr(token_auth, "SOCKET_OBSERVERS", None),
+            "SESSION_OWNERSHIP_CHECKERS": getattr(
+                token_auth, "SESSION_OWNERSHIP_CHECKERS", None
+            ),
         },
         _approval: {"_RESOLVE_OBSERVERS": getattr(_approval, "_RESOLVE_OBSERVERS", None)},
     }
@@ -75,6 +78,7 @@ def test_register_late_wires_every_core_seam_after_attrs_restore(
     delayed_lists = [
         (token_auth, "IDENTITY_VALIDATORS"),
         (token_auth, "SOCKET_OBSERVERS"),
+        (token_auth, "SESSION_OWNERSHIP_CHECKERS"),
         (_approval, "_RESOLVE_OBSERVERS"),
     ]
     for module, name in delayed_lists:
@@ -96,6 +100,9 @@ def test_register_late_wires_every_core_seam_after_attrs_restore(
     assert device_tokens.match in token_auth.TOKEN_AUTHENTICATORS
     assert _contains_named(token_auth.IDENTITY_VALIDATORS, "_validate_device")
     assert _contains_named(token_auth.SOCKET_OBSERVERS, "_observe_socket")
+    assert _contains_named(
+        token_auth.SESSION_OWNERSHIP_CHECKERS, "_identity_owns_session"
+    )
     assert _contains_named(_approval._RESOLVE_OBSERVERS, "_audit_resolution")
     assert push_engine.handle_turn_start in manager._hooks["pre_llm_call"]
     assert push_engine.handle_turn_reply in manager._hooks["post_llm_call"]

@@ -43,7 +43,6 @@ import secrets
 import stat
 import sys
 import time
-import urllib.parse
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -1285,37 +1284,6 @@ class LiveActivityBody(BaseModel):
     token: str
     session_id: str
     env: str = ""  # "sandbox" | "production"; empty → server default
-
-
-@router.post("/relay/pair")
-async def pair_relay_device(request: Request) -> Any:
-    """Mint the one mobile pairing link; never expose the agent secret."""
-    if not _has_dashboard_api_auth(request):
-        raise HTTPException(status_code=401, detail="Unauthorized")
-    if not _device_has_scope(request, "approve"):
-        raise HTTPException(status_code=403, detail="Device token lacks approve scope")
-
-    relay = _plugin_module("relay_client")
-    if not relay.relay_url_configured():
-        return JSONResponse(
-            status_code=400,
-            content={"error": "relay URL is not configured", "code": 4001},
-        )
-
-    try:
-        relay_url_value, agent_id, pairing_secret = await relay.relay_client().relay_pairing()
-    except relay.NeedsAttestation as exc:
-        return JSONResponse(status_code=428, content={"error": str(exc), "code": 4002})
-    except relay.RelayConfigurationError as exc:
-        return JSONResponse(status_code=400, content={"error": str(exc), "code": 4001})
-
-    query = urllib.parse.urlencode({
-        "relay": relay_url_value,
-        "agent": agent_id,
-        "pairing": pairing_secret,
-        "kind": "relay",
-    })
-    return {"url": f"hermesapp://pair?{query}"}
 
 
 def _relay_device_environment(requested_env: str) -> str:

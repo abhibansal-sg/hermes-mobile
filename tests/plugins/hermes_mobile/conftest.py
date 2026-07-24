@@ -124,6 +124,7 @@ def wired_token_auth():
         list(token_auth.TOKEN_AUTHENTICATORS),
         list(token_auth.IDENTITY_VALIDATORS),
         list(token_auth.SOCKET_OBSERVERS),
+        list(token_auth.SESSION_OWNERSHIP_CHECKERS),
     )
     plugin._wire_token_auth()
     try:
@@ -132,6 +133,7 @@ def wired_token_auth():
         token_auth.TOKEN_AUTHENTICATORS[:] = before[0]
         token_auth.IDENTITY_VALIDATORS[:] = before[1]
         token_auth.SOCKET_OBSERVERS[:] = before[2]
+        token_auth.SESSION_OWNERSHIP_CHECKERS[:] = before[3]
 
 
 @pytest.fixture
