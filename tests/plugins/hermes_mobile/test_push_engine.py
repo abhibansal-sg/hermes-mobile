@@ -171,7 +171,6 @@ class _Client:
 
 
 def _arm_direct_live_activity(monkeypatch, client):
-    monkeypatch.delenv("HERMES_MOBILE_RELAY_URL", raising=False)
     monkeypatch.setattr(
         push.APNsConfig, "from_env", classmethod(lambda _cls: _Config())
     )
@@ -228,22 +227,18 @@ def test_direct_live_activity_prunes_only_dead_tokens(
     assert (push.live_activity_token_for("sess-1") is None) is removed
 
 
-def test_live_activity_uses_existing_relay_wake_when_relay_is_configured(
-    monkeypatch
+def test_live_activity_stays_on_activitykit_apns_when_alert_relay_is_configured(
+    monkeypatch, isolated_home
 ):
-    relay = load_plugin_module("relay_client")
-    calls = []
     monkeypatch.setenv("HERMES_MOBILE_RELAY_URL", "https://relay.example.test")
-    monkeypatch.setattr(
-        relay,
-        "send_live_activity_background",
-        lambda **kwargs: calls.append(kwargs),
-    )
+    client = _Client(200)
+    _arm_direct_live_activity(monkeypatch, client)
+    assert push.register_live_activity_token("sess-1", _TOKEN, env="production")
     state = {"phase": "waiting", "needsApproval": True}
 
     assert push.notify_live_activity("sess-1", state, end=True)
-    assert calls == [{
-        "session_id": "sess-1",
-        "content_state": state,
-        "end": True,
-    }]
+    path, payload, headers = client.calls[0]
+    assert path == f"/3/device/{_TOKEN}"
+    assert payload["aps"]["event"] == "end"
+    assert payload["aps"]["content-state"] == state
+    assert headers["apns-push-type"] == "liveactivity"

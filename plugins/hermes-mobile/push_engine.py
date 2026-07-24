@@ -720,9 +720,9 @@ def notify_live_activity(
     no-op (returns False) unless push is armed AND a token is registered. The
     token is pruned on APNs ``410 Unregistered`` or ``400 BadDeviceToken``,
     matching alert-token pruning semantics (QA-2 R1). Returns True iff APNs
-    accepted the push (HTTP 200). In
-    relay mode, returns True only when background relay delivery was kicked off;
-    relay delivery failures are surfaced via relay warnings/failure counters.
+    accepted the push (HTTP 200). Alert notifications use the hosted relay;
+    ActivityKit updates remain on this direct APNs path because they target a
+    session-scoped Live Activity token rather than an app device token.
 
     ``content_state`` MUST use the ``HermesTurnAttributes.ContentState`` Codable
     field names (``phase``, ``toolName``, ``elapsedSeconds``, ``needsApproval``,
@@ -732,23 +732,6 @@ def notify_live_activity(
     Never raises: errors are logged and swallowed so a failed LA push can never
     break the calling gateway hook.
     """
-    if os.environ.get("HERMES_MOBILE_RELAY_URL"):
-        try:
-            from . import relay_client
-        except Exception:
-            _log.debug("relay live activity notify failed", exc_info=True)
-            return False
-        try:
-            relay_client.send_live_activity_background(
-                session_id=session_id,
-                content_state=content_state,
-                end=end,
-            )
-            return True
-        except Exception:
-            _log.debug("relay live activity notify failed", exc_info=True)
-            return False
-
     config = APNsConfig.from_env()
     if not config.is_armed():
         _log.debug("live activity: not armed — no-op")

@@ -571,43 +571,6 @@ def unregister_device_background(
     ).start()
 
 
-def send_live_activity_background(
-    *,
-    session_id: str,
-    content_state: dict[str, Any],
-    end: bool = False,
-    hermes_home: Path | None = None,
-) -> None:
-    """Relay-mode fallback for ActivityKit updates.
-
-    The relay contract is alert-event based, not a direct ActivityKit remote
-    update API. Keep the branch non-blocking and map user-visible attention
-    states into the relay's category vocabulary so relay-mode hosts still emit a
-    best-effort phone wake-up without touching the direct APNs implementation.
-    """
-    phase = str(content_state.get("phase") or "update")
-    if end:
-        relay_kind = "replies"
-        title = "Hermes finished"
-        body = "Turn finished"
-    elif bool(content_state.get("needsApproval")) or phase == "waiting":
-        relay_kind = "attention"
-        title = "Hermes needs your attention"
-        body = "Review this request in Hermes"
-    else:
-        relay_kind = "proactive"
-        title = "Hermes update"
-        body = f"Current phase: {phase}"
-    send_event_background(
-        kind=relay_kind,
-        session_id=session_id,
-        title=title,
-        body=body,
-        source="live_activity",
-        hermes_home=hermes_home,
-    )
-
-
 def _send_sync(
     kind: str,
     session_id: str | None,
