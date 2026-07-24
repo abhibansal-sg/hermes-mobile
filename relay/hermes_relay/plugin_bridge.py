@@ -37,21 +37,21 @@ def find_plugin_dir() -> Path:
     override = os.environ.get("HERMES_RELAY_PLUGIN_DIR")
     if override:
         p = Path(override)
-        if (p / "replay_ring.py").exists():
+        if (p / "device_tokens.py").exists():
             _cached_dir = p
             return p
 
     root = os.environ.get("HERMES_REPO_ROOT")
     if root:
         p = Path(root) / _PLUGIN_REL
-        if (p / "replay_ring.py").exists():
+        if (p / "device_tokens.py").exists():
             _cached_dir = p
             return p
 
     here = Path(__file__).resolve()
     for parent in here.parents:
         cand = parent / _PLUGIN_REL
-        if (cand / "replay_ring.py").exists():
+        if (cand / "device_tokens.py").exists():
             _cached_dir = cand
             return cand
 

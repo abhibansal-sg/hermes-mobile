@@ -8,7 +8,7 @@ from hermes_relay import plugin_bridge
 def test_finds_plugin_dir_in_worktree():
     d = plugin_bridge.find_plugin_dir()
     assert d.name == "hermes-mobile"
-    assert (d / "replay_ring.py").exists()
+    assert (d / "device_tokens.py").exists()
 
 
 def test_resolves_device_token_authority():

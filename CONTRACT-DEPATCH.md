@@ -19,9 +19,9 @@ either already upstream or no longer consumed by `plugins/hermes-mobile` / iOS.
 
 | Seam | Verdict | New-base disposition / evidence |
 |---|---|---|
-| S1 | STILL-NEEDED (reduced) | First-class `post_frame_write` and `on_ws_transport_change` hooks only; no legacy subscriber lists (`hermes_cli/plugins.py`, `tui_gateway/server.py`, `tui_gateway/ws.py`). |
-| S2 | NOT USED FOR NOTIFICATIONS | Push intake now uses stock v0.19 lifecycle hooks (`pre_llm_call`, `post_llm_call`, `on_session_end`, tool and approval hooks). The existing frame seam remains a separate live-client concern until removed from its remaining consumers. |
-| S3 | SUPERSEDED / reduced | Upstream `_session_info` already includes provider. `_runtime_sid` storage is dropped; finalize receives the existing record's `_sid` as transient hook metadata. |
+| S1 | REMOVED | Foreign-frame fan-out was a second delivery system. The phone uses the transparent relay as a normal stock gateway client; foreign sessions reconcile from stock history instead of receiving mirrored private frames. |
+| S2 | REMOVED | Push intake uses stock v0.19 lifecycle hooks (`pre_llm_call`, `post_llm_call`, `on_session_end`, tool and approval hooks). No frame observer or payload transform remains. |
+| S3 | SUPERSEDED | Upstream `_session_info` already includes provider. Finalize cleanup derives runtime aliases from the live stock session table; no extra hook metadata is required. |
 | S4 | STILL-NEEDED (small) | Reasoning is already session-scoped upstream. Only `config.set/get fast` needed adaptation to `create_service_tier_override`. |
 | S5 | STILL-NEEDED | The stock provider registry covers exact Bearer-token REST routes, but not rich device metadata, plugin routes, WS tickets, live revocation, socket indexing, or resolver audit identity. Generic registries and guarded call sites remain. Every device-capable dashboard WS route now enters one shared lifecycle that indexes only active device identities and closes revoke/register races (ABH-449). |
 | S6 | STILL-NEEDED | Stock `session.delete` still returned 4023 for a live row. It now interrupts a running turn, releases prompts/approvals, tears down, deletes, and reports `evicted`. |
@@ -30,7 +30,7 @@ either already upstream or no longer consumed by `plugins/hermes-mobile` / iOS.
 | S9 | OBSOLETE | The plugin enriches fan-out frames with `stored_session_id`; no desktop foreign-frame core adoption seam is referenced. |
 | S10 | OBSOLETE | Embedded-chat route guards are upstream. iOS closes its owned runtime before RPC delete and uses profile-scoped REST only for non-default rows, so the old REST live-delete core guard has no current consumer. |
 | S11 | STILL-NEEDED (generic) | `prompt.submit` exposes a generic receipt-provider registry and calls it before mutation. The hermes-mobile plugin owns SQLite, profile scoping, liveness, and 30-day retention (ABH-462 / R-48). |
-| S12 | STILL-NEEDED (small) | Stock `session.status` exposes only rendered text. The additive structured projection (`running`, nullable model/provider/usage) is generic gateway protocol completeness and an upstream-ready fix; authoritative runtime state is unreachable through a mobile plugin without replacing the core RPC. |
+| S12 | REMOVED | iOS consumes the stock `session.resume` snapshot (`running`, `status`, bounded `inflight`) and uses stock `session.active_list` for read-only liveness. Context occupancy comes from stock `session.usage`. The structured `session.status` fork and its extra iOS round-trip were deleted. |
 | S13 | STILL-NEEDED (generic) | Approval and clarification owners expose lock-safe, display-redacted pending-record snapshots plus the existing clarification waiter resolver. The mobile plugin owns auth visibility, cursor signing, bounded delta/tombstone history, and the REST route (ABH-445 / R-03,R-53,R-54). |
 
 ## 1. Plugin package: `plugins/hermes-mobile/`
@@ -56,20 +56,13 @@ Modules (moved or already-new):
   REST `_require_token` AND `_ws_auth_reason`; whatever it can't reach stays S5).
   Audit: move `tools/approval.py` seam onto `post_approval_response` hook
   (verify kwargs carry enough; device identity may need S5 cooperation).
-- `broadcast.py` — fan-out engine: live-transport registry, per-transport
-  broadcast queue/drain (ws.py clusters A,C,D as module/mixin), enrichment
-  (stored_session_id). Activated only when seam S1 fires it.
 - `gitbranch.py` — `_git_branch_fast` (pure additive helper + 1 call-site swap).
 - Tests move alongside (tests/plugins/hermes_mobile/…).
 
 ## 2. Irreducible seams (each = an upstream-PR candidate)
-S1 write_json broadcast hook (~3 lines, server.py) — after owner write, iterate a
-   module-level subscriber set the plugin populates. PR: "gateway: event fan-out
-   subscribers".
-S2 _emit transform/observer — no notification consumer remains. Audit and
-   remove separately once any non-notification consumers are resolved.
-S3 `_runtime_sid` in session record (1 line) + `provider` in `_session_info`
-   (1 line). PR: trivial info-completeness.
+S1 removed — stock owner routing remains the only frame-delivery path.
+S2 removed — stock lifecycle hooks are the notification input.
+S3 removed — stock session metadata and live-table lookup are sufficient.
 S4 config.set session-scoping for reasoning/fast (~120 lines today) — REWRITE
    smaller by following upstream's accepted `session["model_override"]` pattern
    (session_overrides dict consulted at agent build). PR: "session-scoped
@@ -95,10 +88,9 @@ S11 prompt receipt provider registry + pre-mutation `prompt.submit` call sites.
    `plugins/hermes-mobile/prompt_receipts.py`. ID-enabled responses expose the
    generic acceptance proof (`accepted`, `client_message_id`, `deduplicated`);
    legacy requests without an id retain their stock response shape.
-S12 session.status structured runtime truth (~30 lines, server.py). Preserve the
-   existing `output` while exposing the session record's boolean `running` and
-   nullable agent metadata/usage. PR: "fix(gateway): return structured session
-   status" — generic wire-contract completeness for every JSON-RPC client.
+S12 removed — stock resume/active-list/usage responses already expose the
+   machine-readable state iOS needs; `session.status` remains the stock
+   human-readable command response.
 S13 lock-safe pending-attention owner snapshots (`tools/approval.py`,
    `tui_gateway/server.py`) plus the public clarification resolver. PR:
    "gateway: expose safe pending interaction snapshots". The waiter maps and
@@ -122,8 +114,8 @@ parity for free. Remaining work: reachable bind for the embedded backend
 
 ## 6. Execution plan (house method: contract → fleet → adversarial gate)
 W1 Scaffold plugin package + manifest; move PLUGIN-verdict clusters verbatim;
-   stock files: delete moved code, add S1–S3 seams. Gate: full pytest + plugin
-   loads + routes mounted + broadcast/push smoke on test gateway (9124).
+   stock files stay free of notification/frame-delivery seams. Gate: full pytest
+   + plugin loads + routes mounted + stock-hook push smoke on test gateway.
 W2 Seam-minimization conversions: CLI registration, auth provider, audit hook,
    S4 rewrite to override-dict pattern. Gate: auth matrix tests (shared token /
    device token / OAuth) + approval round-trip.

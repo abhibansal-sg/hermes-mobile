@@ -64,7 +64,6 @@ def test_register_populates_every_seam_registry(plugin_and_ctx):
     plugin, ctx, manager = plugin_and_ctx
     device_tokens = load_plugin_module("device_tokens")
     push_engine = load_plugin_module("push_engine")
-    broadcast = load_plugin_module("broadcast")
 
     plugin.register(ctx)
 
@@ -87,13 +86,13 @@ def test_register_populates_every_seam_registry(plugin_and_ctx):
         provider.__class__.__name__ == "SQLitePromptReceiptProvider"
         for provider in server.PROMPT_RECEIPT_PROVIDERS
     )
-    # Live co-watch still uses S1. Notifications use only upstream v0.19
-    # lifecycle hooks and never register the fork-only S2 emit observer.
+    # Notifications use only upstream v0.19 lifecycle hooks. The plugin does
+    # not register gateway-frame observers or a second live fan-out path.
     hooks = manager._hooks
-    assert any(cb for cb in hooks.get("post_frame_write", [])), "post_frame_write not registered"
-    assert any(cb for cb in hooks.get("on_ws_transport_change", [])), "on_ws_transport_change not registered"
     assert not hooks.get("pre_emit_event")
     assert not hooks.get("post_emit_event")
+    assert not hooks.get("post_frame_write")
+    assert not hooks.get("on_ws_transport_change")
     assert push_engine.handle_turn_start in hooks.get("pre_llm_call", [])
     assert push_engine.handle_turn_reply in hooks.get("post_llm_call", [])
     assert push_engine.handle_turn_end in hooks.get("on_session_end", [])

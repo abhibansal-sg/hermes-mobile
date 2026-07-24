@@ -13,9 +13,8 @@
 # with a temp HERMES_HOME (see r0-relay-spike/launch_gateway.sh) — NEVER the
 # live gateway on 9119.
 #
-# The reused plumbing (replay_ring / push_engine / device_tokens) is imported
-# from plugins/hermes-mobile at runtime via hermes_relay.plugin_bridge; it is
-# NOT installed as a package.
+# The device-token authority is imported from plugins/hermes-mobile at runtime
+# via hermes_relay.plugin_bridge; it is not installed as a second package.
 
 # runtime
 aiohttp>=3.11

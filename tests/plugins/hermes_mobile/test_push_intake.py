@@ -1006,15 +1006,13 @@ def test_live_activity_hook_reuses_one_start_epoch_for_activity_lifetime(
 
 
 # ===========================================================================
-# Session-boundary integration — the gateway's synthetic "session.finalize" /
-# Compatibility event intake can still clean up a deleted Live Activity token,
-# in the plugin. Driven through the same server RPC paths the originals used,
-# with the plugin's handle_gateway_event wired via the wired_gateway fixture.
+# Session-boundary integration — stock ``on_session_finalize`` cleanup driven
+# through the same server RPC paths as production.
 # ===========================================================================
 
 
 def test_session_close_unregisters_live_activity_runtime(monkeypatch, wired_gateway):
-    server_mod, _ws, pn, _bc = wired_gateway
+    server_mod, _ws, pn = wired_gateway
     removed = []
 
     def _fake_unregister(session_id):
@@ -1039,15 +1037,15 @@ def test_session_close_unregisters_live_activity_runtime(monkeypatch, wired_gate
     finally:
         server_mod._sessions.pop("sid-la-close", None)
 
-    # The finalize event passes the runtime sid plus the stored session id /
-    # session key, so the runtime sid must be among the unregistered ids.
-    assert "sid-la-close" in removed
+    # Stock finalization identifies the durable conversation. Runtime-keyed
+    # ActivityKit teardown remains phone-owned; no runtime-id hook is needed.
+    assert removed == ["stored-session"]
 
 
 def test_session_delete_does_not_require_notification_emit_observer(
     monkeypatch, wired_gateway
 ):
-    server_mod, _ws, pn, _bc = wired_gateway
+    server_mod, _ws, pn = wired_gateway
     removed = []
 
     class _DB:
