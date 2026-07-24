@@ -1,7 +1,6 @@
 """Shared client for the hermes-mobile opt-in push relay.
 
-Adapted from Fetch's ``_relay.py`` for ABH-208 Slice B. The relay holds APNs
-credentials and fans out to registered devices. This host stores only an
+The relay holds APNs credentials and fans out to registered devices. This host stores only an
 anonymous per-agent ``agent_id`` + ``agent_secret`` minted on first relay use.
 
 Relay mode is deliberately opt-in: no hosted relay URL is compiled in. Set

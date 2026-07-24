@@ -1,1 +1,1 @@
-"""Fetch iOS push relay."""
+"""Hermes Mobile push relay."""
