@@ -23,11 +23,11 @@ either already upstream or no longer consumed by `plugins/hermes-mobile` / iOS.
 | S2 | REMOVED | Push intake uses stock v0.19 lifecycle hooks (`pre_llm_call`, `post_llm_call`, `on_session_end`, tool and approval hooks). No frame observer or payload transform remains. |
 | S3 | SUPERSEDED | Upstream `_session_info` already includes provider. The stock finalize hook supplies the durable stored ID; the plugin uses it as a fallback Live Activity teardown key while the phone owns runtime-keyed ActivityKit teardown. No extra hook metadata is required. |
 | S4 | STILL-NEEDED (small) | Reasoning is already session-scoped upstream. Only `config.set/get fast` needed adaptation to `create_service_tier_override`. |
-| S5 | STILL-NEEDED | The stock provider registry covers exact Bearer-token REST routes, but not rich device metadata, plugin routes, WS tickets, live revocation, socket indexing, or resolver audit identity. Generic registries and guarded call sites remain. Every device-capable dashboard WS route now enters one shared lifecycle that indexes only active device identities and closes revoke/register races (ABH-449). |
+| S5 | STILL-NEEDED | The stock provider registry covers exact Bearer-token REST routes, but not rich identity metadata, plugin routes, WS tickets, live revocation, socket indexing, resource ownership, or resolver audit identity. Generic registries and guarded call sites remain; core never imports Hermes Mobile or owns its device/session map. Every token-authenticated dashboard WS route enters one shared lifecycle that indexes only active identities and closes revoke/register races (ABH-449). |
 | S6 | STILL-NEEDED | Stock `session.delete` still returned 4023 for a live row. It now interrupts a running turn, releases prompts/approvals, tears down, deletes, and reports `evicted`. |
 | S7 | SUPERSEDED | Upstream `WSTransport` already schedules loop-owned writes, coalesces token frames, and preserves control-frame ordering. |
 | S8 | SUPERSEDED | `exclude_sources` is already implemented in `hermes_state.py` and both dashboard session APIs. |
-| S9 | OBSOLETE | The plugin enriches fan-out frames with `stored_session_id`; no desktop foreign-frame core adoption seam is referenced. |
+| S9 | REMOVED | No plugin fan-out enrichment or desktop foreign-frame adoption seam remains. Stock owner routing and bounded history reconciliation replace that duplicate path. |
 | S10 | OBSOLETE | Embedded-chat route guards are upstream. iOS closes its owned runtime before RPC delete and uses profile-scoped REST only for non-default rows, so the old REST live-delete core guard has no current consumer. |
 | S11 | STILL-NEEDED (generic) | `prompt.submit` exposes a generic receipt-provider registry and calls it before mutation. The hermes-mobile plugin owns SQLite, profile scoping, liveness, and 30-day retention (ABH-462 / R-48). |
 | S12 | REMOVED | iOS consumes the stock `session.resume` snapshot (`running`, `status`, bounded `inflight`) and uses stock `session.active_list` for read-only liveness. Context occupancy comes from stock `session.usage`. The structured `session.status` fork and its extra iOS round-trip were deleted. |
@@ -67,19 +67,20 @@ S4 config.set session-scoping for reasoning/fast (~120 lines today) — REWRITE
    smaller by following upstream's accepted `session["model_override"]` pattern
    (session_overrides dict consulted at agent build). PR: "session-scoped
    reasoning/fast overrides" — natural extension of their own fix.
-S5 Device-token auth branches not coverable by the auth-provider registry
-   (`_ws_auth_reason` WS branch, `mint_ticket extra`, shared device-socket
-   lifecycle on every accepting WS handler, resolver audit call sites). The
-   lifecycle is provider-neutral and notifies generic socket observers; the
-   plugin owns the per-device index and revoke/register race guard. PR:
-   "pluggable WS auth / ticket extras / authenticated socket lifecycle".
+S5 Rich token-auth branches not coverable by the auth-provider registry
+   (`_ws_auth_reason` WS branch, `mint_ticket extra`, authenticated socket
+   lifecycle on every accepting WS handler, resource-ownership checks, and
+   resolver audit call sites). The lifecycle and registries are provider-
+   neutral; the plugin owns device policy, the per-device index, and the only
+   device/session owner map. PR: "pluggable WS auth / ticket extras /
+   authenticated socket lifecycle".
 S6 session.delete live-evict (~35-line helper + shim in the RPC handler).
    PR: UX fix — delete shouldn't 4023 on live sessions.
 S7 WSTransport non-blocking owner-write queue (~175 lines, class rewrite).
    PR: perf/robustness fix (head-of-line blocking) — strong standalone case.
 S8 `exclude_sources` params (hermes_state 7 + web_server 8). PR: API addition.
-S9 Desktop foreign-frame adoption ref-threading (~60 lines across 3 files) —
-   ships only WITH the desktop multi-client PR; until then stays in fork.
+S9 removed — the phone is a stock gateway client, so there is no foreign-frame
+   adoption or plugin-enriched fan-out protocol to retain.
 S10 web_server REST live-delete guard (~34) + embedded-chat guard reorder (~12).
    Bundle into S6's PR.
 S11 prompt receipt provider registry + pre-mutation `prompt.submit` call sites.

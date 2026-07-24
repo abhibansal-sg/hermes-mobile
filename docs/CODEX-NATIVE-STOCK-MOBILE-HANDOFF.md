@@ -1,12 +1,20 @@
 # Hermes Mobile native-stock architecture handoff
 
-**Prepared:** 2026-07-24  
-**Review branch:** `codex/native-stock-architecture`  
-**Draft PR:** [#243 — refactor(mobile): adopt stock notification and session architecture](https://github.com/abhibansal-sg/hermes-mobile/pull/243)  
-**Product implementation head:** `a651d3a49acd6cb3306bf0e3efcf37ac09bbf37d`  
-**Finalize-oracle correction:** `174aed949`  
-**PR merge base:** `82c2545662905b80bf86e6d85c15358918eb5f80`  
-**Current `origin/main` when this was written:** `f890a1d12dec7763ea61c55861d441c60240d9a7`
+**Prepared:** 2026-07-24
+
+**Review branch:** `codex/native-stock-architecture`
+
+**Draft PR:** [#243 — refactor(mobile): adopt stock notification and session architecture](https://github.com/abhibansal-sg/hermes-mobile/pull/243)
+
+**Stock-hook implementation:** `2dae8d44c`
+
+**Duplicate-path deletion:** `d40a7971b`
+
+**Finalize-oracle correction:** `a68ce0dca`
+
+**Independent-review correction:** `2eba1915d`
+
+**PR merge base / current `origin/main`:** `f890a1d12dec7763ea61c55861d441c60240d9a7`
 
 This is the reviewer handoff for the complete Hermes Mobile simplification
 exercise. In this document, “custom scene” is interpreted as **custom seam**:
@@ -29,9 +37,9 @@ The mobile chat architecture now has one conversation protocol:
 5. Mobile-only edge behavior lives in `plugins/hermes-mobile`.
 6. Five generic core seams remain: S4, S5, S6, S11, and S13.
 
-The current PR deletes the second frame-delivery/replay/status architecture:
-**565 additions and 4,494 deletions** relative to its merge base. Its second
-commit alone is **117 additions and 4,085 deletions**.
+The current PR is a net-deletion of the second frame-delivery/replay/status
+architecture. The review correction deletes another 652 lines while adding
+146 lines for corrected tests, truthful metadata, and one generic S5 checker.
 
 This PR is not merged or released by this handoff. It did not modify the live
 gateway, live relay, production configuration, TestFlight, or `main`.
@@ -176,12 +184,10 @@ keeps bounded process-local maps for open device sockets, foreground session
 selection, and runtime-to-device correlation. Revocation closes indexed
 device sockets; shared-token sockets are not indexed as devices.
 
-There is also a hosted-relay pairing route at
-`/api/plugins/hermes-mobile/relay/pair`. That produces a different
-`kind=relay` link for the hosted broker/tunnel capability. It must not be
-confused with direct gateway/device-token pairing. The iOS parser recognizes
-this payload, but `HermesURLRouter.applyPair` currently returns without applying
-it, so it is not a working connection path today.
+The former hosted `kind=relay` setup link was a dead end: the plugin minted it
+and iOS parsed it, but the app never applied it. That route, parser branch, and
+tests are now deleted. Hosted push enrollment remains separate from the direct
+gateway/device-token pairing flow above.
 
 ### 4. Durable sends and pending interactions
 
@@ -208,15 +214,15 @@ uses the generic S5 resolve-observer context.
   bounded REST transcript pages; it is not a transcript store.
 - [`ios_turn_context.py`](../plugins/hermes-mobile/ios_turn_context.py) injects
   concise mobile-output guidance only for authenticated mobile turns.
-- [`kanban_spec_guard.py`](../plugins/hermes-mobile/kanban_spec_guard.py) blocks
-  under-specified agent-created kanban cards.
 - [`gitbranch.py`](../plugins/hermes-mobile/gitbranch.py) is a small branch
   lookup helper.
 
-The last two policy modules are not necessary for transport, caching, or push.
-Their continued placement in the Hermes Mobile adapter is a legitimate
-independent review question. The mobile-output hook also deserves a prompt
-cache/instruction-stability review even though it uses a stock hook.
+The mobile-output hook is an explicit presentation policy of the iOS adapter,
+not transport behavior. Stock Hermes injects its return value only into the
+current API-call copy of the user message (`agent/turn_context.py` and
+`agent/conversation_loop.py`); it does not mutate history or the cached system
+prompt, so the stable prompt-cache prefix is preserved. The unrelated
+`kanban_spec_guard` policy and its tests were removed from this adapter.
 
 ## What remains custom inside Hermes core
 
@@ -227,7 +233,7 @@ host seams.
 | Seam | Core files | What core exposes | What stays in the plugin | Why stock v0.19 is insufficient |
 |---|---|---|---|---|
 | S4 | `tui_gateway/server.py` | Session-scoped `fast` override carried through create/config/agent build | No mobile state | Stock has session model/reasoning overrides, but not the complete hot fast-tier override path |
-| S5 | `hermes_cli/dashboard_auth/token_auth.py` plus guarded dashboard/WS/resolver call sites | Generic token authenticators, identity validators, socket observers, resolver identity context | Device registry, hash policy, liveness, revoke races, socket index, audit record | Stock auth providers do not cover WS tickets, live revocation, device metadata, socket lifecycle, and resolver identity end-to-end |
+| S5 | `hermes_cli/dashboard_auth/token_auth.py` plus guarded dashboard/WS/resolver call sites | Generic token authenticators, identity validators, socket observers, session-ownership checkers, resolver identity context | Device registry, hash policy, liveness, revoke races, socket index, the only device/session owner map, audit record | Stock auth providers do not cover WS tickets, live revocation, rich identity metadata, socket lifecycle, resource ownership, and resolver identity end-to-end |
 | S6 | `tui_gateway/server.py` | `session.delete` safely interrupts/tears down a matching live runtime and reports `evicted` | Nothing mobile-specific | Stock returns 4023 rather than deleting a live session |
 | S11 | `tui_gateway/server.py` | Structural prompt-receipt provider registry and pre-mutation call | SQLite schema, scoping, retention, liveness and disposition | Stock `prompt.submit` has no durable idempotency receipt |
 | S13 | `tools/approval.py`, `tui_gateway/server.py` | Lock-safe redacted pending approval/clarification snapshots, clarification resolver, resolve observers | Auth visibility, signed cursors, bounded delta/tombstones, REST route | The waiter maps and locks are private to core and cannot be safely reconstructed by a plugin |
@@ -235,6 +241,20 @@ host seams.
 These seams are intentionally provider-neutral and are candidates for
 upstreaming independently. They must not import Hermes Mobile, APNs, GRDB, or
 mobile paths.
+
+### S5 audit result
+
+The retained S5 call sites carry only an authenticated identity dictionary,
+scope checks, ticket metadata, socket lifecycle notifications, and a generic
+session-ownership question. The ownership check previously imported
+`hermes_plugins.hermes_mobile.device_tokens` from `tui_gateway/server.py`;
+that dependency is removed. `token_auth.py` now exposes the checker registry,
+and the plugin answers from its existing bounded owner map.
+
+There is no credential database, revocation index, device/session map, APNs
+policy, or Hermes Mobile import in core. With the plugin absent all four S5
+registries are empty, rich-token authentication fails closed, and stock shared
+dashboard/session authentication remains unchanged.
 
 ### Behavior on pristine public v0.19
 
@@ -491,27 +511,26 @@ push intake.
 
 ## Current PR verification
 
-Recorded on the implementation head:
+Recorded before the independent-review correction:
 
 - physical iPhone 16 Pro Max:
   `LiveTurnReentryTests` and `ContextMeterTests` passed;
-- focused gateway suite: 6 passed;
-- plugin notification/registration suite: 48 passed;
-- complete retained relay suite: 27 passed;
-- plugin registration against pristine public v0.19 passed;
-- Python compile and `git diff --check` passed;
-- full mobile-plugin sweep: 636 passed with five known baseline failures.
+- plugin registration against pristine public v0.19 passed.
 
-The five plugin failures are:
+Re-run on review-correction code head `2eba1915d`, after rebasing onto current
+main:
 
-- four stale Live Activity mocks that do not accept the current `priority`
-  argument or assert old event behavior;
-- one environment-dependent provider-auth backfill assertion.
+- relay suite: **27 passed**;
+- stock-hook notification/registration/Live Activity slice: **63 passed**;
+- finalize/lazy-session regression file: **18 passed**;
+- S5 auth, ticket, ownership, and plugin-wiring slices: **102 passed**;
+- complete mobile-plugin sweep: **624 passed**, with only the known
+  owner-configuration-sensitive provider assertion failing;
+- that provider assertion passed in an isolated `HERMES_HOME`: **1 passed**;
+- Python compile and `git diff --check` passed.
 
-GitHub CI initially failed one stale test that still required removed S3
-`runtime_session_id` finalize metadata. Commit `174aed949` changes only that
-test expectation and corrects the S3 ledger wording. The complete focused file
-then passed: **18 passed**.
+The required current-head physical iOS rerun and APNs completion/approval proof
+remain the only open verification gate.
 
 ## Important limits and open review findings
 
@@ -520,32 +539,35 @@ then passed: **18 passed**.
    clarification notification device evidence predates the switch from frame
    observers to stock hooks. A reviewer should require at least one
    current-head physical notification for completion and one actionable gate.
-2. **The four stale Live Activity mock failures touch the subsystem changed by
-   this PR.** Calling them pre-existing is historically accurate, but they
-   should not be allowed to conceal a new push regression.
-3. **S5 is the broadest retained core seam.** Review it for the minimum generic
-   registries/call sites and confirm no device policy leaked into core.
-4. **The plugin manifest says `provides_hooks: []` while `register(ctx)`
-   dynamically registers stock hooks.** Confirm this is valid manifest
-   semantics or update the declaration/documentation.
+2. **The four stale Live Activity mocks are corrected.** They now accept the
+   real notifier priority and drive completion/finalize through stock hook
+   entry points. The focused suite is green.
+3. **S5 remains the broadest retained core seam and has been audited.** One
+   direct core-to-plugin ownership import was found and replaced by a generic
+   checker beside the existing auth registries. The plugin still owns all
+   credential, revocation, socket-index, and session-owner state.
+4. **The manifest hook declaration is corrected.** `provides_hooks` is
+   informational in the stock plugin manager rather than an enforcement gate,
+   but it now lists every hook name dynamically registered by the adapter so
+   metadata cannot silently drift.
 5. **The hosted broker retains Fetch naming and tunnel capabilities.** Confirm
    which hosted functions Hermes Mobile actually deploys; do not accidentally
    merge the stateful APNs broker with the stateless co-located chat proxy.
-6. **Hosted `kind=relay` pairing is currently dormant/incomplete.** The plugin
-   can mint the link and iOS can parse it, but `HermesURLRouter.applyPair`
-   explicitly ignores it. Do not describe that route as zero-setup mobile
-   connectivity unless it is either completed under an approved plan or
-   deleted.
-7. **`ios_turn_context` and `kanban_spec_guard` are policy, not transport.**
-   Review whether they belong in this adapter and whether mobile context
-   injection preserves the project’s prompt-cache contract.
+6. **The dormant hosted `kind=relay` pairing path was deleted.** The stateful
+   hosted push broker remains separate from the stateless chat proxy; no
+   minted-but-ignored mobile pairing link remains.
+7. **`ios_turn_context` is presentation policy, not transport.** Its scope is
+   explicit in the plugin manifest. Stock pre-LLM context injection changes
+   only the current API-call user-message copy, preserving history and the
+   byte-stable cached system prompt. The unrelated `kanban_spec_guard` was
+   deleted from this adapter.
 8. **Pristine-stock registration is graceful degradation, not zero-seam
    parity.** Test both “loads” and the actual absence behavior for each optional
    seam.
-9. **The branch was created from `82c254566`; `origin/main` advanced to
-   `f890a1d12` while this work was in progress.** GitHub reports it mergeable,
-   but the reviewer must inspect the three-dot diff against current main and
-   rerun the affected gates after the gated update/merge.
+9. **The branch is rebased onto `f890a1d12`.** Range-diff preserved the four
+   original changes, and the main commit touched adjacent iOS views/support
+   rather than the branch’s protocol/store files. Physical iOS gates still
+   must be rerun on the final review-correction head.
 10. **No live production validation belongs to this branch.** Production
    gateway wiring, TestFlight release, and owner data truth must be a separate,
    explicitly approved deployment gate.
@@ -565,8 +587,8 @@ Verify relay transparency and absence of state/translation:
 
 ```sh
 PYTHONPATH=relay python -m pytest -q relay/tests
-git diff -U0 origin/main...HEAD -- relay/ |
-  rg 'json\\.loads|json\\.dumps|sqlite|transcript|replay|reframe|session_state'
+git diff -U0 origin/main...HEAD -- relay/hermes_relay |
+  rg '^\\+[^+].*(json\\.loads|json\\.dumps|sqlite|transcript|replay|reframe|session_state)'
 ```
 
 Verify the removed observer/replay architecture stays absent:
@@ -628,10 +650,10 @@ Please review, in this order:
    runtime.
 7. Trace completion, approval, clarification, error, and interrupt push from
    the exact stock hook to APNs.
-8. Decide whether `ios_turn_context` and `kanban_spec_guard` belong in the
-   mobile adapter.
+8. Confirm the retained `ios_turn_context` stays limited to authenticated
+   mobile turns and continues to use stock cache-safe user-message injection.
 9. Distinguish and audit the stateless chat proxy and stateful APNs broker as
-   separate systems, including the currently ignored `kind=relay` pairing.
+   separate systems; the unused cross-system `kind=relay` pairing path is gone.
 10. Require current-head physical notification evidence before approval.
 
 The acceptance standard is architectural deletion, not merely passing tests:
