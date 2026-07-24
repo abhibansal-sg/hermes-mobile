@@ -529,16 +529,27 @@ main:
 - that provider assertion passed in an isolated `HERMES_HOME`: **1 passed**;
 - Python compile and `git diff --check` passed.
 
-The required current-head physical iOS rerun and APNs completion/approval proof
-remain the only open verification gate.
+Re-run on final review-correction code head `518fde7e4`:
+
+- physical completion APNs opened and painted the owning session: green;
+- physical actionable approval APNs opened the owning gate, resumed the turn,
+  and painted the final answer: green;
+- physical `NotificationLaunchCoordinatorTests` +
+  `NotificationActionTests`: green;
+- physical `LiveTurnReentryTests` + `ContextMeterTests`: green.
+
+The exact commands, runtime/stored IDs, timestamps, markers, broker rows, and
+artifact paths are recorded in
+[`PR243-CURRENT-HEAD-PHYSICAL-PUSH-EVIDENCE.md`](PR243-CURRENT-HEAD-PHYSICAL-PUSH-EVIDENCE.md).
 
 ## Important limits and open review findings
 
-1. **Current PR push behavior lacks a new physical APNs proof.** The physical
-   session-resume/context tests are green, but the completion/approval/
-   clarification notification device evidence predates the switch from frame
-   observers to stock hooks. A reviewer should require at least one
-   current-head physical notification for completion and one actionable gate.
+1. **Current-head physical APNs proof is green.** Completion opened and painted
+   the owning session. An actionable approval opened the owning gate, resumed
+   the blocked turn, and painted the final answer. The gate exposed one real
+   missing edge: foreground completion APNs was presented but did not reconcile
+   the active transcript. `518fde7e4` now routes that existing notification
+   edge through the existing one-shot backfill and drawer refresh.
 2. **The four stale Live Activity mocks are corrected.** They now accept the
    real notifier priority and drive completion/finalize through stock hook
    entry points. The focused suite is green.
@@ -553,6 +564,11 @@ remain the only open verification gate.
 5. **The hosted broker retains Fetch naming and tunnel capabilities.** Confirm
    which hosted functions Hermes Mobile actually deploys; do not accidentally
    merge the stateful APNs broker with the stateless co-located chat proxy.
+   The current hosted deployment rejects `ai.hermes.app` as an unsupported
+   bundle ID even though repository source allows it. This is a separate
+   deployment prerequisite; the current-head device gate used repository
+   `server/push-relay` locally with real sandbox APNs and changed no hosted
+   service.
 6. **The dormant hosted `kind=relay` pairing path was deleted.** The stateful
    hosted push broker remains separate from the stateless chat proxy; no
    minted-but-ignored mobile pairing link remains.
@@ -566,8 +582,8 @@ remain the only open verification gate.
    seam.
 9. **The branch is rebased onto `f890a1d12`.** Range-diff preserved the four
    original changes, and the main commit touched adjacent iOS views/support
-   rather than the branch’s protocol/store files. Physical iOS gates still
-   must be rerun on the final review-correction head.
+   rather than the branch’s protocol/store files. The physical iOS gates were
+   rerun on final correction head `518fde7e4`.
 10. **No live production validation belongs to this branch.** Production
    gateway wiring, TestFlight release, and owner data truth must be a separate,
    explicitly approved deployment gate.
