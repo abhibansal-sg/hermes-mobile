@@ -1095,15 +1095,6 @@ final class ConnectionStore {
     /// cancelled on disconnect so a teardown mid-hydration can't later flip the
     /// phase back to `.connected`.
     private var hydrationTask: Task<Void, Never>?
-    /// Whether the session-list `refresh()` kicked off in ``startHydration`` actually
-    /// COMPLETED, vs being cancelled by the hard-`hydrationTimeout` race. For a large
-    /// account the list pull (hundreds/thousands of sessions) reliably loses the 8s
-    /// race, so the refresh is cancelled and the drawer is left on STALE cache even
-    /// though the phase flips to `.connected` (reported: cold-launch sessions stuck at
-    /// an old timestamp, new messages not visible). ``finishHydration`` re-fires the
-    /// refresh in the background when this is false — the same safety net the running-
-    /// model probe already has.
-    private var hydrationRefreshCompleted = false
     /// True once a connection has been established at least once, so that a
     /// later `.closed`/`.failed` should trigger reconnection rather than be
     /// treated as a clean initial idle state.
@@ -1574,45 +1565,34 @@ final class ConnectionStore {
 
     /// Coordinate the post-connect `.hydrating → .connected` transition.
     ///
-    /// Races the real gateway-state hydration (session-list refresh + running-
-    /// model probe) against a hard `hydrationTimeout`: whichever finishes first
+    /// Races the initial session paint + running-model probe against a hard
+    /// `hydrationTimeout`: whichever finishes first
     /// flips the phase to `.connected` and lands on a fresh new-chat draft, so
     /// the branded loading screen NEVER strands even if a probe is slow or hangs.
     /// Idempotent in effect — `finishHydration()` only acts while still
     /// `.hydrating`, so the losing branch of the race is a no-op.
-    /// The hydration session-list refresh, wrapped so its COMPLETION (vs being
-    /// cancelled by the timeout race) is recorded on the main actor. `refresh()`
-    /// returns early on cancellation, so `Task.isCancelled` distinguishes a real
-    /// completion from a cancelled one; `finishHydration` re-fires the refresh in
-    /// the background when this never set the flag.
-    private func runHydrationRefresh(generation: UInt64) async {
+    /// Paint enough session state to reveal the shell: disk cache when available,
+    /// otherwise the small stock first-pair slice. The authoritative recent-order
+    /// refresh remains off the reveal path in ``finishHydration``.
+    private func runInitialSessionPaint(generation: UInt64) async {
         guard isActiveGeneration(generation) else { return }
-        await sessionStore.refresh()
-        guard !Task.isCancelled, isActiveGeneration(generation) else { return }
-        hydrationRefreshCompleted = true
+        await sessionStore.refreshInitialPaint()
     }
 
     private func startHydration(generation: UInt64) {
         guard isActiveGeneration(generation) else { return }
         hydrationTask?.cancel()
-        hydrationRefreshCompleted = false
         hydrationTask = Task { [weak self] in
             guard let self, self.isActiveGeneration(generation) else { return }
             await withTaskGroup(of: Void.self) { group in
-                // Branch 1: the real hydration — pull the session list (so the
-                // drawer is populated when the shell reveals) AND resolve the
+                // Branch 1: the real hydration — paint a small first-pair slice
+                // (or the existing disk cache) so the drawer is populated when
+                // the shell reveals, AND resolve the
                 // running model (so the composer chip can render immediately).
-                // The two run CONCURRENTLY with each other via `async let`, not
-                // chained: with hundreds of sessions the list pull can eat the
-                // whole hydration budget, and sequencing the probe behind it meant
-                // a slow first connect let the timeout branch win and cancel the
-                // group before the probe ran — so the composer chip stayed empty
-                // until a force-quit warmed the cache. Awaiting both here keeps
-                // the outer race intact (this branch finishes only when BOTH are
-                // done) while letting the chip resolve in parallel. (ABH-84 QA.)
+                // The two run concurrently so neither delays the other.
                 group.addTask { [weak self] in
                     guard let self, await self.isActiveGeneration(generation) else { return }
-                    async let sessions: Void = self.runHydrationRefresh(generation: generation)
+                    async let sessions: Void = self.runInitialSessionPaint(generation: generation)
                     async let model: Void = self.refreshActiveModel(generation: generation)
                     _ = await (sessions, model)
                 }
@@ -1671,28 +1651,16 @@ final class ConnectionStore {
                 await self?.refreshActiveModel(generation: generation)
             }
         }
-        // STALE-DRAWER FIX: the hydration race cancels the session-list `refresh()`
-        // when the 8s timeout branch wins — which it reliably does for a large account
-        // (the list pull eats the whole budget). Without recovery the drawer stays on
-        // STALE cache while the UI shows "connected" (reported: cold-launch sessions
-        // stuck at an old timestamp; new messages not visible until a manual pull).
-        // The model probe above already has this exact safety net; give the session
-        // list one too — re-run the refresh in the BACKGROUND (off the reveal path,
-        // phase is already `.connected`) so the drawer reconciles to the gateway's
-        // fresh state shortly after connect. Opening a session then fetches its fresh
-        // transcript on its own (the delta route falls back to a full resync).
-        if !hydrationRefreshCompleted {
-            Task { [weak self] in
-                guard let self, self.isActiveGeneration(generation) else { return }
-                await self.sessionStore.refresh()
-                guard self.isActiveGeneration(generation) else { return }
-            }
+        // The initial slice is deliberately provisional. Reconcile the normal
+        // compression-aware recent snapshot off the reveal path, then warm its
+        // transcripts. The same task also recovers when the 8s fallback cancelled
+        // the first-paint request.
+        Task { [weak self] in
+            guard let self, self.isActiveGeneration(generation) else { return }
+            await self.sessionStore.refresh()
+            guard self.isActiveGeneration(generation) else { return }
+            self.sessionStore.prefetchRecentTranscripts()
         }
-        // CACHE-FIRST coverage (WhatsApp bar): hydration has settled and the
-        // session list is populated — warm the top-N recent transcripts in the
-        // background so nearly every subsequent drawer tap is a disk hit. Paced +
-        // cancellable; a no-op when offline (no REST client) or on a cold cache.
-        sessionStore.prefetchRecentTranscripts()
         // Hygiene (WhatsApp bar): run the daily-throttled eviction sweep so the
         // cache never grows unbounded. Self-throttled to once/24h in CacheStore.
         sessionStore.runEvictionIfNeeded()

@@ -92,7 +92,12 @@ final class SessionStore {
     /// One recent authoritative window. Older sessions remain available through
     /// the existing server-backed search instead of a second pagination state
     /// machine in the drawer.
-    static let snapshotLimit = 200
+    nonisolated static let snapshotLimit = 200
+
+    /// Small creation-ordered slice used only when first pairing has no disk
+    /// cache. The normal recent-order snapshot immediately reconciles it after
+    /// the shell paints.
+    nonisolated static let initialSnapshotLimit = 20
 
     /// Sources excluded server-side from the human-chat Recents list (drawer
     /// bifurcation). Automation RUNS (`source == "cron"`) and agent-internal
@@ -2269,9 +2274,32 @@ final class SessionStore {
         _ = await refreshOutcome()
     }
 
+    /// First-pair paint: cached rows are enough when present; otherwise fetch a
+    /// small stock creation-ordered slice that avoids the expensive recent-chain
+    /// query. ``ConnectionStore`` follows it with the normal authoritative refresh.
+    func refreshInitialPaint() async {
+        _ = await refreshOutcome(
+            limit: Self.initialSnapshotLimit,
+            order: "created",
+            cachePaintIsEnough: true
+        )
+    }
+
     /// The same authoritative cache/REST/WS pipeline with a typed result for
     /// background policy. This must remain the sole refresh implementation.
     func refreshOutcome() async -> BackgroundRefreshOutcome {
+        await refreshOutcome(
+            limit: Self.snapshotLimit,
+            order: "recent",
+            cachePaintIsEnough: false
+        )
+    }
+
+    private func refreshOutcome(
+        limit: Int,
+        order: String,
+        cachePaintIsEnough: Bool
+    ) async -> BackgroundRefreshOutcome {
         let myConnectionWorkGeneration = connectionWorkGeneration
         let myCacheScope = currentCacheScope
         var fallbackOutcome: BackgroundRefreshOutcome?
@@ -2310,6 +2338,7 @@ final class SessionStore {
         await paintFromCache()
         guard connectionWorkGeneration == myConnectionWorkGeneration,
               currentCacheScope == myCacheScope else { return .timeout }
+        if cachePaintIsEnough, !sessions.isEmpty { return .success }
         if let cacheStore, let scope = currentCacheScope {
             // Bounded, resumable batches. Yield between transactions so cache
             // paint and interaction are never held behind historical indexing.
@@ -2352,12 +2381,14 @@ final class SessionStore {
                 if usesAggregateRail {
                     fetched = try await rest.profileSessions(
                         profile: DefaultsKeys.allProfilesScope,
-                        limit: Self.snapshotLimit,
+                        limit: limit,
+                        order: order,
                         excludeSource: Self.recentsExcludeSources
                     ).sessions
                 } else {
                     fetched = try await rest.sessionsWithTotal(
-                        limit: Self.snapshotLimit,
+                        limit: limit,
+                        order: order,
                         minMessages: 1,
                         excludeSource: Self.recentsExcludeSources
                     ).sessions
@@ -2377,11 +2408,15 @@ final class SessionStore {
             }
         }
 
+        // The stock WS list always performs the expensive recent-order query
+        // and over-fetches at least 200 rows, so it cannot satisfy the quick
+        // creation-ordered first paint.
+        guard order == "recent" else { return fallbackOutcome ?? .retryableFailure }
         guard let client else { return fallbackOutcome ?? .retryableFailure }
         do {
             let raw = try await client.requestRaw(
                 "session.list",
-                params: .object(["limit": .number(Double(Self.snapshotLimit))])
+                params: .object(["limit": .number(Double(limit))])
             )
             guard refreshToken == myToken,
                   currentCacheScope == myCacheScope else { return .timeout }

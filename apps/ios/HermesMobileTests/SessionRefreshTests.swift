@@ -77,6 +77,54 @@ final class SessionRefreshTests: XCTestCase {
         XCTAssertEqual(SessionStore.snapshotLimit, 200)
     }
 
+    func testFirstPairPaintsSmallCreatedSliceBeforeAuthoritativeRecentSnapshot() async {
+        FirstPairSessionListStubProtocol.requestedOrders = []
+        let config = URLSessionConfiguration.ephemeral
+        config.protocolClasses = [FirstPairSessionListStubProtocol.self]
+        let rest = RestClient(
+            baseURL: URL(string: "https://gateway.test")!,
+            token: "test-token",
+            session: URLSession(configuration: config)
+        )
+
+        let chat = ChatStore()
+        let store = SessionStore()
+        let connection = ConnectionStore(sessionStore: store, chatStore: chat)
+        let attachments = AttachmentStore()
+        chat.attach(connection: connection, sessions: store, attachments: attachments)
+        store.attach(connection: connection, chat: chat)
+        connection._restOverrideForTesting = rest
+        connection._seedConnectedForTesting(
+            serverURL: "https://gateway.test",
+            token: "test-token"
+        )
+
+        await store.refreshInitialPaint()
+
+        XCTAssertEqual(store.sessions.map(\.id), ["quick"])
+        XCTAssertEqual(FirstPairSessionListStubProtocol.requestedOrders, ["created"])
+
+        await store.refresh()
+
+        XCTAssertEqual(store.sessions.map(\.id), ["authoritative"])
+        XCTAssertEqual(FirstPairSessionListStubProtocol.requestedOrders, ["created", "recent"])
+    }
+
+    func testInitialPaintKeepsWarmRowsWithoutAProvisionalFetch() async {
+        let store = makeStore()
+        store.sessions = [makeSummary(id: "cached")]
+        var fetchCount = 0
+        store.sessionsFetch = {
+            fetchCount += 1
+            return ([self.makeSummary(id: "unexpected")], 1)
+        }
+
+        await store.refreshInitialPaint()
+
+        XCTAssertEqual(fetchCount, 0)
+        XCTAssertEqual(store.sessions.map(\.id), ["cached"])
+    }
+
     // MARK: - build125: identical first-page refresh produces no array churn (#208)
 
     /// A periodic first-page refresh that returns byte-identical rows must NOT
@@ -377,6 +425,47 @@ final class SessionRefreshTests: XCTestCase {
             "Hard-replace is no longer acceptable — active session must survive the merge")
     }
 
+}
+
+private final class FirstPairSessionListStubProtocol: URLProtocol, @unchecked Sendable {
+    nonisolated(unsafe) static var requestedOrders: [String] = []
+
+    override class func canInit(with request: URLRequest) -> Bool { true }
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+
+    override func startLoading() {
+        let components = request.url.flatMap {
+            URLComponents(url: $0, resolvingAgainstBaseURL: false)
+        }
+        let items = components?.queryItems ?? []
+        let order = items.first(where: { $0.name == "order" })?.value ?? ""
+        let limit = items.first(where: { $0.name == "limit" })?.value
+        Self.requestedOrders.append(order)
+
+        let expectedLimit = order == "created"
+            ? String(SessionStore.initialSnapshotLimit)
+            : String(SessionStore.snapshotLimit)
+        guard limit == expectedLimit else {
+            client?.urlProtocol(self, didFailWithError: URLError(.badURL))
+            return
+        }
+
+        let id = order == "created" ? "quick" : "authoritative"
+        let body = """
+        {"sessions":[{"id":"\(id)","title":"\(id)","started_at":1,"message_count":1,"source":"cli","last_active":1}],"total":1}
+        """.data(using: .utf8)!
+        let response = HTTPURLResponse(
+            url: request.url!,
+            statusCode: 200,
+            httpVersion: nil,
+            headerFields: ["Content-Type": "application/json"]
+        )!
+        client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+        client?.urlProtocol(self, didLoad: body)
+        client?.urlProtocolDidFinishLoading(self)
+    }
+
+    override func stopLoading() {}
 }
 
 // MARK: - ABH-178: explicit turnInProgress carry-forward gate
