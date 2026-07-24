@@ -174,7 +174,6 @@ targets:
           - WorkRepositoryLeaseTests.swift
           - WorkRepositoryMigrationTests.swift
           - WorkRepositoryTestSupport.swift
-      - path: ../../tests/fixtures/session_status_responses.json
         buildPhase: resources
     dependencies:
       - target: HermesMobile

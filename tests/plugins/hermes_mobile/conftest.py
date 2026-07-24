@@ -6,8 +6,6 @@ These tests cover code that moved out of the stock gateway files into
 * ``push_engine``  — APNs + Live Activity engine and the gateway event intake
   (formerly ``hermes_cli/push_notify.py`` + the push block in
   ``tui_gateway/server.py``).
-* ``broadcast``    — multi-client fan-out engine (formerly
-  ``server._broadcast_event`` + the ``WSTransport`` broadcast queue/drain).
 * ``dashboard/api.py`` — REST routes, mounted at ``/api/plugins/hermes-mobile/``.
 
 The plugin package is loaded through the same namespace the stock
@@ -106,18 +104,6 @@ def push_engine():
 
 
 @pytest.fixture
-def broadcast_engine():
-    """The plugin's broadcast module."""
-    return load_plugin_module("broadcast")
-
-
-@pytest.fixture
-def replay_ring():
-    """The plugin's replay_ring module (per-session resumable-stream ring)."""
-    return load_plugin_module("replay_ring")
-
-
-@pytest.fixture
 def wired_token_auth():
     """Wire the plugin's device-token registry into the S5 token-auth seam.
 
@@ -173,10 +159,10 @@ def wired_approval_audit():
 
 @pytest.fixture
 def wired_gateway():
-    """Gateway server module with live fan-out and stock push hooks wired.
+    """Gateway server module with stock push hooks wired.
 
-    Yields ``(server, ws, push_engine, broadcast)`` and unwires afterwards so
-    other gateway tests see pristine seam lists.
+    Yields ``(server, ws, push_engine)`` and unwires afterwards so other
+    gateway tests see pristine hook lists.
     """
     from hermes_cli.plugins import (
         PluginContext,
@@ -186,7 +172,6 @@ def wired_gateway():
     from tui_gateway import server, ws
 
     push = load_plugin_module("push_engine")
-    bcast = load_plugin_module("broadcast")
     manager = get_plugin_manager()
     before = {name: list(callbacks) for name, callbacks in manager._hooks.items()}
     ctx = PluginContext(
@@ -194,9 +179,8 @@ def wired_gateway():
         manager,
     )
     push.activate(ctx)
-    bcast.activate(ctx)
     try:
-        yield server, ws, push, bcast
+        yield server, ws, push
     finally:
         manager._hooks.clear()
         manager._hooks.update(before)

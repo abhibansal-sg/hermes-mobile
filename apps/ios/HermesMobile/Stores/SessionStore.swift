@@ -3314,12 +3314,12 @@ final class SessionStore {
                 // ABH-371 live re-entry: the transcript seed is persisted history,
                 // not proof the just-resumed runtime is idle. Wait for the open seed
                 // so a stale REST/cache snapshot cannot erase the placeholder, then
-                // reconcile against live `session.status`. If the runtime reports a
+                // reconcile against the stock resume snapshot. If it reports a
                 // turn in flight, ChatStore restores the streaming placeholder + Stop
                 // state immediately instead of showing a completed-turn action row.
                 // Run this BEFORE the runtime-bound queue drain; otherwise an idle
                 // queued prompt could slip into an already-running server turn during
-                // the resume/status gap.
+                // the resume/reconcile gap.
                 await seedTask.value
                 guard self.isCurrentRuntimeBinding(
                     token: token,
@@ -3338,11 +3338,11 @@ final class SessionStore {
                 // resume window. If live re-entry just restored a running turn, the
                 // queue's busy guards now see that state and leave prompts queued.
                 self.onActiveRuntimeBound?()
-                // Seed the context-window meter from session.status so a resumed
+                // Seed the context-window meter from session.usage so a resumed
                 // session shows occupancy before its first new turn (H1). Runs
                 // after the resume lands the runtime id; guarded against a newer
                 // open inside ChatStore via the runtime-id check.
-                await self.chat?.seedContextUsageFromStatus(runtimeId: result.sessionId)
+                await self.chat?.seedContextUsage(runtimeId: result.sessionId)
             } catch {
                 // A stale token/generation or a replaced epoch is a superseded
                 // binding, not an actionable open failure.

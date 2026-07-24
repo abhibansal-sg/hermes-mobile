@@ -1,13 +1,12 @@
-"""hermes-mobile — multi-client gateway plugin (iOS app + remote clients).
+"""Hermes Mobile edge plugin for a stock Hermes gateway.
 
-ABH-88 de-patch (W1): all mobile/multi-client gateway work lives here, riding
-the stock plugin system plus the minimal seams catalogued in
-CONTRACT-DEPATCH.md (S1 event fan-out subscribers and S3 session-info
-completeness). Notifications themselves use only stock lifecycle hooks.
+The phone talks to the co-located transparent relay. The plugin contributes
+mobile REST routes, pairing, idempotency receipts, and APNs delivery through
+the public Hermes plugin surface. Notification intake uses only stock v0.19
+lifecycle hooks; it does not observe or transform gateway frames.
 
 Modules:
 
-* ``broadcast``   — multi-client event fan-out engine (S1).
 * ``push_engine`` — stock lifecycle hooks → relay/APNs + Live Activities.
 * ``gitbranch``   — fork-free branch lookup for the session.create fast path.
 * ``mobile_pair`` — the ``hermes mobile-pair`` CLI command (QR pairing),
@@ -182,30 +181,26 @@ def _wire_token_auth() -> None:
     _append_unique(token_auth, "SOCKET_OBSERVERS", _observe_socket, "token-auth")
 
 
-def _wire_prompt_receipts() -> None:
-    """Register the plugin-owned SQLite provider on the generic gateway seam."""
+def _wire_prompt_receipts() -> bool:
+    """Register idempotency when the host exposes the optional receipt seam."""
     from tui_gateway import server
 
     from .prompt_receipts import PROVIDER
 
-    server.register_prompt_receipt_provider(PROVIDER)
+    register_provider = getattr(server, "register_prompt_receipt_provider", None)
+    if not callable(register_provider):
+        return False
+    register_provider(PROVIDER)
+    return True
 
 
 def register(ctx) -> None:
     """Stock plugin entry point — wire the gateway seams + CLI command."""
     try:
-        from . import broadcast, push_engine
+        from . import push_engine
     except Exception:
-        _log.warning("hermes-mobile: seam module import failed", exc_info=True)
-        broadcast = None
+        _log.warning("hermes-mobile: push module import failed", exc_info=True)
         push_engine = None
-    if broadcast is not None:
-        try:
-            broadcast.activate(ctx)
-        except Exception:
-            # Never break host startup on a wiring failure; the gateway simply
-            # behaves like stock (no fan-out) and logs why.
-            _log.warning("hermes-mobile: broadcast seam wiring failed", exc_info=True)
     if push_engine is not None:
         try:
             push_engine.activate(ctx)
