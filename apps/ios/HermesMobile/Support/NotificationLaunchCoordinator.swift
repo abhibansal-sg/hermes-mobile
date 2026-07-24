@@ -52,8 +52,8 @@ final class NotificationLaunchCoordinator: NSObject, UNUserNotificationCenterDel
     private var tapHandler: (@MainActor @Sendable (NotificationService.Tap) -> Void)?
     private var endpointProvider:
         (@MainActor @Sendable () -> NotificationService.ActionEndpoint?)?
-    private var actionCompletionHandler: (@MainActor @Sendable () -> Void)?
-    private var owesActionReconciliation = false
+    private var reconciliationHandler: (@MainActor @Sendable () -> Void)?
+    private var owesReconciliation = false
     private var actionRequestIDsInFlight: Set<String> = []
     private var completedActionRequestIDs: Set<String> = []
 
@@ -80,10 +80,10 @@ final class NotificationLaunchCoordinator: NSObject, UNUserNotificationCenterDel
         drainIfReady()
     }
 
-    func attachActionCompletionHandler(_ handler: @escaping @MainActor @Sendable () -> Void) {
-        actionCompletionHandler = handler
-        if owesActionReconciliation {
-            owesActionReconciliation = false
+    func attachReconciliationHandler(_ handler: @escaping @MainActor @Sendable () -> Void) {
+        reconciliationHandler = handler
+        if owesReconciliation {
+            owesReconciliation = false
             handler()
         }
     }
@@ -130,7 +130,7 @@ final class NotificationLaunchCoordinator: NSObject, UNUserNotificationCenterDel
                     )
                 }
                 self.finishAction(requestID: action?.requestId)
-                self.notifyActionCompletion()
+                self.notifyReconciliation()
                 completion.handler()
             }
         case .reply(let text, let action, let completion):
@@ -147,7 +147,7 @@ final class NotificationLaunchCoordinator: NSObject, UNUserNotificationCenterDel
                     )
                 }
                 self.finishAction(requestID: action?.approvalId)
-                self.notifyActionCompletion()
+                self.notifyReconciliation()
                 completion.handler()
             }
         }
@@ -167,12 +167,17 @@ final class NotificationLaunchCoordinator: NSObject, UNUserNotificationCenterDel
         completedActionRequestIDs.insert(requestID)
     }
 
-    private func notifyActionCompletion() {
-        if let actionCompletionHandler {
-            actionCompletionHandler()
+    private func notifyReconciliation() {
+        if let reconciliationHandler {
+            reconciliationHandler()
         } else {
-            owesActionReconciliation = true
+            owesReconciliation = true
         }
+    }
+
+    func receiveForegroundPush(_ tap: NotificationService.Tap?) {
+        guard tap != nil else { return }
+        notifyReconciliation()
     }
 
     nonisolated func userNotificationCenter(
@@ -185,6 +190,9 @@ final class NotificationLaunchCoordinator: NSObject, UNUserNotificationCenterDel
             completion: completionHandler
         )
         Task { @MainActor in
+            self.receiveForegroundPush(
+                NotificationService.decodeTap(from: box.userInfo)
+            )
             box.completion(
                 NotificationService.foregroundPresentationOptions(userInfo: box.userInfo)
             )
