@@ -2,13 +2,13 @@
 
 ABH-88 de-patch (W1): all mobile/multi-client gateway work lives here, riding
 the stock plugin system plus the minimal seams catalogued in
-CONTRACT-DEPATCH.md (S1 event fan-out subscribers, S2 emit observers, S3
-session-info completeness).
+CONTRACT-DEPATCH.md (S1 event fan-out subscribers and S3 session-info
+completeness). Notifications themselves use only stock lifecycle hooks.
 
 Modules:
 
 * ``broadcast``   — multi-client event fan-out engine (S1).
-* ``push_engine`` — APNs alert + Live Activity push, gateway event intake (S2).
+* ``push_engine`` — stock lifecycle hooks → relay/APNs + Live Activities.
 * ``gitbranch``   — fork-free branch lookup for the session.create fast path.
 * ``mobile_pair`` — the ``hermes mobile-pair`` CLI command (QR pairing),
   registered through the stock ``register_cli_command`` facade.
@@ -18,10 +18,8 @@ Modules:
   system at ``/api/plugins/hermes-mobile/`` (upload, approvals, devices,
   fs browse, push registration).
 
-``register(ctx)`` imports the gateway modules to wire the seams. That is
-intentional and cheap-ish (~ms) — in the dashboard/gateway process those
-modules load anyway, and in CLI-only processes the wiring is inert (the seam
-lists are simply never iterated).
+``register(ctx)`` imports the gateway modules and registers the stock hooks.
+In CLI-only processes the gateway-specific wiring is inert.
 """
 
 from __future__ import annotations

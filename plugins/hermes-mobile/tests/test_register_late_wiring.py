@@ -124,7 +124,13 @@ def test_register_late_wires_every_core_seam_after_attrs_restore(
     assert _contains_named(token_auth.SOCKET_OBSERVERS, "_observe_socket")
     assert _contains_named(_approval._RESOLVE_OBSERVERS, "_audit_resolution")
     assert broadcast.on_owner_write in server._EVENT_FANOUT_SUBSCRIBERS
-    assert push_engine.handle_gateway_event in server._EMIT_OBSERVERS
+    assert push_engine.handle_gateway_event not in server._EMIT_OBSERVERS
+    assert push_engine.handle_turn_start in manager._hooks["pre_llm_call"]
+    assert push_engine.handle_turn_reply in manager._hooks["post_llm_call"]
+    assert push_engine.handle_pre_tool_call in manager._hooks["pre_tool_call"]
+    assert push_engine.handle_approval_request in manager._hooks[
+        "pre_approval_request"
+    ]
     assert broadcast.on_transport in ws.TRANSPORT_OBSERVERS
     assert "mobile-pair" in manager._cli_commands
 
