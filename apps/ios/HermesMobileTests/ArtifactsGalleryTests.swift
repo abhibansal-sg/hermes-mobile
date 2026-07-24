@@ -24,6 +24,8 @@ import XCTest
 ///      and resets offset and generation.
 ///  12b.``testStaleMidFlightLoadMoreIsDiscarded`` — cor-A2: slow load-more overtaken by
 ///      filter change → generation guard discards the stale page.
+///  12c.``testStaleInitialLoadIsDiscardedAfterFilterChange`` — page-zero requests
+///      obey the same generation guard.
 ///  13. ``testNoDuplicateArtifactIdsAcrossPages`` — ABH-180/cor-A3: cross-page dedup by
 ///      content key; positional ids ensure same-url-in-one-message artifacts are kept.
 ///  9b. ``testSameUrlTwiceInOneMessageGetsDistinctIds`` — cor-A3: P1 fix — two artifacts
@@ -615,6 +617,35 @@ final class ArtifactsGalleryTests: XCTestCase {
             model.artifacts.count, limit,
             "Only one images-filter page must be present"
         )
+    }
+
+    func testStaleInitialLoadIsDiscardedAfterFilterChange() async {
+        let model = ArtifactsGalleryModel()
+        model.fetchPage = { type, _ in
+            if type == "all" {
+                try? await Task.sleep(for: .milliseconds(150))
+            }
+            return ArtifactPage(
+                type: type,
+                results: [Artifact.stub(
+                    messageId: type == "all" ? 1 : 2,
+                    urlOrPath: "https://example.com/\(type)"
+                )],
+                total: 1,
+                offset: 0
+            )
+        }
+        let client = RestClient(
+            baseURL: URL(string: "http://127.0.0.1:9123")!,
+            token: "t"
+        )
+
+        let stale = Task { await model.load(type: "all", api: client) }
+        try? await Task.sleep(for: .milliseconds(30))
+        await model.load(type: "images", api: client)
+        await stale.value
+
+        XCTAssertEqual(model.artifacts.map(\.urlOrPath), ["https://example.com/images"])
     }
 
     // MARK: - 13. ABH-180: no duplicate artifact ids across pages

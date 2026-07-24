@@ -854,15 +854,6 @@ private struct SplitLayout: View {
                 .disabled(!chat.isStreaming)
 
                 Button {
-                    sendCurrentComposerDraft()
-                } label: { Text("Send") }
-                .keyboardShortcut(.return, modifiers: .command)
-                .disabled(!RootKeyboardShortcutActions.canSendComposerDraft(
-                    sessions: sessions,
-                    isStreaming: chat.isStreaming
-                ))
-
-                Button {
                     recallPreviousComposerPrompt()
                 } label: { Text("Previous Prompt") }
                 .keyboardShortcut(.upArrow, modifiers: .command)
@@ -878,16 +869,6 @@ private struct SplitLayout: View {
                 .keyboardShortcut(",", modifiers: .command)
 
                 Button {
-                    navigateBack()
-                } label: { Text("Back") }
-                .keyboardShortcut("[", modifiers: .command)
-
-                Button {
-                    navigateForward()
-                } label: { Text("Forward") }
-                .keyboardShortcut("]", modifiers: .command)
-
-                Button {
                     toggleAppearanceDarkMode()
                 } label: { Text("Toggle Dark Mode") }
                 .keyboardShortcut("d", modifiers: .command)
@@ -901,15 +882,6 @@ private struct SplitLayout: View {
         sessions.startDraft()
     }
 
-    private func sendCurrentComposerDraft() {
-        RootKeyboardShortcutActions.sendCurrentComposerDraft(
-            from: sessions,
-            isStreaming: chat.isStreaming
-        ) { text in
-            Task { await chat.send(text: text, includeAttachments: false) }
-        }
-    }
-
     private func recallPreviousComposerPrompt() {
         RootKeyboardShortcutActions.recallPreviousComposerPrompt(sessions: sessions, chat: chat)
     }
@@ -917,14 +889,6 @@ private struct SplitLayout: View {
     private func recallNextComposerPrompt() {
         RootKeyboardShortcutActions.recallNextComposerPrompt(sessions: sessions, chat: chat)
     }
-    private func navigateBack() {
-        RootKeyboardShortcutActions.navigateBack()
-    }
-
-    private func navigateForward() {
-        RootKeyboardShortcutActions.navigateForward()
-    }
-
     private func toggleAppearanceDarkMode() {
         RootKeyboardShortcutActions.toggleAppearanceDarkMode(themeStore: themeStore)
     }
@@ -938,40 +902,11 @@ private struct SplitLayout: View {
 // MARK: - iPad hardware-keyboard action seams
 
 /// Testable action seams for ``SplitLayout``'s hidden hardware-keyboard buttons.
-/// The actions are intentionally tiny and safe: shortcuts are regular-width only,
-/// absent navigation targets no-op, and sending refuses empty/whitespace drafts.
+/// The actions are intentionally tiny and safe: shortcuts are regular-width only.
 @MainActor
 enum RootKeyboardShortcutActions {
     static func isEnabledForHardwareShortcuts(horizontalSizeClass: UserInterfaceSizeClass?) -> Bool {
         horizontalSizeClass == .regular
-    }
-
-    static func hasSendableComposerText(sessions: SessionStore) -> Bool {
-        !sessions.composerDraft(for: sessions.activeComposerDraftKey)
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-            .isEmpty
-    }
-
-    static func canSendComposerDraft(sessions: SessionStore, isStreaming: Bool) -> Bool {
-        !isStreaming && hasSendableComposerText(sessions: sessions)
-    }
-
-    @discardableResult
-    static func sendCurrentComposerDraft(
-        from sessions: SessionStore,
-        isStreaming: Bool = false,
-        send: @escaping @MainActor (String) -> Void
-    ) -> Bool {
-        guard !isStreaming else { return false }
-        let key = sessions.activeComposerDraftKey
-        let text = sessions.composerDraft(for: key)
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !text.isEmpty else { return false }
-
-        sessions.setComposerDraft("", for: key)
-        sessions.resetComposerHistoryBrowse(for: key)
-        send(text)
-        return true
     }
 
     @discardableResult
@@ -986,19 +921,6 @@ enum RootKeyboardShortcutActions {
 
     static func openSettings(isPresented: Binding<Bool>) {
         isPresented.wrappedValue = true
-    }
-
-    @discardableResult
-    static func navigateBack() -> Bool {
-        // The split-view detail currently owns no root-level NavigationPath. Keep
-        // ⌘[ wired as a safe no-op until a detail navigation target is introduced.
-        false
-    }
-
-    @discardableResult
-    static func navigateForward() -> Bool {
-        // Symmetric safe no-op for ⌘] while there is no forward stack to traverse.
-        false
     }
 
     static func toggleAppearanceDarkMode(themeStore: ThemeStore) {
