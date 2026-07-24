@@ -1,6 +1,6 @@
-# Fly.io deploy for the Fetch push relay.
+# Fly.io deploy for the Hermes Mobile push relay.
 #
-# 1) fly launch --no-deploy --copy-config --name fetch-push-relay
+# 1) fly launch --no-deploy --copy-config --name hermes-mobile-push
 # 2) fly volumes create relay_data --size 1 --region iad
 # 3) Set secrets (NEVER commit the .p8):
 #      fly secrets set \
@@ -10,7 +10,7 @@
 #        HERMES_RELAY_REGISTRATION_TOKEN="$(openssl rand -hex 24)" \
 #        HERMES_RELAY_SECRET_PEPPER="$(openssl rand -hex 24)"
 # 4) fly deploy
-app = "fetch-push-relay"
+app = "hermes-mobile-push"
 primary_region = "iad"
 
 [build]
