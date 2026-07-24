@@ -2242,13 +2242,6 @@ struct ChatView: View {
             } label: {
                 Label("Export as Markdown", systemImage: "square.and.arrow.up")
             }
-            Divider()
-            Button(role: .destructive) {
-                Task { await sessionStore.delete(summary) }
-            } label: {
-                Label("Delete", systemImage: "trash")
-                    .foregroundStyle(theme.destructive)
-            }
         } else {
             Button {
                 copyTranscript()
@@ -2289,11 +2282,13 @@ struct ChatView: View {
 
     /// Copy the whole transcript to the pasteboard (export affordance).
     private func copyTranscript() {
-        let text = chatStore.messages
-            .map { $0.text }
-            .filter { !$0.isEmpty }
-            .joined(separator: "\n\n")
-        UIPasteboard.general.string = text
+        let messages = chatStore.messages.map(\.text)
+        Task {
+            let text = await Task.detached {
+                messages.filter { !$0.isEmpty }.joined(separator: "\n\n")
+            }.value
+            UIPasteboard.general.string = text
+        }
     }
 
     // MARK: - Scroll-to-bottom pill (compact — F3)

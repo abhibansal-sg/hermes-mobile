@@ -43,6 +43,8 @@ struct ModelPickerView: View {
     @State private var globalReasoningEffort: String = ""
     /// Current global default fast mode.
     @State private var globalFast: Bool = false
+    @State private var savedGlobalReasoningEffort: String = ""
+    @State private var savedGlobalFast: Bool = false
     /// True while a global fast/reasoning write is in flight.
     @State private var pendingGlobalConfig: Bool = false
 
@@ -410,18 +412,23 @@ struct ModelPickerView: View {
     private func loadGlobalConfig() async {
         // Read from `GET /api/config` — the same endpoint the desktop uses.
         guard let agentSection = try? await control.agentConfig() else { return }
-        let effort = agentSection["reasoning_effort"]?.stringValue ?? ""
+        let rawEffort = agentSection["reasoning_effort"]?.stringValue ?? ""
+        let effort = rawEffort == "none" ? "" : rawEffort
         let tier = agentSection["service_tier"]?.stringValue ?? ""
+        savedGlobalReasoningEffort = effort
+        savedGlobalFast = (tier == "priority" || tier == "fast")
         globalReasoningEffort = effort
-        globalFast = (tier == "priority" || tier == "fast")
+        globalFast = savedGlobalFast
     }
 
     private func applyGlobalReasoning(_ effort: String) async {
+        guard effort != savedGlobalReasoningEffort else { return }
         pendingGlobalConfig = true
         defer { pendingGlobalConfig = false }
-        let prev = globalReasoningEffort
+        let prev = savedGlobalReasoningEffort
         do {
             try await connectionStore.globalSetReasoning(effort.isEmpty ? "none" : effort)
+            savedGlobalReasoningEffort = effort
         } catch {
             globalReasoningEffort = prev
             actionError = (error as? GatewayError)?.errorDescription ?? error.localizedDescription
@@ -429,11 +436,13 @@ struct ModelPickerView: View {
     }
 
     private func applyGlobalFast(_ enabled: Bool) async {
+        guard enabled != savedGlobalFast else { return }
         pendingGlobalConfig = true
         defer { pendingGlobalConfig = false }
-        let prev = globalFast
+        let prev = savedGlobalFast
         do {
             try await connectionStore.globalSetFast(enabled)
+            savedGlobalFast = enabled
         } catch {
             globalFast = prev
             actionError = (error as? GatewayError)?.errorDescription ?? error.localizedDescription

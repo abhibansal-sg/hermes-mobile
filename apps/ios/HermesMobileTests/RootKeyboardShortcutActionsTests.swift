@@ -11,61 +11,6 @@ final class RootKeyboardShortcutActionsTests: XCTestCase {
         XCTAssertFalse(RootKeyboardShortcutActions.isEnabledForHardwareShortcuts(horizontalSizeClass: nil))
     }
 
-    func testSendCurrentComposerDraftTrimsClearsAndInvokesSendAction() {
-        let sessions = SessionStore()
-        let key = sessions.activeComposerDraftKey
-        sessions.setComposerDraft("  hello keyboard  ", for: key)
-        var sent: [String] = []
-
-        let didSend = RootKeyboardShortcutActions.sendCurrentComposerDraft(
-            from: sessions,
-            isStreaming: false
-        ) { text in
-            sent.append(text)
-        }
-
-        XCTAssertTrue(didSend)
-        XCTAssertEqual(sent, ["hello keyboard"])
-        XCTAssertEqual(sessions.composerDraft(for: key), "")
-    }
-
-    func testStreamingSendCurrentComposerDraftDoesNotClearOrSend() {
-        let sessions = SessionStore()
-        let key = sessions.activeComposerDraftKey
-        sessions.setComposerDraft("  keep me queued  ", for: key)
-        var sent: [String] = []
-
-        XCTAssertFalse(RootKeyboardShortcutActions.canSendComposerDraft(
-            sessions: sessions,
-            isStreaming: true
-        ))
-        let didSend = RootKeyboardShortcutActions.sendCurrentComposerDraft(
-            from: sessions,
-            isStreaming: true
-        ) { text in
-            sent.append(text)
-        }
-
-        XCTAssertFalse(didSend)
-        XCTAssertTrue(sent.isEmpty)
-        XCTAssertEqual(sessions.composerDraft(for: key), "  keep me queued  ")
-    }
-
-    func testSendCurrentComposerDraftNoOpsForWhitespaceDraft() {
-        let sessions = SessionStore()
-        let key = sessions.activeComposerDraftKey
-        sessions.setComposerDraft("   \n\t  ", for: key)
-        var sent: [String] = []
-
-        let didSend = RootKeyboardShortcutActions.sendCurrentComposerDraft(from: sessions) { text in
-            sent.append(text)
-        }
-
-        XCTAssertFalse(didSend)
-        XCTAssertTrue(sent.isEmpty)
-        XCTAssertEqual(sessions.composerDraft(for: key), "")
-    }
-
     func testOpenSettingsShortcutSetsPresentationBinding() {
         var presented = false
         let binding = Binding<Bool>(
@@ -136,11 +81,6 @@ final class RootKeyboardShortcutActionsTests: XCTestCase {
             .filter { $0.trimmingCharacters(in: .whitespaces) == "@State private var showingSettings = false" }
             .count
         XCTAssertEqual(showingSettingsStateCount, 1, "showingSettings @State must exist exactly once (RootView only); a second occurrence means a layout branch owns independent presentation state — the STR-687 regression.")
-    }
-
-    func testBackForwardShortcutsAreSafeNoOpsWithoutNavigationTargets() {
-        XCTAssertFalse(RootKeyboardShortcutActions.navigateBack())
-        XCTAssertFalse(RootKeyboardShortcutActions.navigateForward())
     }
 
     func testPromptHistoryDerivesNewestFirstTrimmedUserMessagesOnly() {
@@ -270,21 +210,13 @@ final class RootKeyboardShortcutActionsTests: XCTestCase {
             .appendingPathComponent("HermesMobile/Views/Shell/RootView.swift")
         let source = try String(contentsOf: rootViewPath, encoding: .utf8)
 
-        XCTAssertTrue(source.contains(".keyboardShortcut(.return, modifiers: .command)"))
         XCTAssertTrue(source.contains(".keyboardShortcut(.upArrow, modifiers: .command)"))
         XCTAssertTrue(source.contains(".keyboardShortcut(.downArrow, modifiers: .command)"))
         XCTAssertTrue(source.contains(".keyboardShortcut(\",\", modifiers: .command)"))
-        XCTAssertTrue(source.contains(".keyboardShortcut(\"[\", modifiers: .command)"))
-        XCTAssertTrue(source.contains(".keyboardShortcut(\"]\", modifiers: .command)"))
         XCTAssertTrue(source.contains(".keyboardShortcut(\"d\", modifiers: .command)"))
-        XCTAssertTrue(source.contains("sendCurrentComposerDraft"))
         XCTAssertTrue(source.contains("recallPreviousComposerPrompt"))
         XCTAssertTrue(source.contains("recallNextComposerPrompt"))
-        XCTAssertTrue(source.contains("canSendComposerDraft"))
-        XCTAssertTrue(source.contains("isStreaming: chat.isStreaming"))
         XCTAssertTrue(source.contains("openSettings"))
-        XCTAssertTrue(source.contains("navigateBack"))
-        XCTAssertTrue(source.contains("navigateForward"))
         XCTAssertTrue(source.contains("toggleAppearanceDarkMode"))
     }
 

@@ -323,16 +323,18 @@ struct ComposerView: View {
             matching: .images
         )
         .fullScreenCover(isPresented: $showCamera) {
-            CameraPicker { data in
-                if let data { attachmentStore.add(data: data) }
+            CameraPicker { image in
                 showCamera = false
+                if let image { Task { await attachmentStore.add(image: image) } }
             }
             .ignoresSafeArea()
         }
         .fullScreenCover(isPresented: $showScanner) {
             DocumentScanner(onComplete: { pages in
-                for data in pages { _ = attachmentStore.add(data: data) }
                 showScanner = false
+                Task {
+                    for image in pages { _ = await attachmentStore.add(image: image) }
+                }
             }, onCancel: {
                 showScanner = false
             })
@@ -393,7 +395,7 @@ struct ComposerView: View {
                 // release-audit P1.
                 do {
                     if let data = try await newItem.loadTransferable(type: Data.self) {
-                        attachmentStore.add(data: data)
+                        await attachmentStore.add(data: data)
                     } else {
                         photoLoadError = "That photo couldn't be loaded. Try another."
                     }
@@ -1947,9 +1949,9 @@ private struct QueuedPromptRow: View {
 // MARK: - Camera
 
 /// Thin `UIImagePickerController` wrapper for `.camera` capture. Returns the
-/// captured image as JPEG `Data`, or `nil` if the user cancelled.
+/// captured image, or `nil` if the user cancelled.
 private struct CameraPicker: UIViewControllerRepresentable {
-    let onComplete: (Data?) -> Void
+    let onComplete: (UIImage?) -> Void
 
     func makeUIViewController(context: Context) -> UIImagePickerController {
         let picker = UIImagePickerController()
@@ -1965,9 +1967,9 @@ private struct CameraPicker: UIViewControllerRepresentable {
     }
 
     final class Coordinator: NSObject, UIImagePickerControllerDelegate, UINavigationControllerDelegate {
-        let onComplete: (Data?) -> Void
+        let onComplete: (UIImage?) -> Void
 
-        init(onComplete: @escaping (Data?) -> Void) {
+        init(onComplete: @escaping (UIImage?) -> Void) {
             self.onComplete = onComplete
         }
 
@@ -1975,9 +1977,7 @@ private struct CameraPicker: UIViewControllerRepresentable {
             _ picker: UIImagePickerController,
             didFinishPickingMediaWithInfo info: [UIImagePickerController.InfoKey: Any]
         ) {
-            let image = info[.originalImage] as? UIImage
-            // Hand raw JPEG to AttachmentStore, which re-normalises (downscale).
-            onComplete(image?.jpegData(compressionQuality: 0.95))
+            onComplete(info[.originalImage] as? UIImage)
         }
 
         func imagePickerControllerDidCancel(_ picker: UIImagePickerController) {

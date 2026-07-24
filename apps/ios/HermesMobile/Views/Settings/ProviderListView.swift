@@ -291,19 +291,18 @@ struct ProviderListView: View {
             // Tapping an authenticated provider re-opens its provisioning form:
             //   • .apiKey → EnterProviderKeyView (replace key)
             //   • .custom → CustomProviderView in edit/rotate mode (ABH-257)
-            // OAuth-only providers that somehow report authenticated are
-            // read-only (no tap affordance). The `canProvision` gate keeps the
-            // tap a no-op for them while still letting the swipe Disconnect fire.
+            // OAuth-only providers are read-only apart from Disconnect, so they
+            // do not install a tap gesture.
             .contentShape(Rectangle())
-            .onTapGesture {
-                guard canProvision, disconnectingSlug == nil else { return }
+            .gesture(canProvision ? TapGesture().onEnded {
+                guard disconnectingSlug == nil else { return }
                 actionError = nil
                 if provider.authType == .custom {
                     pendingEditCustom = provider
                 } else {
                     pendingKeyProvider = provider
                 }
-            }
+            } : nil)
             // A re-provision (replace key) is available for provisionable providers
             // even when already authenticated; OAuth-only providers are read-only.
             .swipeActions(edge: .trailing, allowsFullSwipe: false) {

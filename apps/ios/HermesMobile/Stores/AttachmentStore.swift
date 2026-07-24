@@ -34,9 +34,9 @@ final class AttachmentStore {
     private(set) var pending: [PendingAttachment] = []
 
     /// Longest-edge cap applied during normalisation.
-    private static let maxDimension: CGFloat = 2048
+    nonisolated private static let maxDimension: CGFloat = 2048
     /// JPEG compression quality for normalised attachments.
-    private static let jpegQuality: CGFloat = 0.85
+    nonisolated private static let jpegQuality: CGFloat = 0.85
 
     init() {}
 
@@ -119,13 +119,20 @@ final class AttachmentStore {
     /// format the server accepts), downscaled so the longest side is ≤ 2048px.
     /// Returns silently if the data can't be decoded as an image.
     @discardableResult
-    func add(data: Data) -> Bool {
-        guard let image = UIImage(data: data) else { return false }
-        let normalised = Self.downscaled(image, maxDimension: Self.maxDimension)
-        guard let jpeg = normalised.jpegData(compressionQuality: Self.jpegQuality) else {
-            return false
-        }
-        pending.append(PendingAttachment(thumbnail: normalised, jpegData: jpeg))
+    func add(data: Data) async -> Bool {
+        guard let jpeg = await Task.detached(priority: .userInitiated, operation: {
+            Self.normalizedJPEG(from: data)
+        }).value, let thumbnail = UIImage(data: jpeg) else { return false }
+        pending.append(PendingAttachment(thumbnail: thumbnail, jpegData: jpeg))
+        return true
+    }
+
+    @discardableResult
+    func add(image: UIImage) async -> Bool {
+        guard let jpeg = await Task.detached(priority: .userInitiated, operation: {
+            Self.normalizedJPEG(from: image)
+        }).value, let thumbnail = UIImage(data: jpeg) else { return false }
+        pending.append(PendingAttachment(thumbnail: thumbnail, jpegData: jpeg))
         return true
     }
 
@@ -373,7 +380,17 @@ final class AttachmentStore {
     /// Return `image` scaled so its longest side is `maxDimension`, or the image
     /// unchanged when it already fits. Redraws at scale 1 so `jpegData` reflects
     /// pixel dimensions, not points.
-    private static func downscaled(_ image: UIImage, maxDimension: CGFloat) -> UIImage {
+    nonisolated private static func normalizedJPEG(from data: Data) -> Data? {
+        guard let image = UIImage(data: data) else { return nil }
+        return normalizedJPEG(from: image)
+    }
+
+    nonisolated private static func normalizedJPEG(from image: UIImage) -> Data? {
+        downscaled(image, maxDimension: maxDimension)
+            .jpegData(compressionQuality: jpegQuality)
+    }
+
+    nonisolated private static func downscaled(_ image: UIImage, maxDimension: CGFloat) -> UIImage {
         let size = image.size
         let longest = max(size.width, size.height)
         guard longest > maxDimension, longest > 0 else {
@@ -385,7 +402,7 @@ final class AttachmentStore {
         return redraw(image, size: target)
     }
 
-    private static func redraw(_ image: UIImage, size: CGSize) -> UIImage {
+    nonisolated private static func redraw(_ image: UIImage, size: CGSize) -> UIImage {
         let format = UIGraphicsImageRendererFormat.default()
         format.scale = 1
         format.opaque = true

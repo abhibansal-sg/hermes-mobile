@@ -1774,7 +1774,9 @@ struct DrawerView: View {
         Task {
             guard let markdown = await sessions.exportMarkdown(summary) else { return }
             do {
-                let url = try Self.writeMarkdownExport(markdown, summary: summary)
+                let url = try await Task.detached {
+                    try Self.writeMarkdownExport(markdown, summary: summary)
+                }.value
                 exportedTranscript = DrawerExportedTranscript(
                     sessionId: summary.id,
                     fileURL: url
@@ -1787,7 +1789,7 @@ struct DrawerView: View {
         }
     }
 
-    private static func writeMarkdownExport(
+    nonisolated private static func writeMarkdownExport(
         _ markdown: String,
         summary: SessionSummary
     ) throws -> URL {
@@ -1803,7 +1805,7 @@ struct DrawerView: View {
         return url
     }
 
-    private static func exportFilename(for summary: SessionSummary) -> String {
+    nonisolated private static func exportFilename(for summary: SessionSummary) -> String {
         let raw = summary.displayTitle.trimmingCharacters(in: .whitespacesAndNewlines)
         let fallback = "Hermes Session"
         let allowed = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: " -_"))
