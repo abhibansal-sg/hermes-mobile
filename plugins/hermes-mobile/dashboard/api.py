@@ -1277,21 +1277,6 @@ class PushRegisterBody(BaseModel):
     device_id: Optional[str] = None
 
 
-class NotifyBody(BaseModel):
-    """External event injection for the push engine (watcher fallback path).
-
-    Mirrors the ``handle_gateway_event(event, sid, payload)`` signature so an
-    out-of-process poller (``scripts/watcher.py``) can trigger the exact same
-    push pipeline the in-process gateway hooks feed. Preferred path is the
-    in-process ``post_emit_event`` hook (zero latency, zero extra process);
-    this endpoint exists for hosts running a core without the hooks.
-    """
-
-    event: str
-    session_id: str
-    payload: Optional[Dict[str, Any]] = None
-
-
 class PushUnregisterBody(BaseModel):
     token: str
 
@@ -1382,27 +1367,6 @@ async def register_push_token(body: PushRegisterBody, request: Request) -> Dict[
     if not _has_dashboard_api_auth(request):
         raise HTTPException(status_code=401, detail="Unauthorized")
     await _register_relay_device(body)
-    return {"ok": True}
-
-
-@router.post("/notify")
-async def notify_event(body: NotifyBody, request: Request) -> Dict[str, Any]:
-    """Inject a gateway event into the push pipeline (watcher fallback path).
-
-    Auth: same dashboard/device auth as ``/push/register``. The event name is
-    validated against the push engine's known event kinds so this endpoint
-    cannot be used to spray arbitrary push payloads.
-    """
-    if not _has_dashboard_api_auth(request):
-        raise HTTPException(status_code=401, detail="Unauthorized")
-    engine = _plugin_module("push_engine")
-    known = getattr(engine, "PUSH_EVENT_KINDS", None)
-    if known and body.event not in known:
-        raise HTTPException(status_code=400, detail=f"Unknown event kind: {body.event}")
-    try:
-        engine.handle_gateway_event(body.event, body.session_id, body.payload)
-    except Exception:
-        raise HTTPException(status_code=500, detail="push dispatch failed")
     return {"ok": True}
 
 

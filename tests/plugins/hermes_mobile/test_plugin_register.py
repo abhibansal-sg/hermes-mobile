@@ -87,14 +87,21 @@ def test_register_populates_every_seam_registry(plugin_and_ctx):
         provider.__class__.__name__ == "SQLitePromptReceiptProvider"
         for provider in server.PROMPT_RECEIPT_PROVIDERS
     )
-    # S1 + S2 gateway wiring: on a core that ships the tui-gateway observer
-    # hooks (this one), the plugin registers HOOKS and leaves the legacy
-    # module-level seams EMPTY (double-wiring would double-deliver frames).
+    # Live co-watch still uses S1. Notifications use only upstream v0.19
+    # lifecycle hooks and never register the fork-only S2 emit observer.
     hooks = manager._hooks
     assert any(cb for cb in hooks.get("post_frame_write", [])), "post_frame_write not registered"
     assert any(cb for cb in hooks.get("on_ws_transport_change", [])), "on_ws_transport_change not registered"
-    assert any(cb for cb in hooks.get("post_emit_event", [])), "post_emit_event not registered"
+    assert not hooks.get("pre_emit_event")
+    assert not hooks.get("post_emit_event")
+    assert push_engine.handle_turn_start in hooks.get("pre_llm_call", [])
+    assert push_engine.handle_turn_reply in hooks.get("post_llm_call", [])
+    assert push_engine.handle_turn_end in hooks.get("on_session_end", [])
+    assert push_engine.handle_pre_tool_call in hooks.get("pre_tool_call", [])
+    assert push_engine.handle_post_tool_call in hooks.get("post_tool_call", [])
+    assert push_engine.handle_api_request_error in hooks.get("api_request_error", [])
     assert push_engine.handle_approval_request in hooks.get("pre_approval_request", [])
+    assert push_engine.handle_approval_response in hooks.get("post_approval_response", [])
     assert push_engine.handle_session_finalize in hooks.get("on_session_finalize", [])
     # CLI command registered on the manager facade
     cmd = manager._cli_commands.get("mobile-pair")

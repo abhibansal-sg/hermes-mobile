@@ -173,7 +173,7 @@ def wired_approval_audit():
 
 @pytest.fixture
 def wired_gateway():
-    """Gateway server module with the plugin's S1/S2 observers wired.
+    """Gateway server module with live fan-out and stock push hooks wired.
 
     Yields ``(server, ws, push_engine, broadcast)`` and unwires afterwards so
     other gateway tests see pristine seam lists.

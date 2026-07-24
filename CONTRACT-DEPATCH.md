@@ -20,7 +20,7 @@ either already upstream or no longer consumed by `plugins/hermes-mobile` / iOS.
 | Seam | Verdict | New-base disposition / evidence |
 |---|---|---|
 | S1 | STILL-NEEDED (reduced) | First-class `post_frame_write` and `on_ws_transport_change` hooks only; no legacy subscriber lists (`hermes_cli/plugins.py`, `tui_gateway/server.py`, `tui_gateway/ws.py`). |
-| S2 | STILL-NEEDED (reduced) | First-class `pre_emit_event` payload transform and `post_emit_event` observer plus runtime id metadata on upstream's existing `on_session_finalize`; no `_EMIT_OBSERVERS` or synthetic finalize event. The pre-transform lets the mobile plugin stamp one correlation identity before both owner and broadcast delivery. |
+| S2 | NOT USED FOR NOTIFICATIONS | Push intake now uses stock v0.19 lifecycle hooks (`pre_llm_call`, `post_llm_call`, `on_session_end`, tool and approval hooks). The existing frame seam remains a separate live-client concern until removed from its remaining consumers. |
 | S3 | SUPERSEDED / reduced | Upstream `_session_info` already includes provider. `_runtime_sid` storage is dropped; finalize receives the existing record's `_sid` as transient hook metadata. |
 | S4 | STILL-NEEDED (small) | Reasoning is already session-scoped upstream. Only `config.set/get fast` needed adaptation to `create_service_tier_override`. |
 | S5 | STILL-NEEDED | The stock provider registry covers exact Bearer-token REST routes, but not rich device metadata, plugin routes, WS tickets, live revocation, socket indexing, or resolver audit identity. Generic registries and guarded call sites remain. Every device-capable dashboard WS route now enters one shared lifecycle that indexes only active device identities and closes revoke/register races (ABH-449). |
@@ -46,9 +46,8 @@ Modules (moved or already-new):
   journals, signed cursors, bounded upsert/tombstone retention, and owner
   snapshot aggregation for the mobile reconciliation route.
 - `push_engine.py` (from `hermes_cli/push_notify.py`) — APNs + Live Activity.
-  Event intake: approval pushes via STOCK `pre_approval_request` hook;
-  session-end LA cleanup via `on_session_finalize`; long-turn/clarify pushes
-  need the emit-subscriber seam (S2) until an upstream events hook exists.
+  Event intake: STOCK turn, tool, approval, API-error, and session-finalize
+  hooks. Alert delivery continues through the existing relay client.
 - `device_tokens.py`, `audit_log.py`, `mobile_pair.py` — move as-is.
   CLI: register `mobile-pair` via facade `register_cli_command`
   (KILLS the ~49-line main.py seam).
@@ -67,10 +66,8 @@ Modules (moved or already-new):
 S1 write_json broadcast hook (~3 lines, server.py) — after owner write, iterate a
    module-level subscriber set the plugin populates. PR: "gateway: event fan-out
    subscribers".
-S2 _emit transform/observer (small helper + call, server.py) — generic chained
-   `pre_emit_event` payload transformation followed by the existing post-emit
-   observer. PR: "gateway: event payload transforms + emit observers" (mobile
-   correlation and push ride it; all identity/policy remains plugin-owned).
+S2 _emit transform/observer — no notification consumer remains. Audit and
+   remove separately once any non-notification consumers are resolved.
 S3 `_runtime_sid` in session record (1 line) + `provider` in `_session_info`
    (1 line). PR: trivial info-completeness.
 S4 config.set session-scoping for reasoning/fast (~120 lines today) — REWRITE
