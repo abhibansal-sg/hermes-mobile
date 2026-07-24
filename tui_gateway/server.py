@@ -10608,19 +10608,9 @@ def _ws_device_identity() -> Optional[dict]:
 
 def _ws_device_owns_session(device: dict, session_id: str) -> bool:
     """Fail-closed ownership check for device-authenticated WS RPCs."""
-    device_id = device.get("device_id") if isinstance(device, dict) else None
-    if not device_id:
-        return False
-    try:
-        import importlib
+    from hermes_cli.dashboard_auth.token_auth import identity_owns_session
 
-        device_tokens = importlib.import_module(
-            "hermes_plugins.hermes_mobile.device_tokens"
-        )
-        owner = device_tokens.device_identity_for_session(session_id)
-    except Exception:
-        return False
-    return isinstance(owner, dict) and owner.get("device_id") == device_id
+    return identity_owns_session(device, session_id)
 
 
 def _ws_resolve_audit(session_id: str, session_key: str) -> dict:

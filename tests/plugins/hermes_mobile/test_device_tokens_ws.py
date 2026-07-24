@@ -146,10 +146,12 @@ def test_device_token_not_accepted_without_wiring(loopback, home):
         list(token_auth.TOKEN_AUTHENTICATORS),
         list(token_auth.IDENTITY_VALIDATORS),
         list(token_auth.SOCKET_OBSERVERS),
+        list(token_auth.SESSION_OWNERSHIP_CHECKERS),
     )
     token_auth.TOKEN_AUTHENTICATORS[:] = []
     token_auth.IDENTITY_VALIDATORS[:] = []
     token_auth.SOCKET_OBSERVERS[:] = []
+    token_auth.SESSION_OWNERSHIP_CHECKERS[:] = []
     try:
         issued = device_tokens.issue(device_name="x")
         ws = _fake_ws(query={"token": issued["token"]})
@@ -158,6 +160,7 @@ def test_device_token_not_accepted_without_wiring(loopback, home):
         token_auth.TOKEN_AUTHENTICATORS[:] = before[0]
         token_auth.IDENTITY_VALIDATORS[:] = before[1]
         token_auth.SOCKET_OBSERVERS[:] = before[2]
+        token_auth.SESSION_OWNERSHIP_CHECKERS[:] = before[3]
 
 
 def test_revoked_device_token_fails_ws_auth(loopback, home, wired_token_auth):

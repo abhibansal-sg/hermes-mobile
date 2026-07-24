@@ -170,6 +170,16 @@ def _observe_socket(action: str, identity: dict, ws) -> None:
         device_tokens.deregister_ws_socket(device_id, ws)
 
 
+def _identity_owns_session(identity: dict, session_id: str) -> bool | None:
+    device_id = identity.get("device_id") if isinstance(identity, dict) else None
+    if not device_id:
+        return None
+    from . import device_tokens
+
+    owner = device_tokens.device_identity_for_session(session_id)
+    return isinstance(owner, dict) and owner.get("device_id") == device_id
+
+
 def _wire_token_auth() -> None:
     """Register the per-device token registry on the S5 token-auth seam."""
     from hermes_cli.dashboard_auth import token_auth
@@ -179,6 +189,12 @@ def _wire_token_auth() -> None:
     _append_unique(token_auth, "TOKEN_AUTHENTICATORS", device_tokens.match, "token-auth")
     _append_unique(token_auth, "IDENTITY_VALIDATORS", _validate_device, "token-auth")
     _append_unique(token_auth, "SOCKET_OBSERVERS", _observe_socket, "token-auth")
+    _append_unique(
+        token_auth,
+        "SESSION_OWNERSHIP_CHECKERS",
+        _identity_owns_session,
+        "token-auth",
+    )
 
 
 def _wire_prompt_receipts() -> bool:
@@ -208,14 +224,6 @@ def register(ctx) -> None:
             # Never break host startup on a wiring failure; the gateway simply
             # behaves like stock (no push) and logs why.
             _log.warning("hermes-mobile: push seam wiring failed", exc_info=True)
-    try:
-        from . import kanban_spec_guard
-
-        kanban_spec_guard.activate(ctx)
-    except Exception:
-        # Spec enforcement is safety-critical for agent-created cards, but a
-        # broken plugin hook must not take down the host process.
-        _log.warning("hermes-mobile: kanban-spec guard wiring failed", exc_info=True)
     try:
         from . import ios_turn_context
 

@@ -168,8 +168,7 @@ class RelayCredentials:
     agent_secret: str
     # App-tunnel pairing capability token (plaintext). Minted by the relay and
     # returned once at registration; the relay keeps only its hash, so this is
-    # the agent's only copy. None for agents enrolled before pairing capture
-    # existed — re-minted on demand via ``relay_pairing()``.
+    # the agent's only copy.
     pairing: str | None = None
 
 
@@ -372,13 +371,6 @@ class RelayClient:
         # identity won the atomic file write.
         return self._read_credentials() or creds
 
-    async def relay_pairing(self) -> tuple[str, str, str]:
-        """Return ``(relay_url, agent_id, pairing)`` for a relay setup link."""
-        await self._credentials()
-        pairing = await self._mint_pairing()
-        creds = await self._credentials()
-        return self.relay_url, creds.agent_id, pairing
-
     async def tunnel_status(self) -> dict:
         """Return tunnel readiness when ABH-202 adds the relay status surface."""
         # ABH-202 owns the real reverse-tunnel status contract. Until that server
@@ -403,23 +395,6 @@ class RelayClient:
             if time.monotonic() >= deadline:
                 return last
             await asyncio.sleep(max(0.1, interval_s))
-
-    async def _mint_pairing(self) -> str:
-        """Rotate + fetch a fresh pairing token for an already-enrolled agent."""
-        response = await self._post("/v1/agents/pairing", {}, authenticated=True)
-        pairing = str(response.json()["pairing_secret"])
-        creds = await self._credentials()
-        # Persist alongside the existing identity so the file stays a valid
-        # pairing record (drives setup / tunnel autostart in later slices).
-        self._write_credentials(
-            RelayCredentials(
-                relay_url=creds.relay_url,
-                agent_id=creds.agent_id,
-                agent_secret=creds.agent_secret,
-                pairing=pairing,
-            )
-        )
-        return pairing
 
     def _read_credentials(self) -> RelayCredentials | None:
         try:
