@@ -194,6 +194,7 @@ struct RestClient: Sendable {
     func sessionsWithTotal(
         limit: Int = 100,
         offset: Int = 0,
+        order: String = "recent",
         minMessages: Int = 1,
         excludeSource: [String] = [],
         source: String? = nil,
@@ -202,7 +203,7 @@ struct RestClient: Sendable {
     ) async throws -> (sessions: [SessionSummary], total: Int?) {
         var queryItems = [
             URLQueryItem(name: "limit", value: "\(limit)"),
-            URLQueryItem(name: "order", value: "recent"),
+            URLQueryItem(name: "order", value: order),
             URLQueryItem(name: "archived", value: "exclude"),
         ]
         if minMessages > 0 { queryItems.append(URLQueryItem(name: "min_messages", value: "\(minMessages)")) }
