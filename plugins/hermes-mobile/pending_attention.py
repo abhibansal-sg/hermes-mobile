@@ -41,11 +41,12 @@ _states: dict[str, _VisibilityState] = {}
 
 def capture_pending_attention() -> list[dict]:
     """Capture both waiter owners through their public snapshot interfaces."""
-    from tools.approval import pending_approval_snapshot
-    from tui_gateway.server import (
-        attention_session_identities,
-        pending_prompt_snapshot,
-    )
+    from tools import approval
+    from tui_gateway import server
+
+    pending_approval_snapshot = getattr(approval, "pending_approval_snapshot", lambda: [])
+    attention_session_identities = getattr(server, "attention_session_identities", lambda: [])
+    pending_prompt_snapshot = getattr(server, "pending_prompt_snapshot", lambda: [])
 
     identities = attention_session_identities()
     runtime_by_stored: dict[str, list[str]] = {}

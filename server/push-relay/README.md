@@ -1,6 +1,6 @@
-# Fetch Push Relay
+# Hermes Mobile Push Relay
 
-Minimal APNs relay for the Fetch iOS app.
+Minimal APNs broker for the Hermes Mobile iOS app.
 
 The relay does not run Hermes Agent and does not store conversations. It stores
 anonymous agent credentials, APNs device tokens, notification preferences, and
@@ -27,13 +27,13 @@ export HERMES_RELAY_APNS_KEY_ID=XXXXXXXXXX
 export HERMES_RELAY_APNS_TEAM_ID=TEAMID1234
 ```
 
-Point the [`fetch` plugin](../../fetch-plugin) at it during development:
+Point the Hermes Mobile adapter at it during development:
 
 ```bash
-export HERMES_FETCH_RELAY_URL=http://127.0.0.1:8787
+export HERMES_MOBILE_RELAY_URL=http://127.0.0.1:8787
 # allow anonymous agent registration locally (prod requires a token):
 export HERMES_RELAY_ALLOW_OPEN_REGISTRATION=true
-export HERMES_RELAY_ENABLE_TUNNEL=true
+export HERMES_RELAY_ENABLE_TUNNEL=false
 ```
 
 For local testing, the script automatically sources `~/.hermes/.env`, uses
@@ -65,7 +65,7 @@ static/default builder.
 ```bash
 railway login                                   # interactive (browser)
 cd server/push-relay
-railway init --name fetch-push-relay            # create project, link this dir
+railway init --name hermes-mobile-push           # create project, link this dir
 railway up --detach                             # first build + deploy
 railway volume add -m /data                      # persistent SQLite (mounts /data)
 # Secrets — .p8 via stdin so it never lands in shell history:
@@ -75,20 +75,20 @@ railway variable set \
   "HERMES_RELAY_APNS_TEAM_ID=XXXXXXXXXX" \
   "HERMES_RELAY_REGISTRATION_TOKEN=$(openssl rand -hex 24)" \
   "HERMES_RELAY_SECRET_PEPPER=$(openssl rand -hex 24)" \
-  "HERMES_RELAY_ENABLE_TUNNEL=true" \
+  "HERMES_RELAY_ENABLE_TUNNEL=false" \
   "HERMES_RELAY_ALLOWED_BUNDLE_IDS=ai.hermes.app"   # redeploys with creds + volume
 railway domain                                   # public HTTPS URL
 ```
 
 `HERMES_RELAY_DATABASE_PATH` defaults to `/data/push-relay.db` (the Dockerfile
 sets it), matching the volume mount. Capture the `HERMES_RELAY_REGISTRATION_TOKEN`
-— each agent's plugin must send the same value as `HERMES_FETCH_RELAY_REGISTRATION_TOKEN`.
+— each agent's plugin must send the same value as `HERMES_MOBILE_RELAY_REGISTRATION_TOKEN`.
 
 ### Fly.io
 
 ```bash
 cd server/push-relay
-fly launch --no-deploy --copy-config --name fetch-push-relay
+fly launch --no-deploy --copy-config --name hermes-mobile-push
 fly volumes create relay_data --size 1 --region iad
 fly secrets set \
   HERMES_RELAY_APNS_KEY="$(cat AuthKey_XXXXXXXXXX.p8)" \
@@ -96,7 +96,7 @@ fly secrets set \
   HERMES_RELAY_APNS_TEAM_ID=XXXXXXXXXX \
   HERMES_RELAY_REGISTRATION_TOKEN="$(openssl rand -hex 24)" \
   HERMES_RELAY_SECRET_PEPPER="$(openssl rand -hex 24)" \
-  HERMES_RELAY_ENABLE_TUNNEL=true
+  HERMES_RELAY_ENABLE_TUNNEL=false
 fly deploy
 fly open /healthz   # -> {"ok":true,"apns_configured":true}
 ```
@@ -104,19 +104,18 @@ fly open /healthz   # -> {"ok":true,"apns_configured":true}
 ### Any Docker host
 
 ```bash
-docker build -t fetch-push-relay server/push-relay
+docker build -t hermes-mobile-push server/push-relay
 docker run -p 8080:8080 -v relay_data:/data \
   -e HERMES_RELAY_APNS_KEY="$(cat AuthKey.p8)" \
   -e HERMES_RELAY_APNS_KEY_ID=XXXXXXXXXX -e HERMES_RELAY_APNS_TEAM_ID=XXXXXXXXXX \
   -e HERMES_RELAY_REGISTRATION_TOKEN="$(openssl rand -hex 24)" \
   -e HERMES_RELAY_SECRET_PEPPER="$(openssl rand -hex 24)" \
-  -e HERMES_RELAY_ENABLE_TUNNEL=true \
-  fetch-push-relay
+  -e HERMES_RELAY_ENABLE_TUNNEL=false \
+  hermes-mobile-push
 ```
 
-Then put it behind HTTPS at your relay domain (e.g. `push.tryfetchapp.com`) and
-set that as the plugin's `HERMES_FETCH_RELAY_URL` (or bake it as the default in
-`fetch-plugin/_relay.py`).
+Then put it behind HTTPS and set that URL as the adapter's
+`HERMES_MOBILE_RELAY_URL`.
 
 ## Production checklist
 
@@ -130,8 +129,8 @@ set that as the plugin's `HERMES_FETCH_RELAY_URL` (or bake it as the default in
   plugin-provided title/body copy through APNs. Set it to `false` to force
   generic lock-screen copy when conversation text must stay off the relay.
 - **`HERMES_RELAY_ALLOWED_BUNDLE_IDS`** = your real App ID(s) only.
-- **`HERMES_RELAY_ENABLE_TUNNEL=true`** is required for relay pairing and
-  app-to-agent streaming.
+- Keep **`HERMES_RELAY_ENABLE_TUNNEL=false`**. Chat uses the co-located,
+  byte-transparent relay; this service only delivers APNs notifications.
 - Verify the `.p8` is APNs-enabled for that App ID in the Apple portal, and test
   one real push to a TestFlight device.
 

@@ -1,6 +1,6 @@
 # hermes-mobile-plugin
 
-HermesMobile iOS companion plugin for [Hermes Agent](https://github.com/NousResearch/hermes-agent): APNs push + Live Activities, desktop-phone multi-client broadcast, device pairing (`hermes mobile-pair`), sandboxed file browse, attachment upload.
+HermesMobile iOS companion plugin for [Hermes Agent](https://github.com/NousResearch/hermes-agent): stock lifecycle hooks to APNs + Live Activities, device pairing (`hermes mobile-pair`), sandboxed file browse, and attachment upload.
 
 ## Install
 

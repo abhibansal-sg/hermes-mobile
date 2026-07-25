@@ -18,7 +18,7 @@ final class NotificationActionTests: XCTestCase {
         let coordinator = NotificationLaunchCoordinator()
         coordinator.attachActionEndpointProvider { nil }
         let reconciled = expectation(description: "attention reconciliation requested")
-        coordinator.attachActionCompletionHandler { reconciled.fulfill() }
+        coordinator.attachReconciliationHandler { reconciled.fulfill() }
         coordinator.receive(.approval(
             true, nil,
             .init(handler: {})

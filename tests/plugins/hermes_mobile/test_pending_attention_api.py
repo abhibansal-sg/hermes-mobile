@@ -77,6 +77,18 @@ def test_pending_attention_requires_authentication(client):
     assert response.status_code == 401
 
 
+def test_pending_attention_is_empty_when_optional_stock_seams_are_absent(
+    attention, monkeypatch
+):
+    from tools import approval
+
+    monkeypatch.delattr(approval, "pending_approval_snapshot")
+    monkeypatch.delattr(gateway, "attention_session_identities")
+    monkeypatch.delattr(gateway, "pending_prompt_snapshot")
+
+    assert attention.capture_pending_attention() == []
+
+
 def test_pending_attention_full_snapshot_and_valid_cursor_delta(
     client, attention, monkeypatch
 ):

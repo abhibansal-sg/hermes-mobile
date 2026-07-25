@@ -43,7 +43,6 @@ import secrets
 import stat
 import sys
 import time
-import urllib.parse
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -1277,21 +1276,6 @@ class PushRegisterBody(BaseModel):
     device_id: Optional[str] = None
 
 
-class NotifyBody(BaseModel):
-    """External event injection for the push engine (watcher fallback path).
-
-    Mirrors the ``handle_gateway_event(event, sid, payload)`` signature so an
-    out-of-process poller (``scripts/watcher.py``) can trigger the exact same
-    push pipeline the in-process gateway hooks feed. Preferred path is the
-    in-process ``post_emit_event`` hook (zero latency, zero extra process);
-    this endpoint exists for hosts running a core without the hooks.
-    """
-
-    event: str
-    session_id: str
-    payload: Optional[Dict[str, Any]] = None
-
-
 class PushUnregisterBody(BaseModel):
     token: str
 
@@ -1300,37 +1284,6 @@ class LiveActivityBody(BaseModel):
     token: str
     session_id: str
     env: str = ""  # "sandbox" | "production"; empty → server default
-
-
-@router.post("/relay/pair")
-async def pair_relay_device(request: Request) -> Any:
-    """Mint the one mobile pairing link; never expose the agent secret."""
-    if not _has_dashboard_api_auth(request):
-        raise HTTPException(status_code=401, detail="Unauthorized")
-    if not _device_has_scope(request, "approve"):
-        raise HTTPException(status_code=403, detail="Device token lacks approve scope")
-
-    relay = _plugin_module("relay_client")
-    if not relay.relay_url_configured():
-        return JSONResponse(
-            status_code=400,
-            content={"error": "relay URL is not configured", "code": 4001},
-        )
-
-    try:
-        relay_url_value, agent_id, pairing_secret = await relay.relay_client().relay_pairing()
-    except relay.NeedsAttestation as exc:
-        return JSONResponse(status_code=428, content={"error": str(exc), "code": 4002})
-    except relay.RelayConfigurationError as exc:
-        return JSONResponse(status_code=400, content={"error": str(exc), "code": 4001})
-
-    query = urllib.parse.urlencode({
-        "relay": relay_url_value,
-        "agent": agent_id,
-        "pairing": pairing_secret,
-        "kind": "relay",
-    })
-    return {"url": f"hermesapp://pair?{query}"}
 
 
 def _relay_device_environment(requested_env: str) -> str:
@@ -1382,27 +1335,6 @@ async def register_push_token(body: PushRegisterBody, request: Request) -> Dict[
     if not _has_dashboard_api_auth(request):
         raise HTTPException(status_code=401, detail="Unauthorized")
     await _register_relay_device(body)
-    return {"ok": True}
-
-
-@router.post("/notify")
-async def notify_event(body: NotifyBody, request: Request) -> Dict[str, Any]:
-    """Inject a gateway event into the push pipeline (watcher fallback path).
-
-    Auth: same dashboard/device auth as ``/push/register``. The event name is
-    validated against the push engine's known event kinds so this endpoint
-    cannot be used to spray arbitrary push payloads.
-    """
-    if not _has_dashboard_api_auth(request):
-        raise HTTPException(status_code=401, detail="Unauthorized")
-    engine = _plugin_module("push_engine")
-    known = getattr(engine, "PUSH_EVENT_KINDS", None)
-    if known and body.event not in known:
-        raise HTTPException(status_code=400, detail=f"Unknown event kind: {body.event}")
-    try:
-        engine.handle_gateway_event(body.event, body.session_id, body.payload)
-    except Exception:
-        raise HTTPException(status_code=500, detail="push dispatch failed")
     return {"ok": True}
 
 

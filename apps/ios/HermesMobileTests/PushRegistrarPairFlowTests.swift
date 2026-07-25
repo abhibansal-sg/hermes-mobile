@@ -5,7 +5,7 @@ import XCTest
 @MainActor
 final class PushRegistrarPairFlowTests: XCTestCase {
 
-    private var registrar: PushRegistrar { PushRegistrar.shared }
+    private var registrar: PushRegistrar!
     private let pushDefaultsKeys = [
         DefaultsKeys.pushEnabled,
         DefaultsKeys.pushLastDeviceToken,
@@ -23,11 +23,13 @@ final class PushRegistrarPairFlowTests: XCTestCase {
 
     override func setUp() async throws {
         try await super.setUp()
+        registrar = PushRegistrar()
         resetRegistrarState()
     }
 
     override func tearDown() async throws {
         resetRegistrarState()
+        registrar = nil
         try await super.tearDown()
     }
 
@@ -90,6 +92,44 @@ final class PushRegistrarPairFlowTests: XCTestCase {
         XCTAssertFalse(UserDefaults.standard.bool(forKey: DefaultsKeys.pushRegistrationHealthy))
         XCTAssertEqual(SettingsView.notificationPermissionLabel(for: .denied), "Not authorized")
         XCTAssertEqual(SettingsView.pushTokenRegistrationLabel(token: nil), "Not registered")
+    }
+
+    func testForegroundReplaysUnhealthyCachedTokenWithoutAPNsCallback() async {
+        var apnsRegisterCalls = 0
+        var postedRegistrations: [(token: String, events: [String]?)] = []
+
+        UserDefaults.standard.set("deadbeef", forKey: DefaultsKeys.pushLastDeviceToken)
+        UserDefaults.standard.set(["approval"], forKey: DefaultsKeys.pushLastEvents)
+        UserDefaults.standard.set(false, forKey: DefaultsKeys.pushRegistrationHealthy)
+
+        registrar.authorizationRequester = { _ in .authorized }
+        registrar.remoteNotificationsRegistrar = {
+            apnsRegisterCalls += 1
+        }
+        registrar.tokenRegisterOverride = { token, events in
+            postedRegistrations.append((token: token, events: events))
+            return .success
+        }
+        registrar.setEnabled(true)
+
+        registrar.ensureRegisteredForPairedGateway()
+
+        await waitUntil(
+            postedRegistrations.count == 1,
+            "cached token should POST without an APNs callback"
+        )
+        await waitUntil(apnsRegisterCalls > 0, "foreground should still request token rotation")
+        guard let registration = postedRegistrations.first else { return }
+        XCTAssertEqual(registration.token, "deadbeef")
+        XCTAssertEqual(
+            registration.events,
+            ["approval", "clarify", "turn_complete", "turn_error", "background_done"]
+        )
+        XCTAssertTrue(UserDefaults.standard.bool(forKey: DefaultsKeys.pushRegistrationHealthy))
+        XCTAssertEqual(
+            UserDefaults.standard.string(forKey: DefaultsKeys.pushLastEnv),
+            PushTokenPoster.apnsEnvironment
+        )
     }
 
     func testNotificationToggleReregisterWaitsBehindForegroundRegisterAndWins() async {

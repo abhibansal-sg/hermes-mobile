@@ -162,14 +162,29 @@ final class PushRegistrar {
             isEnabled = true
             UserDefaults.standard.set(true, forKey: DefaultsKeys.pushEnabled)
         }
+        let defaults = UserDefaults.standard
+        let needsReplay = !defaults.bool(forKey: DefaultsKeys.pushRegistrationHealthy)
+            || lastRegisteredEnv != PushTokenPoster.apnsEnvironment
+            || defaults.string(forKey: DefaultsKeys.pushLastRegistrationScope)
+                != currentRegistrationScope
+        if let token = defaults.string(forKey: DefaultsKeys.pushLastDeviceToken),
+           !token.isEmpty,
+           needsReplay {
+            // iOS does not guarantee that every foreground registration request
+            // re-delivers an unchanged APNs token. Replay the token we already
+            // own when the prior server write is stale or unhealthy; the APNs
+            // request below still catches token rotation.
+            reRegisterEvents()
+        }
         enableIfAllowed()
     }
 
     /// If push is enabled, request authorization and kick off APNs registration.
     /// Safe to call every launch/foreground — APNs registration is cheap and
-    /// idempotent, and the system re-delivers the current token to the delegate
-    /// each time. Denied notification access is an honest terminal state: do not
-    /// ask APNs for a token the UI would then present as healthy.
+    /// idempotent. The foreground reconciliation above replays a cached token
+    /// when iOS does not deliver an unchanged token again. Denied notification
+    /// access is an honest terminal state: do not ask APNs for a token the UI
+    /// would then present as healthy.
     func enableIfAllowed(forcePrompt: Bool = false) {
         guard isEnabled else { return }
         #if canImport(UIKit)

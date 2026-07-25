@@ -14,8 +14,10 @@ from __future__ import annotations
 
 import argparse
 import sys
+from pathlib import Path
 
 import pytest
+import yaml
 
 from tests.plugins.hermes_mobile.conftest import _PLUGIN_PKG, load_plugin_module
 
@@ -43,6 +45,7 @@ def plugin_and_ctx():
         list(token_auth.TOKEN_AUTHENTICATORS),
         list(token_auth.IDENTITY_VALIDATORS),
         list(token_auth.SOCKET_OBSERVERS),
+        list(token_auth.SESSION_OWNERSHIP_CHECKERS),
         list(_approval._RESOLVE_OBSERVERS),
         list(server.PROMPT_RECEIPT_PROVIDERS),
     )
@@ -52,8 +55,9 @@ def plugin_and_ctx():
         token_auth.TOKEN_AUTHENTICATORS[:] = snapshot[0]
         token_auth.IDENTITY_VALIDATORS[:] = snapshot[1]
         token_auth.SOCKET_OBSERVERS[:] = snapshot[2]
-        _approval._RESOLVE_OBSERVERS[:] = snapshot[3]
-        server.PROMPT_RECEIPT_PROVIDERS[:] = snapshot[4]
+        token_auth.SESSION_OWNERSHIP_CHECKERS[:] = snapshot[3]
+        _approval._RESOLVE_OBSERVERS[:] = snapshot[4]
+        server.PROMPT_RECEIPT_PROVIDERS[:] = snapshot[5]
 
 
 def test_register_populates_every_seam_registry(plugin_and_ctx):
@@ -64,7 +68,6 @@ def test_register_populates_every_seam_registry(plugin_and_ctx):
     plugin, ctx, manager = plugin_and_ctx
     device_tokens = load_plugin_module("device_tokens")
     push_engine = load_plugin_module("push_engine")
-    broadcast = load_plugin_module("broadcast")
 
     plugin.register(ctx)
 
@@ -78,6 +81,10 @@ def test_register_populates_every_seam_registry(plugin_and_ctx):
         getattr(o, "__name__", "") == "_observe_socket"
         for o in token_auth.SOCKET_OBSERVERS
     )
+    assert any(
+        getattr(checker, "__name__", "") == "_identity_owns_session"
+        for checker in token_auth.SESSION_OWNERSHIP_CHECKERS
+    )
     # S5 approval audit observer
     assert any(
         getattr(o, "__name__", "") == "_audit_resolution"
@@ -87,20 +94,55 @@ def test_register_populates_every_seam_registry(plugin_and_ctx):
         provider.__class__.__name__ == "SQLitePromptReceiptProvider"
         for provider in server.PROMPT_RECEIPT_PROVIDERS
     )
-    # S1 + S2 gateway wiring: on a core that ships the tui-gateway observer
-    # hooks (this one), the plugin registers HOOKS and leaves the legacy
-    # module-level seams EMPTY (double-wiring would double-deliver frames).
+    # Notifications use only upstream v0.19 lifecycle hooks. The plugin does
+    # not register gateway-frame observers or a second live fan-out path.
     hooks = manager._hooks
-    assert any(cb for cb in hooks.get("post_frame_write", [])), "post_frame_write not registered"
-    assert any(cb for cb in hooks.get("on_ws_transport_change", [])), "on_ws_transport_change not registered"
-    assert any(cb for cb in hooks.get("post_emit_event", [])), "post_emit_event not registered"
+    assert not hooks.get("pre_emit_event")
+    assert not hooks.get("post_emit_event")
+    assert not hooks.get("post_frame_write")
+    assert not hooks.get("on_ws_transport_change")
+    assert push_engine.handle_turn_start in hooks.get("pre_llm_call", [])
+    assert push_engine.handle_turn_reply in hooks.get("post_llm_call", [])
+    assert push_engine.handle_turn_end in hooks.get("on_session_end", [])
+    assert push_engine.handle_pre_tool_call in hooks.get("pre_tool_call", [])
+    assert push_engine.handle_post_tool_call in hooks.get("post_tool_call", [])
+    assert push_engine.handle_api_request_error in hooks.get("api_request_error", [])
     assert push_engine.handle_approval_request in hooks.get("pre_approval_request", [])
+    assert push_engine.handle_approval_response in hooks.get("post_approval_response", [])
     assert push_engine.handle_session_finalize in hooks.get("on_session_finalize", [])
     # CLI command registered on the manager facade
     cmd = manager._cli_commands.get("mobile-pair")
     assert cmd is not None
     assert cmd["plugin"] == "hermes-mobile"
     assert callable(cmd["setup_fn"]) and callable(cmd["handler_fn"])
+
+
+def test_manifest_hook_declaration_matches_runtime_registration(plugin_and_ctx):
+    plugin, ctx, manager = plugin_and_ctx
+    plugin.register(ctx)
+
+    manifest_path = Path(plugin.__file__).with_name("plugin.yaml")
+    declared = set(yaml.safe_load(manifest_path.read_text())["provides_hooks"])
+    registered = {name for name, callbacks in manager._hooks.items() if callbacks}
+
+    assert declared == registered
+
+
+def test_session_ownership_stays_plugin_owned(plugin_and_ctx, monkeypatch):
+    from hermes_cli.dashboard_auth import token_auth
+
+    plugin, ctx, _manager = plugin_and_ctx
+    device_tokens = load_plugin_module("device_tokens")
+    plugin.register(ctx)
+    monkeypatch.setattr(
+        device_tokens,
+        "device_identity_for_session",
+        lambda session_id: {"device_id": "owner"} if session_id == "owned" else None,
+    )
+
+    identity = {"device_id": "owner"}
+    assert token_auth.identity_owns_session(identity, "owned") is True
+    assert token_auth.identity_owns_session(identity, "other") is False
 
 
 def test_register_is_idempotent(plugin_and_ctx):
@@ -115,6 +157,7 @@ def test_register_is_idempotent(plugin_and_ctx):
         len(token_auth.TOKEN_AUTHENTICATORS),
         len(token_auth.IDENTITY_VALIDATORS),
         len(token_auth.SOCKET_OBSERVERS),
+        len(token_auth.SESSION_OWNERSHIP_CHECKERS),
         len(_approval._RESOLVE_OBSERVERS),
         len(server.PROMPT_RECEIPT_PROVIDERS),
     )
@@ -123,6 +166,7 @@ def test_register_is_idempotent(plugin_and_ctx):
         len(token_auth.TOKEN_AUTHENTICATORS),
         len(token_auth.IDENTITY_VALIDATORS),
         len(token_auth.SOCKET_OBSERVERS),
+        len(token_auth.SESSION_OWNERSHIP_CHECKERS),
         len(_approval._RESOLVE_OBSERVERS),
         len(server.PROMPT_RECEIPT_PROVIDERS),
     )
