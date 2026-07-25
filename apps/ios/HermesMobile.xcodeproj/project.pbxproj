@@ -962,13 +962,6 @@
 			path = Stores;
 			sourceTree = "<group>";
 		};
-		2805DC003D3AC46DD0CE653D /* tests */ = {
-			isa = PBXGroup;
-			children = (
-			);
-			path = tests;
-			sourceTree = "<group>";
-		};
 		2C0E0892137AA72D9468922E /* HermesMobile */ = {
 			isa = PBXGroup;
 			children = (
@@ -1055,15 +1048,6 @@
 			path = HermesShare;
 			sourceTree = "<group>";
 		};
-		858AF3EC8ECA3128F21E1573 /* lightweight-state-consolidation */ = {
-			isa = PBXGroup;
-			children = (
-				2805DC003D3AC46DD0CE653D /* tests */,
-			);
-			name = "lightweight-state-consolidation";
-			path = ../..;
-			sourceTree = "<group>";
-		};
 		885E8F8307636D94085EA353 /* Products */ = {
 			isa = PBXGroup;
 			children = (
@@ -1142,7 +1126,6 @@
 				1AD5CE0A622C4EFAADFED3BC /* HermesWidgets */,
 				AAC0F415E0F074318DB2E5E7 /* HermesWorkTestHost */,
 				528E7534DED9EA712680A3CB /* KilledAppInboxReconciliationValidation */,
-				858AF3EC8ECA3128F21E1573 /* lightweight-state-consolidation */,
 				885E8F8307636D94085EA353 /* Products */,
 			);
 			sourceTree = "<group>";
