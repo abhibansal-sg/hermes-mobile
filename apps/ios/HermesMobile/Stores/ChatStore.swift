@@ -4738,17 +4738,98 @@ final class ChatStore {
         localTurnWatchdog = nil
     }
 
-    /// QA-3 S8/A4 stage 1 — the current turn went silent past
-    /// ``turnLivenessResyncAfter``: record the silent-turn threshold once.
-    /// The reconnect/reconcile owner may still heal a dropped terminal event;
-    /// the user sees nothing (C3). Latched once per turn.
+    /// QA-3 S8/A4 stage 1 — the current LOCAL turn went silent past
+    /// ``turnLivenessResyncAfter``. Ask the stock gateway whether that stored
+    /// session is still running. A live turn is left entirely alone; an
+    /// idle/absent turn gets exactly one authoritative transcript read so a
+    /// dropped terminal frame can settle from persisted history. Latched once
+    /// per turn and silent to the user (C3).
     private func fireTurnLivenessResync() {
-        guard isStreaming, !turnLivenessResyncFired else { return }
+        guard isStreaming, !turnLivenessResyncFired,
+              let turnToken = localTurnToken,
+              let storedID = sessions?.activeStoredId else { return }
         turnLivenessResyncFired = true
         #if DEBUG
         turnLivenessResyncCount += 1
         #endif
-        chatLog.warning("turn-liveness stage 1: current turn silent past the reconcile window (diagnostic only, never surfaced — C3)")
+        let runtimeID = sessions?.activeRuntimeId
+        let prompt = messages.last(where: { $0.role == .user })
+        chatLog.warning("turn-liveness stage 1: checking stock live state after a silent local turn")
+        Task { [weak self] in
+            await self?.reconcileSilentLocalTurn(
+                storedID: storedID,
+                runtimeID: runtimeID,
+                turnToken: turnToken,
+                prompt: prompt
+            )
+        }
+    }
+
+    private func reconcileSilentLocalTurn(
+        storedID: String,
+        runtimeID: String?,
+        turnToken: UUID,
+        prompt: ChatMessage?
+    ) async {
+        guard let sessions else { return }
+        do {
+            switch try await sessions.inspectLiveSession(storedID: storedID) {
+            case .found(let live) where live.status != .idle:
+                chatLog.info("turn-liveness stage 1: stock session is still \(live.status.rawValue, privacy: .public); preserving the live turn")
+                return
+            case .unsupported:
+                return
+            case .found, .absent:
+                break
+            }
+
+            guard isStreaming,
+                  localTurnToken == turnToken,
+                  sessions.activeStoredId == storedID,
+                  let prompt,
+                  let fetch = resolvedBackfillFetch else { return }
+            let stored = try await fetch(storedID)
+            guard isStreaming,
+                  localTurnToken == turnToken,
+                  sessions.activeStoredId == storedID,
+                  Self.containsReply(to: prompt, in: stored) else { return }
+
+            if let cacheStore, let identity = sessions.cacheIdentity(storedID) {
+                do {
+                    try await cacheStore.saveTranscript(identity: identity, messages: stored)
+                } catch {
+                    chatLog.error("turn-liveness cache write failed for session \(storedID, privacy: .public): \(error.localizedDescription, privacy: .public)")
+                }
+            }
+            guard isStreaming,
+                  localTurnToken == turnToken,
+                  sessions.activeStoredId == storedID else { return }
+            pendingReconnectReconcileID = streamingMessageID
+            seed(from: stored, policy: .union)
+            noteTranscriptSeedWindow(stored)
+            lastBackfillError = nil
+            expireTurnScopedPrompts(includeSecure: false)
+            sessions.markTurnCompleted(storedId: storedID, runtimeId: runtimeID)
+            onTurnComplete?()
+            chatLog.notice("turn-liveness stage 1: recovered a dropped terminal frame from stock history")
+        } catch {
+            chatLog.error("turn-liveness stage 1 failed for session \(storedID, privacy: .public): \(error.localizedDescription, privacy: .public)")
+        }
+    }
+
+    private nonisolated static func containsReply(
+        to prompt: ChatMessage,
+        in stored: [StoredMessage]
+    ) -> Bool {
+        let promptText = prompt.text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let promptIndex = stored.lastIndex(where: { row in
+            guard row.role == "user" else { return false }
+            if let clientMessageID = prompt.clientMessageID {
+                return row.clientMessageID == clientMessageID
+            }
+            return row.text.trimmingCharacters(in: .whitespacesAndNewlines) == promptText
+        }) else { return false }
+        return stored[stored.index(after: promptIndex)...].contains { $0.role == "assistant" }
     }
 
     /// QA-3 S8/A4 stage 2 — the current turn went silent past
@@ -4810,7 +4891,7 @@ final class ChatStore {
     /// synchronously without waiting ``turnLivenessResyncAfter`` (QA-3 A4).
     @discardableResult
     func _debugFireTurnLivenessResync() -> Bool {
-        guard isStreaming else { return false }
+        guard isStreaming, !turnLivenessResyncFired else { return false }
         fireTurnLivenessResync()
         return true
     }

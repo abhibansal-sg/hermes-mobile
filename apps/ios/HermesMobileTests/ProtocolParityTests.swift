@@ -257,6 +257,70 @@ final class ProtocolParityTests: XCTestCase {
         XCTAssertEqual(sessions.sessionBinding?.generation, 0)
     }
 
+    func testSilentLocalTurnPreservesWorkingStockSessionWithoutHistoryFetch() async {
+        let (chat, sessions) = makeStore()
+        var activeListCalls = 0
+        var historyCalls = 0
+        sessions.activeListRPC = {
+            activeListCalls += 1
+            return SessionActiveListResult(sessions: [
+                SessionActiveItem(
+                    id: self.activeRuntime,
+                    sessionKey: self.storedId,
+                    status: .working,
+                    model: nil
+                )
+            ])
+        }
+        chat.backfillFetch = { _ in
+            historyCalls += 1
+            return []
+        }
+        chat.messages = [ChatMessage(role: .user, text: "keep working")]
+        chat.handle(event: localFrame(type: "message.start"))
+
+        XCTAssertTrue(chat._debugFireTurnLivenessResync())
+        await waitUntil { activeListCalls == 1 }
+
+        XCTAssertTrue(chat.isStreaming)
+        XCTAssertEqual(historyCalls, 0)
+    }
+
+    func testSilentIdleLocalTurnFetchesHistoryOnceAndSettlesReply() async {
+        let (chat, sessions) = makeStore()
+        var activeListCalls = 0
+        var historyCalls = 0
+        sessions.activeListRPC = {
+            activeListCalls += 1
+            return SessionActiveListResult(sessions: [
+                SessionActiveItem(
+                    id: self.activeRuntime,
+                    sessionKey: self.storedId,
+                    status: .idle,
+                    model: nil
+                )
+            ])
+        }
+        chat.backfillFetch = { _ in
+            historyCalls += 1
+            return [
+                StoredMessage(role: "user", content: .string("recover me")),
+                StoredMessage(role: "assistant", content: .string("recovered reply")),
+            ]
+        }
+        chat.messages = [ChatMessage(role: .user, text: "recover me")]
+        chat.handle(event: localFrame(type: "message.start"))
+
+        XCTAssertTrue(chat._debugFireTurnLivenessResync())
+        XCTAssertFalse(chat._debugFireTurnLivenessResync(), "stage 1 is latched once per turn")
+        await waitUntil { !chat.isStreaming }
+
+        XCTAssertEqual(activeListCalls, 1)
+        XCTAssertEqual(historyCalls, 1)
+        XCTAssertEqual(chat.messages.last?.text, "recovered reply")
+        XCTAssertFalse(chat.localTurnInFlight)
+    }
+
     // MARK: - Item 8: broadcast_gap parsing
 
     func testBroadcastGapParsesFromFrameTopLevel() throws {
