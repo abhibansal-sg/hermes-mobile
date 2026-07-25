@@ -1071,13 +1071,13 @@ final class SessionStore {
     /// version guard for older gateways and falls back to the legacy resume.
     var activeListRPC: (() async throws -> SessionActiveListResult)?
 
-    private enum LiveSessionInspection {
+    enum LiveSessionInspection {
         case found(SessionActiveItem)
         case absent
         case unsupported
     }
 
-    private func inspectLiveSession(storedID: String) async throws -> LiveSessionInspection {
+    func inspectLiveSession(storedID: String) async throws -> LiveSessionInspection {
         let result: SessionActiveListResult
         do {
             if let activeListRPC {
@@ -3523,18 +3523,6 @@ final class SessionStore {
         sessionLog.notice(
             "[ABH-519] persistDraftBornCacheSeed entry session=\(storedID, privacy: .public)"
         )
-        guard let cacheStore else {
-            sessionLog.error(
-                "[ABH-519] persistDraftBornCacheSeed guard-exit session=\(storedID, privacy: .public) reason=cacheStore-nil"
-            )
-            return
-        }
-        guard let identity = cacheIdentity(storedID) else {
-            sessionLog.error(
-                "[ABH-519] persistDraftBornCacheSeed guard-exit session=\(storedID, privacy: .public) reason=cacheIdentity-nil"
-            )
-            return
-        }
         guard let echo else {
             sessionLog.error(
                 "[ABH-519] persistDraftBornCacheSeed guard-exit session=\(storedID, privacy: .public) reason=echo-nil"
@@ -3547,7 +3535,6 @@ final class SessionStore {
             )
             return
         }
-        let scope = CacheScope(serverId: identity.serverId, profileId: identity.profileId)
         let now = Date().timeIntervalSince1970
         let summary = SessionSummary(
             id: storedID,
@@ -3557,8 +3544,26 @@ final class SessionStore {
             messageCount: 1,
             source: nil,
             lastActive: now,
-            cwd: draftCwd
+            cwd: draftCwd,
+            profile: activeStoredProfile
         )
+        let listIdentity = sessionListIdentity(summary)
+        if !sessions.contains(where: { sessionListIdentity($0) == listIdentity }) {
+            sessions.insert(summary, at: 0)
+        }
+        guard let cacheStore else {
+            sessionLog.error(
+                "[ABH-519] persistDraftBornCacheSeed guard-exit session=\(storedID, privacy: .public) reason=cacheStore-nil"
+            )
+            return
+        }
+        guard let identity = cacheIdentity(storedID) else {
+            sessionLog.error(
+                "[ABH-519] persistDraftBornCacheSeed guard-exit session=\(storedID, privacy: .public) reason=cacheIdentity-nil"
+            )
+            return
+        }
+        let scope = CacheScope(serverId: identity.serverId, profileId: identity.profileId)
         let userRow = StoredMessage(
             role: "user", content: .string(echo.text),
             timestamp: now, wireId: nil, clientMessageID: echo.clientMessageID)

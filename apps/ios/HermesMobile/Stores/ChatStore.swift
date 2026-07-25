@@ -2277,8 +2277,12 @@ final class ChatStore {
               messages[index].role == .user else { return }
         let text = messages[index].text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else { return }
-        let ordinal = userOrdinal(at: index)
-        await submitTruncating(text: text, truncateBeforeUserOrdinal: ordinal, truncateFromIndex: index)
+        guard let target = await truncationTarget(for: messageId) else { return }
+        await submitTruncating(
+            text: text,
+            truncateBeforeUserOrdinal: target.ordinal,
+            truncateFromIndex: target.index
+        )
     }
 
     /// Build the `messages[]` seed for a branch-in-new-chat from the transcript
@@ -2913,8 +2917,12 @@ final class ChatStore {
         }
         guard let index = messages.firstIndex(where: { $0.id == messageId }),
               messages[index].role == .user else { return }
-        let ordinal = userOrdinal(at: index)
-        await submitTruncating(text: trimmed, truncateBeforeUserOrdinal: ordinal, truncateFromIndex: index)
+        guard let target = await truncationTarget(for: messageId) else { return }
+        await submitTruncating(
+            text: trimmed,
+            truncateBeforeUserOrdinal: target.ordinal,
+            truncateFromIndex: target.index
+        )
     }
 
     /// Re-run the turn that produced `assistantId`: find the user message that
@@ -2930,8 +2938,39 @@ final class ChatStore {
         guard let userIndex = messages[..<assistantIndex].lastIndex(where: { $0.role == .user }) else { return }
         let text = messages[userIndex].text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else { return }
-        let ordinal = userOrdinal(at: userIndex)
-        await submitTruncating(text: text, truncateBeforeUserOrdinal: ordinal, truncateFromIndex: userIndex)
+        let userMessageId = messages[userIndex].id
+        guard let target = await truncationTarget(for: userMessageId) else { return }
+        await submitTruncating(
+            text: text,
+            truncateBeforeUserOrdinal: target.ordinal,
+            truncateFromIndex: target.index
+        )
+    }
+
+    /// Resolve a destructive edit/retry target against a complete, contiguous
+    /// transcript. The visible array is intentionally a lazy tail, so its
+    /// positional user count is not safe to send as the gateway's absolute
+    /// `truncate_before_user_ordinal` until every earlier page is present.
+    ///
+    /// This runs only after the user explicitly chooses edit/retry/restore.
+    /// Normal session opens stay lazy. If an older page cannot be fetched (or a
+    /// sparse jump window has no contiguous paging cursor), fail closed instead
+    /// of truncating the wrong server turn.
+    func truncationTarget(for messageId: UUID) async -> (index: Int, ordinal: Int)? {
+        while transcriptHasMoreBefore {
+            let previousCount = messages.count
+            await loadEarlierTranscript()
+            guard messages.count > previousCount else {
+                lastError = "Couldn’t load the complete history. Try again."
+                return nil
+            }
+        }
+        guard let index = messages.firstIndex(where: { $0.id == messageId }),
+              messages[index].role == .user else {
+            lastError = "That message is no longer available."
+            return nil
+        }
+        return (index, userOrdinal(at: index))
     }
 
     /// Zero-based ordinal of the user message at `index`: its cached value if
@@ -3528,7 +3567,11 @@ final class ChatStore {
         guard limit > 0 else { return }
         isLoadingEarlierTranscript = true
         defer { isLoadingEarlierTranscript = false }
-        guard let page = await fetch(storedId, limit, pageCursor) else { return }
+        lastError = nil
+        guard let page = await fetch(storedId, limit, pageCursor) else {
+            lastError = "Couldn’t load earlier messages."
+            return
+        }
         if !page.messages.isEmpty {
             let older = Self.toChatMessages(page.messages)
             let existing = Set(messages.map(\.id))
@@ -4738,17 +4781,98 @@ final class ChatStore {
         localTurnWatchdog = nil
     }
 
-    /// QA-3 S8/A4 stage 1 — the current turn went silent past
-    /// ``turnLivenessResyncAfter``: record the silent-turn threshold once.
-    /// The reconnect/reconcile owner may still heal a dropped terminal event;
-    /// the user sees nothing (C3). Latched once per turn.
+    /// QA-3 S8/A4 stage 1 — the current LOCAL turn went silent past
+    /// ``turnLivenessResyncAfter``. Ask the stock gateway whether that stored
+    /// session is still running. A live turn is left entirely alone; an
+    /// idle/absent turn gets exactly one authoritative transcript read so a
+    /// dropped terminal frame can settle from persisted history. Latched once
+    /// per turn and silent to the user (C3).
     private func fireTurnLivenessResync() {
-        guard isStreaming, !turnLivenessResyncFired else { return }
+        guard isStreaming, !turnLivenessResyncFired,
+              let turnToken = localTurnToken,
+              let storedID = sessions?.activeStoredId else { return }
         turnLivenessResyncFired = true
         #if DEBUG
         turnLivenessResyncCount += 1
         #endif
-        chatLog.warning("turn-liveness stage 1: current turn silent past the reconcile window (diagnostic only, never surfaced — C3)")
+        let runtimeID = sessions?.activeRuntimeId
+        let prompt = messages.last(where: { $0.role == .user })
+        chatLog.warning("turn-liveness stage 1: checking stock live state after a silent local turn")
+        Task { [weak self] in
+            await self?.reconcileSilentLocalTurn(
+                storedID: storedID,
+                runtimeID: runtimeID,
+                turnToken: turnToken,
+                prompt: prompt
+            )
+        }
+    }
+
+    private func reconcileSilentLocalTurn(
+        storedID: String,
+        runtimeID: String?,
+        turnToken: UUID,
+        prompt: ChatMessage?
+    ) async {
+        guard let sessions else { return }
+        do {
+            switch try await sessions.inspectLiveSession(storedID: storedID) {
+            case .found(let live) where live.status != .idle:
+                chatLog.info("turn-liveness stage 1: stock session is still \(live.status.rawValue, privacy: .public); preserving the live turn")
+                return
+            case .unsupported:
+                return
+            case .found, .absent:
+                break
+            }
+
+            guard isStreaming,
+                  localTurnToken == turnToken,
+                  sessions.activeStoredId == storedID,
+                  let prompt,
+                  let fetch = resolvedBackfillFetch else { return }
+            let stored = try await fetch(storedID)
+            guard isStreaming,
+                  localTurnToken == turnToken,
+                  sessions.activeStoredId == storedID,
+                  Self.containsReply(to: prompt, in: stored) else { return }
+
+            if let cacheStore, let identity = sessions.cacheIdentity(storedID) {
+                do {
+                    try await cacheStore.saveTranscript(identity: identity, messages: stored)
+                } catch {
+                    chatLog.error("turn-liveness cache write failed for session \(storedID, privacy: .public): \(error.localizedDescription, privacy: .public)")
+                }
+            }
+            guard isStreaming,
+                  localTurnToken == turnToken,
+                  sessions.activeStoredId == storedID else { return }
+            pendingReconnectReconcileID = streamingMessageID
+            seed(from: stored, policy: .union)
+            noteTranscriptSeedWindow(stored)
+            lastBackfillError = nil
+            expireTurnScopedPrompts(includeSecure: false)
+            sessions.markTurnCompleted(storedId: storedID, runtimeId: runtimeID)
+            onTurnComplete?()
+            chatLog.notice("turn-liveness stage 1: recovered a dropped terminal frame from stock history")
+        } catch {
+            chatLog.error("turn-liveness stage 1 failed for session \(storedID, privacy: .public): \(error.localizedDescription, privacy: .public)")
+        }
+    }
+
+    private nonisolated static func containsReply(
+        to prompt: ChatMessage,
+        in stored: [StoredMessage]
+    ) -> Bool {
+        let promptText = prompt.text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let promptIndex = stored.lastIndex(where: { row in
+            guard row.role == "user" else { return false }
+            if let clientMessageID = prompt.clientMessageID {
+                return row.clientMessageID == clientMessageID
+            }
+            return row.text.trimmingCharacters(in: .whitespacesAndNewlines) == promptText
+        }) else { return false }
+        return stored[stored.index(after: promptIndex)...].contains { $0.role == "assistant" }
     }
 
     /// QA-3 S8/A4 stage 2 — the current turn went silent past
@@ -4810,7 +4934,7 @@ final class ChatStore {
     /// synchronously without waiting ``turnLivenessResyncAfter`` (QA-3 A4).
     @discardableResult
     func _debugFireTurnLivenessResync() -> Bool {
-        guard isStreaming else { return false }
+        guard isStreaming, !turnLivenessResyncFired else { return false }
         fireTurnLivenessResync()
         return true
     }

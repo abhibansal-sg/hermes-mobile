@@ -174,7 +174,6 @@ targets:
           - WorkRepositoryLeaseTests.swift
           - WorkRepositoryMigrationTests.swift
           - WorkRepositoryTestSupport.swift
-        buildPhase: resources
     dependencies:
       - target: HermesMobile
       # GRDB direct link so CacheLayerTests can call DatabaseQueue(configuration:)

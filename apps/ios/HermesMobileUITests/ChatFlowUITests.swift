@@ -11,8 +11,11 @@ import XCTest
 @MainActor
 func dismissDeviceConnectionBannerIfPresent() {
     let springboard = XCUIApplication(bundleIdentifier: "com.apple.springboard")
-    let banner = springboard.staticTexts["Connected"]
-    guard banner.waitForExistence(timeout: 2) else { return }
+    let notification = springboard.descendants(matching: .any)
+        .matching(identifier: "NotificationShortLookView").firstMatch
+    let connected = springboard.staticTexts["Connected"]
+    let banner = notification.waitForExistence(timeout: 1) ? notification : connected
+    guard banner.waitForExistence(timeout: 1) else { return }
     banner.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5))
         .press(
             forDuration: 0.05,
@@ -34,6 +37,7 @@ final class ChatFlowUITests: XCTestCase {
         continueAfterFailure = false
     }
 
+    @MainActor
     func testNewSessionStreamingTurn() throws {
         let env = ProcessInfo.processInfo.environment
         guard let url = env["HERMES_URL"], let token = env["HERMES_TOKEN"],
@@ -42,6 +46,7 @@ final class ChatFlowUITests: XCTestCase {
         }
 
         let app = XCUIApplication()
+        XCUIDevice.shared.orientation = .portrait
         app.launchEnvironment["HERMES_URL"] = url
         app.launchEnvironment["HERMES_TOKEN"] = token
         if let relayURL = env["HERMES_RELAY_URL"], !relayURL.isEmpty {
@@ -61,6 +66,26 @@ final class ChatFlowUITests: XCTestCase {
             drawerToggle.waitForExistence(timeout: 30),
             "Connected chat shell (draft home) did not appear"
         )
+        dismissDeviceConnectionBannerIfPresent()
+        if drawerToggle.label == "Close menu" {
+            app.coordinate(withNormalizedOffset: CGVector(dx: 0.9, dy: 0.5)).tap()
+            XCTAssertEqual(
+                XCTWaiter.wait(for: [
+                    XCTNSPredicateExpectation(
+                    predicate: NSPredicate(format: "label == %@", "Open menu"),
+                    object: drawerToggle
+                    )
+                ], timeout: 5),
+                .completed
+            )
+        }
+
+        // Start from a known-empty draft.
+        let newChat = app.buttons["newChatButton"]
+        XCTAssertTrue(newChat.waitForExistence(timeout: 15))
+        app.coordinate(withNormalizedOffset: CGVector(dx: 0.82, dy: 0.10)).tap()
+        let modelChip = app.buttons["composerModelChip"]
+        XCTAssertTrue(modelChip.waitForExistence(timeout: 30))
 
         // 2. A physical device preserves per-session drafts between launches,
         //    so the placeholder is not a stable query. Use the field's identity.
@@ -72,10 +97,15 @@ final class ChatFlowUITests: XCTestCase {
             "Composer did not appear on the draft chat"
         )
         let composer = composerField.exists ? composerField : composerTextView
-        composer.tap()
+        dismissDeviceConnectionBannerIfPresent()
+        app.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.90)).tap()
         // The expected answer must NOT appear in the prompt text, otherwise
         // the assertion below could match the user's own bubble.
-        composer.typeText("What is the capital of France? Reply with just the city name.")
+        let sessionMarker = "ABH519-\(UUID().uuidString.prefix(8))"
+        composer.typeText(
+            "\(sessionMarker) What is the capital of France? Ignore the test marker. "
+                + "Reply with just the city name."
+        )
 
         // 3. Send.
         let send = app.buttons["Send"]
@@ -119,7 +149,6 @@ final class ChatFlowUITests: XCTestCase {
         //    so the relocated chip renders in the composer's Row 2 with its
         //    `composerModelChip` id. The chip is gated on a non-nil model — its
         //    presence here is the non-nil-model assertion the contract requires.
-        let modelChip = app.buttons["composerModelChip"]
         XCTAssertTrue(
             modelChip.waitForExistence(timeout: 30),
             "Composer model chip did not render against a live gateway with a resolved model"
@@ -129,6 +158,33 @@ final class ChatFlowUITests: XCTestCase {
         attachment.name = "chat-after-turn"
         attachment.lifetime = .keepAlways
         add(attachment)
+
+        // Switch away and back: another draft must never paint this session's
+        // transcript, and reopening the newest stored row must restore it.
+        dismissDeviceConnectionBannerIfPresent()
+        app.coordinate(withNormalizedOffset: CGVector(dx: 0.82, dy: 0.10)).tap()
+        XCTAssertTrue(reply.waitForNonExistence(timeout: 5), "Another draft painted the prior reply")
+        drawerToggle.tap()
+        let createdSession = app.buttons.matching(
+            NSPredicate(
+                format: "identifier == %@ AND label CONTAINS[c] %@",
+                "sessionRow",
+                sessionMarker
+            )
+        ).firstMatch
+        XCTAssertTrue(createdSession.waitForExistence(timeout: 20))
+        createdSession.tap()
+        XCTAssertTrue(reply.waitForExistence(timeout: 10), "Reopening the session did not repaint its reply")
+
+        // A true process restart must paint the same selected transcript from
+        // disk quickly, before any full-history recovery could mask a miss.
+        app.terminate()
+        app.launch()
+        XCTAssertTrue(drawerToggle.waitForExistence(timeout: 30))
+        XCTAssertTrue(
+            reply.waitForExistence(timeout: 3),
+            "Force-close/reopen did not paint the selected transcript from disk"
+        )
     }
 
     /// Settings reachability (F1+F2 / Amendment C+E): the footer gear is gone;

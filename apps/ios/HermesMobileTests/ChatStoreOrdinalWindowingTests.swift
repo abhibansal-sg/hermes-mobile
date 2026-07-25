@@ -152,4 +152,63 @@ final class ChatStoreOrdinalWindowingTests: XCTestCase {
             + "the user makes elsewhere in the transcript — even though none of those rows "
             + "changed position in the actual session history the gateway holds.")
     }
+
+    /// The destructive action path must load every earlier page before exposing
+    /// the ordinal that `prompt.submit` interprets against full server history.
+    /// Normal opening remains lazy; only the explicit retry/edit action pays
+    /// this bounded paging cost.
+    func testTruncationTargetBackfillsTailBeforeReturningAbsoluteOrdinal() async {
+        let chat = ChatStore()
+        let sessions = SessionStore()
+        let connection = ConnectionStore(sessionStore: sessions, chatStore: chat)
+        chat.attach(connection: connection, sessions: sessions, attachments: AttachmentStore())
+        sessions.attach(connection: connection, chat: chat)
+        sessions.activeStoredId = "s1"
+
+        let all = longTranscript(userTurns: 40)
+        let tail = Array(all.suffix(20))
+        chat.seed(from: tail)
+        chat.noteTranscriptPaging(oldestId: tail.first?.wireId, hasMoreBefore: true)
+        let targetId = chat.messages.first { $0.text == "u35" }!.id
+        var fetches = 0
+        chat.transcriptPageFetch = { _, _, _ in
+            fetches += 1
+            return TranscriptPageFetch(
+                messages: Array(all.prefix(60)),
+                oldestId: all.first?.wireId,
+                hasMoreBefore: false
+            )
+        }
+
+        let target = await chat.truncationTarget(for: targetId)
+
+        XCTAssertEqual(fetches, 1)
+        XCTAssertEqual(target?.ordinal, 35)
+        XCTAssertEqual(chat.messages.count, 80)
+        XCTAssertNil(chat.lastError)
+    }
+
+    /// A page failure must never fall through to the tail-relative ordinal.
+    /// This is the observed "message no longer available" class made safe:
+    /// retain the transcript, surface a retryable error, send no truncation.
+    func testTruncationTargetFailsClosedWhenEarlierPageCannotLoad() async {
+        let chat = ChatStore()
+        let sessions = SessionStore()
+        let connection = ConnectionStore(sessionStore: sessions, chatStore: chat)
+        chat.attach(connection: connection, sessions: sessions, attachments: AttachmentStore())
+        sessions.attach(connection: connection, chat: chat)
+        sessions.activeStoredId = "s1"
+
+        let tail = Array(longTranscript(userTurns: 40).suffix(20))
+        chat.seed(from: tail)
+        chat.noteTranscriptPaging(oldestId: tail.first?.wireId, hasMoreBefore: true)
+        let targetId = chat.messages.first { $0.text == "u35" }!.id
+        chat.transcriptPageFetch = { _, _, _ in nil }
+
+        let target = await chat.truncationTarget(for: targetId)
+
+        XCTAssertNil(target)
+        XCTAssertEqual(chat.messages.count, 20)
+        XCTAssertEqual(chat.lastError, "Couldn’t load the complete history. Try again.")
+    }
 }
