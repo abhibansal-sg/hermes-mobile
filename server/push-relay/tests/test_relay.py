@@ -1,11 +1,20 @@
 from __future__ import annotations
 
+import asyncio
 import tempfile
 from pathlib import Path
 
 from fastapi.testclient import TestClient
 
-from push_relay.app import APNsResult, Device, PushService, RelayStore, Settings, create_app
+from push_relay.app import (
+    APNsClient,
+    APNsResult,
+    Device,
+    PushService,
+    RelayStore,
+    Settings,
+    create_app,
+)
 from push_relay import attestation as att
 
 
@@ -13,8 +22,22 @@ class FakeAPNs:
     def __init__(self) -> None:
         self.sent: list[dict] = []
 
-    async def send(self, *, device: Device, payload: dict, collapse_id: str | None) -> APNsResult:
-        self.sent.append({"device": device, "payload": payload, "collapse_id": collapse_id})
+    async def send(
+        self,
+        *,
+        device: Device,
+        payload: dict,
+        collapse_id: str | None,
+        push_type: str = "alert",
+    ) -> APNsResult:
+        self.sent.append(
+            {
+                "device": device,
+                "payload": payload,
+                "collapse_id": collapse_id,
+                "push_type": push_type,
+            }
+        )
         return APNsResult(ok=True, status=200, reason=None, should_prune=False)
 
 
@@ -87,6 +110,7 @@ def test_agent_device_push_flow_uses_custom_copy_by_default() -> None:
     # No apns-collapse-id: each push is its own notification (grouping comes from
     # aps thread-id). See test_collapse.py for the per-session regression check.
     assert fake_apns.sent[0]["collapse_id"] is None
+    assert fake_apns.sent[0]["push_type"] == "alert"
     assert fake_apns.sent[0]["payload"]["aps"]["alert"]["title"] == "Assistant replied"
     assert fake_apns.sent[0]["payload"]["aps"]["alert"]["body"] == "The report is ready."
     assert fake_apns.sent[0]["payload"]["source"] == "inbox"
@@ -99,6 +123,117 @@ def test_agent_device_push_flow_uses_custom_copy_by_default() -> None:
     )
     assert attention_res.status_code == 200
     assert attention_res.json()["sent"] == 0
+
+
+def test_background_invalidation_reaches_devices_when_alerts_are_disabled() -> None:
+    client, fake_apns = _client()
+    headers = _register_agent(client)
+    device_res = client.post(
+        "/v1/devices/register",
+        headers=headers,
+        json={
+            "token": "device-token",
+            "platform": "ios",
+            "environment": "sandbox",
+            "bundle_id": "ai.hermes.app",
+            "preferences": {
+                "replies": False,
+                "attention": False,
+                "proactive": False,
+                "sound": False,
+            },
+        },
+    )
+    assert device_res.status_code == 200
+
+    payload = {
+        "aps": {"content-available": 1},
+        "sync": {"scope": "all", "revision": 9, "reason": "sessions"},
+    }
+    response = client.post(
+        "/v1/push/background",
+        headers=headers,
+        json={
+            "payload": payload,
+            "headers": {
+                "apns-topic": "untrusted.example",
+                "apns-push-type": "alert",
+                "apns-priority": "10",
+            },
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["sent"] == 1
+    assert fake_apns.sent == [
+        {
+            "device": fake_apns.sent[0]["device"],
+            "payload": payload,
+            "collapse_id": "hermes-sync:all",
+            "push_type": "background",
+        }
+    ]
+    rejected = client.post(
+        "/v1/push/background",
+        headers=headers,
+        json={"payload": {"aps": {"alert": "secret"}, "sync": payload["sync"]}},
+    )
+    assert rejected.status_code == 400
+    assert len(fake_apns.sent) == 1
+
+
+def test_apns_background_uses_fixed_silent_headers(monkeypatch, tmp_path) -> None:
+    class Response:
+        status_code = 200
+
+    class HTTPClient:
+        def __init__(self) -> None:
+            self.calls: list[dict] = []
+
+        async def post(self, url, *, headers, json):
+            self.calls.append({"url": url, "headers": headers, "json": json})
+            return Response()
+
+    settings = Settings(
+        database_path=tmp_path / "relay.db",
+        apns_key_pem="unused",
+        apns_key_id="key",
+        apns_team_id="team",
+        registration_token=None,
+        allow_custom_body=True,
+    )
+    http = HTTPClient()
+    client = APNsClient(settings, client=http)  # type: ignore[arg-type]
+    monkeypatch.setattr(client, "_jwt", lambda: "provider-token")
+    payload = {
+        "aps": {"content-available": 1},
+        "sync": {"scope": "all", "revision": 9, "reason": "sessions"},
+    }
+
+    result = asyncio.run(
+        client.send(
+            device=Device(
+                token="device-token",
+                platform="ios",
+                environment="sandbox",
+                bundle_id="ai.hermes.app",
+                sound=False,
+            ),
+            payload=payload,
+            collapse_id="hermes-sync:all",
+            push_type="background",
+        )
+    )
+
+    assert result.ok
+    assert http.calls[0]["headers"] == {
+        "authorization": "bearer provider-token",
+        "apns-topic": "ai.hermes.app",
+        "apns-push-type": "background",
+        "apns-priority": "5",
+        "apns-collapse-id": "hermes-sync:all",
+    }
+    assert http.calls[0]["json"] == payload
 
 
 def test_push_flow_uses_generic_copy_when_custom_body_disabled() -> None:

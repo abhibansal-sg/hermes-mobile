@@ -11,7 +11,15 @@ class _CapturingSender:
     def __init__(self) -> None:
         self.collapse_ids: list[str | None] = []
 
-    async def send(self, *, device: Device, payload: dict, collapse_id: str | None) -> APNsResult:
+    async def send(
+        self,
+        *,
+        device: Device,
+        payload: dict,
+        collapse_id: str | None,
+        push_type: str = "alert",
+    ) -> APNsResult:
+        del push_type
         self.collapse_ids.append(collapse_id)
         return APNsResult(ok=True, status=200, reason=None, should_prune=False)
 

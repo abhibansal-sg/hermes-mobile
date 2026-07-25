@@ -201,6 +201,10 @@ class PushEventBody(BaseModel):
         return value
 
 
+class BackgroundPushBody(BaseModel):
+    payload: dict[str, Any]
+
+
 def _column_exists(conn: sqlite3.Connection, table: str, column: str) -> bool:
     assert table.isidentifier(), f"unsafe table name: {table!r}"
     return any(r["name"] == column for r in conn.execute(f"PRAGMA table_info({table})").fetchall())
@@ -524,17 +528,18 @@ class RelayStore:
                 (agent_id, token),
             )
 
-    def list_devices(self, *, agent_id: str, category: PushKind) -> list[Device]:
-        col = _CATEGORY_COLUMN[category]
+    def list_devices(
+        self, *, agent_id: str, category: PushKind | None
+    ) -> list[Device]:
+        query = """SELECT token, platform, environment, bundle_id, sound
+                   FROM devices
+                   WHERE agent_id = ? AND platform = 'ios'"""
+        if category is not None:
+            query += f" AND {_CATEGORY_COLUMN[category]} = 1"
         with self._connect() as conn:
             # NOTE: filters to ios today. When adding Android (FCM), loosen this filter AND
             # register an "android" sender in _senders — send_event already routes by platform.
-            rows = conn.execute(
-                f"""SELECT token, platform, environment, bundle_id, sound
-                    FROM devices
-                    WHERE agent_id = ? AND platform = 'ios' AND {col} = 1""",
-                (agent_id,),
-            ).fetchall()
+            rows = conn.execute(query, (agent_id,)).fetchall()
         return [
             Device(
                 token=str(row["token"]),
@@ -630,13 +635,14 @@ class APNsClient:
         device: Device,
         payload: dict,
         collapse_id: str | None,
+        push_type: Literal["alert", "background"] = "alert",
     ) -> APNsResult:
         url = f"{_apns_host(device.environment)}/3/device/{device.token}"
         headers = {
             "authorization": f"bearer {self._jwt()}",
             "apns-topic": device.bundle_id,
-            "apns-push-type": "alert",
-            "apns-priority": "10",
+            "apns-push-type": push_type,
+            "apns-priority": "5" if push_type == "background" else "10",
         }
         if collapse_id:
             headers["apns-collapse-id"] = collapse_id[:64]
@@ -695,6 +701,49 @@ class PushService:
     def sender_for(self, platform: str):
         return self._senders.get(platform)
 
+    async def _fan_out(
+        self,
+        *,
+        devices: list[Device],
+        payload_for_device,
+        collapse_id: str | None,
+        push_type: Literal["alert", "background"],
+    ) -> tuple[int, int]:
+        if self._apns is None and not self._senders:
+            raise HTTPException(status_code=503, detail="APNs is not configured")
+
+        sent = 0
+        failed = 0
+        for device in devices:
+            sender = self.sender_for(device.platform)
+            if sender is None:
+                logger.warning("no push sender for platform %s", device.platform)
+                continue
+            result = await sender.send(
+                device=device,
+                payload=payload_for_device(device),
+                collapse_id=collapse_id,
+                push_type=push_type,
+            )
+            if result.should_prune:
+                self._store.prune_device(
+                    token=device.token,
+                    environment=device.environment,
+                    bundle_id=device.bundle_id,
+                )
+            if result.ok:
+                sent += 1
+            else:
+                failed += 1
+                logger.info(
+                    "APNs relay send failed status=%s reason=%s env=%s topic=%s",
+                    result.status,
+                    result.reason,
+                    device.environment,
+                    device.bundle_id,
+                )
+        return sent, failed
+
     async def send_event(
         self,
         *,
@@ -717,23 +766,18 @@ class PushService:
         if not devices:
             return {"ok": True, "event_id": event_id, "sent": 0}
 
-        if self._apns is None and not self._senders:
-            raise HTTPException(status_code=503, detail="APNs is not configured")
-
         push_title, push_body = _notification_copy(
             kind=kind,
             title=title,
             body=body,
             allow_custom_body=self._settings.allow_custom_body,
         )
-        sent = 0
-        failed = 0
-        for device in devices:
-            sender = self.sender_for(device.platform)
-            if sender is None:
-                logger.warning("no push sender for platform %s", device.platform)
-                continue
-            device_payload = _payload(
+        # No apns-collapse-id: each reply/attention/proactive message is its own
+        # notification. Grouping is handled by aps "thread-id" (see _payload), so
+        # messages still thread by session without coalescing into one alert.
+        sent, failed = await self._fan_out(
+            devices=devices,
+            payload_for_device=lambda device: _payload(
                 kind=kind,
                 title=push_title,
                 body=push_body,
@@ -742,29 +786,25 @@ class PushService:
                 source=source,
                 event_type=event_type,
                 hermes_payload=payload,
-            )
-            # No apns-collapse-id: each reply/attention/proactive message is its own
-            # notification. Grouping is handled by aps "thread-id" (see _payload), so
-            # messages still thread by session without coalescing into one alert.
-            result = await sender.send(device=device, payload=device_payload, collapse_id=None)
-            if result.should_prune:
-                self._store.prune_device(
-                    token=device.token,
-                    environment=device.environment,
-                    bundle_id=device.bundle_id,
-                )
-            if result.ok:
-                sent += 1
-            else:
-                failed += 1
-                logger.info(
-                    "APNs relay send failed status=%s reason=%s env=%s topic=%s",
-                    result.status,
-                    result.reason,
-                    device.environment,
-                    device.bundle_id,
-                )
+            ),
+            collapse_id=None,
+            push_type="alert",
+        )
         return {"ok": failed == 0, "event_id": event_id, "sent": sent, "failed": failed}
+
+    async def send_background(
+        self, *, agent_id: str, payload: dict[str, Any], collapse_id: str
+    ) -> dict:
+        devices = self._store.list_devices(agent_id=agent_id, category=None)
+        if not devices:
+            return {"ok": True, "sent": 0}
+        sent, failed = await self._fan_out(
+            devices=devices,
+            payload_for_device=lambda _device: payload,
+            collapse_id=collapse_id,
+            push_type="background",
+        )
+        return {"ok": failed == 0, "sent": sent, "failed": failed}
 
 
 class _RateLimiter:
@@ -973,6 +1013,38 @@ def create_app(
             source=body.source,
             event_type=body.event_type,
             payload=body.payload,
+        )
+
+    @app.post("/v1/push/background")
+    async def push_background(
+        request: Request,
+        body: BackgroundPushBody,
+        auth: AgentAuth = Depends(_require_agent),
+    ) -> dict:
+        _rate_limit(request, "push-background")
+        payload = body.payload
+        sync = payload.get("sync")
+        if (
+            set(payload) != {"aps", "sync"}
+            or payload.get("aps") != {"content-available": 1}
+            or not isinstance(sync, dict)
+            or not isinstance(sync.get("scope"), str)
+            or not sync["scope"]
+            or len(sync["scope"]) > 160
+            or isinstance(sync.get("revision"), bool)
+            or not isinstance(sync.get("revision"), int)
+            or sync["revision"] < 0
+            or not isinstance(sync.get("reason"), str)
+            or not sync["reason"]
+            or len(sync["reason"]) > 80
+        ):
+            raise HTTPException(
+                status_code=400, detail="invalid background sync payload"
+            )
+        return await push_service.send_background(
+            agent_id=auth.agent_id,
+            payload=payload,
+            collapse_id=f"hermes-sync:{sync['scope']}"[:64],
         )
 
     if settings.enable_tunnel:
