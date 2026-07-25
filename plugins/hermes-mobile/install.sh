@@ -2,7 +2,7 @@
 # install.sh — install the hermes-mobile plugin into a stock Hermes.
 #
 # Usage (two-line install):
-#   curl -fsSL https://raw.githubusercontent.com/abhibansal-sg/hermes-mobile/environment-and-workflows-overview/plugins/hermes-mobile/install.sh | sh
+#   curl -fsSL https://raw.githubusercontent.com/abhibansal-sg/hermes-mobile/main/plugins/hermes-mobile/install.sh | sh
 #   hermes mobile-pair
 #
 # What it does:
@@ -14,7 +14,7 @@
 set -eu
 
 REPO="${HERMES_MOBILE_REPO:-abhibansal-sg/hermes-mobile}"
-BRANCH="${HERMES_MOBILE_BRANCH:-environment-and-workflows-overview}"
+BRANCH="${HERMES_MOBILE_BRANCH:-main}"
 HERMES_HOME="${HERMES_HOME:-$HOME/.hermes}"
 DEST="$HERMES_HOME/plugins/hermes-mobile"
 TMP="$(mktemp -d)"
@@ -33,8 +33,18 @@ SRC="$TMP/plugins/hermes-mobile"
 [ -d "$SRC" ] || { echo "ERROR: plugin dir missing from archive" >&2; exit 1; }
 
 mkdir -p "$HERMES_HOME/plugins"
-rm -rf "$DEST"
-cp -R "$SRC" "$DEST"
+mkdir -p "$DEST"
+# Replace installed code without deleting durable prompt-receipt SQLite state.
+find "$DEST" -type f \
+  ! -name '*.sqlite' \
+  ! -name '*.sqlite3' \
+  ! -name '*.sqlite-wal' \
+  ! -name '*.sqlite-shm' \
+  ! -name '*.sqlite3-wal' \
+  ! -name '*.sqlite3-shm' \
+  -delete
+find "$DEST" -depth -type d -empty -delete
+cp -R "$SRC"/. "$DEST"/
 # Never ship test/dev artifacts into the live plugin dir.
 rm -rf "$DEST/tests" "$DEST/__pycache__" 2>/dev/null || true
 
