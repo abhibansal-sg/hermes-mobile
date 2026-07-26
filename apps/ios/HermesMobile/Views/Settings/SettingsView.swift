@@ -777,6 +777,7 @@ struct SettingsView: View {
                         let server = connectionStore.serverURLString
                         let deviceId = DefaultsKeys.deviceId(server: server)
                         await connectionStore.forgetGateway(remoteCleanup: {
+                            await PushRegistrar.shared.unregisterRememberedToken()
                             if let rest, let deviceId { _ = try await rest.revokeDevice(id: deviceId) }
                         })
                         dismiss()

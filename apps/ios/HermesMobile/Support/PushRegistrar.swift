@@ -48,6 +48,8 @@ final class PushRegistrar {
     @ObservationIgnored
     var tokenRegisterOverride: (@MainActor @Sendable (String, [String]?) async -> PushTokenPoster.Outcome)?
     @ObservationIgnored
+    var tokenUnregisterOverride: (@MainActor @Sendable (String) async -> PushTokenPoster.Outcome)?
+    @ObservationIgnored
     private var registrationInFlight = false
     @ObservationIgnored
     private var pendingRegistrationRequest: RegistrationRequest?
@@ -121,26 +123,8 @@ final class PushRegistrar {
             // only applies to the silent launch path).
             enableIfAllowed(forcePrompt: true)
         } else {
-            let lastDeviceToken = UserDefaults.standard.string(
-                forKey: DefaultsKeys.pushLastDeviceToken
-            )
-            if let lastDeviceToken, !lastDeviceToken.isEmpty {
-                if let poster = makePoster() {
-                    Task { @MainActor in
-                        let outcome = await poster.unregister(token: lastDeviceToken)
-                        switch outcome {
-                        case .success, .softFail, .validationRejected:
-                            connection?.capabilities.notePushRegistry(
-                                available: outcome.provesEndpointPresent
-                            )
-                        case .hardFail:
-                            // Best-effort network cleanup: keep the Settings toggle
-                            // responsive and still clear local opt-out state.
-                            break
-                        }
-                    }
-                }
-            }
+            let token = UserDefaults.standard.string(forKey: DefaultsKeys.pushLastDeviceToken)
+            Task { await unregisterRememberedToken(token) }
             UserDefaults.standard.removeObject(forKey: DefaultsKeys.pushLastDeviceToken)
             UserDefaults.standard.removeObject(forKey: DefaultsKeys.pushLastEvents)
             UserDefaults.standard.removeObject(forKey: DefaultsKeys.pushLastEnv)
@@ -149,6 +133,31 @@ final class PushRegistrar {
             #if canImport(UIKit)
             UIApplication.shared.unregisterForRemoteNotifications()
             #endif
+        }
+    }
+
+    /// Remove the remembered APNs token while the gateway credential is still
+    /// available. Gateway forget awaits this before erasing local credentials;
+    /// otherwise the hosted push registry can keep notifying an unpaired app.
+    func unregisterRememberedToken(_ rememberedToken: String? = nil) async {
+        let token = rememberedToken
+            ?? UserDefaults.standard.string(forKey: DefaultsKeys.pushLastDeviceToken)
+        guard let token, !token.isEmpty else { return }
+
+        let outcome: PushTokenPoster.Outcome
+        if let tokenUnregisterOverride {
+            outcome = await tokenUnregisterOverride(token)
+        } else {
+            guard let poster = makePoster() else { return }
+            outcome = await poster.unregister(token: token)
+        }
+        switch outcome {
+        case .success, .softFail, .validationRejected:
+            connection?.capabilities.notePushRegistry(
+                available: outcome.provesEndpointPresent
+            )
+        case .hardFail:
+            break
         }
     }
 

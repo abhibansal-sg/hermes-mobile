@@ -193,10 +193,24 @@ final class PushRegistrarPairFlowTests: XCTestCase {
         XCTAssertEqual(UserDefaults.standard.string(forKey: DefaultsKeys.pushLastEnv), currentEnv)
     }
 
+    func testGatewayForgetUnregistersRememberedPushToken() async {
+        var unregisteredTokens: [String] = []
+        UserDefaults.standard.set("deadbeef", forKey: DefaultsKeys.pushLastDeviceToken)
+        registrar.tokenUnregisterOverride = { token in
+            unregisteredTokens.append(token)
+            return .success
+        }
+
+        await registrar.unregisterRememberedToken()
+
+        XCTAssertEqual(unregisteredTokens, ["deadbeef"])
+    }
+
     private func resetRegistrarState() {
         registrar.authorizationRequester = nil
         registrar.remoteNotificationsRegistrar = nil
         registrar.tokenRegisterOverride = nil
+        registrar.tokenUnregisterOverride = nil
         for key in pushDefaultsKeys {
             UserDefaults.standard.removeObject(forKey: key)
         }
