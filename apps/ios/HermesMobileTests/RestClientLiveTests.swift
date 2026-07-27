@@ -44,7 +44,7 @@ final class RestClientLiveTests: XCTestCase {
 
     func testBoundedTranscriptTailIgnoresPluginPathStyle() async throws {
         TranscriptPageStubProtocol.nextResponse = (
-            #"{"session_id":"s 1","messages":[{"id":51,"role":"assistant","content":"tail"}],"pagination":{"limit":50,"offset":10,"returned":1}}"#.data(using: .utf8)!,
+            #"{"session_id":"s 1","messages":[{"id":51,"role":"user","content":"tail"}],"pagination":{"limit":50,"offset":10,"returned":1}}"#.data(using: .utf8)!,
             200
         )
         TranscriptPageStubProtocol.requestedPath = nil

@@ -2112,7 +2112,7 @@ final class ConnectionStore {
         if let gap = event.broadcastGap, gap > 0 {
             Task {
                 guard self.isActiveGeneration(generation) else { return }
-                await self.chatStore.backfill()
+                await self.chatStore.reconcileAuthoritativeTranscript()
                 guard self.isActiveGeneration(generation) else { return }
                 await self.sessionStore.refresh()
                 guard self.isActiveGeneration(generation) else { return }

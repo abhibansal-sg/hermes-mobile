@@ -1,0 +1,13 @@
+{
+  "source": "physical-device-cache-structural-snapshot",
+  "captured_build": 135,
+  "session_message_count": 313,
+  "cached_row_count": 50,
+  "cached_user_row_count": 0,
+  "cached_assistant_row_count": 20,
+  "cached_tool_row_count": 30,
+  "first_row_role": "tool",
+  "orphan_tool_result_count": 1,
+  "description": "The cached tail begins with a tool result whose owning assistant tool call is outside the page.",
+  "expected": "Fetch preceding raw rows to the user boundary, then normalize the combined sequence once."
+}

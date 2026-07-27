@@ -109,6 +109,7 @@
 		44BAA236725F9557A480DDAD /* DrawerView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1DD028C91B17BFAA2A7D8DD3 /* DrawerView.swift */; };
 		44DF034A2EE2488D4660B66A /* RestClient+Artifacts.swift in Sources */ = {isa = PBXBuildFile; fileRef = EBA9FCC265C83686612CD365 /* RestClient+Artifacts.swift */; };
 		44E63C9F12193AD01A3DEAB3 /* InboxStoreTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0127D3D1ADD45560D331E4E7 /* InboxStoreTests.swift */; };
+		455245A6F857E57C9D20D85A /* ios_fix_mid_turn_tail.json in Resources */ = {isa = PBXBuildFile; fileRef = ACCF2E02057CCACF71FC3C63 /* ios_fix_mid_turn_tail.json */; };
 		458E4319DAC3C7EEDBDE7B2A /* InboxStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 36500DDDD7B917A3A3C1A3FC /* InboxStore.swift */; };
 		46C4C919CBA39FA3F0F46210 /* ManualTokenPromptView.swift in Sources */ = {isa = PBXBuildFile; fileRef = FA40DF869418B593356B8F5F /* ManualTokenPromptView.swift */; };
 		46E2A96F1355D0C152342B44 /* AttachmentBlobCache.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8D8177A575A9843A7DB122E0 /* AttachmentBlobCache.swift */; };
@@ -316,6 +317,7 @@
 		CF447105EF03356968AF74CF /* WorkScope+CacheScope.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2FE5C56B72B1F359A33712E4 /* WorkScope+CacheScope.swift */; };
 		CFBE657902C51DE1C9AAE5B7 /* SilentSyncPushTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 828D97F8379B23D0E46489A3 /* SilentSyncPushTests.swift */; };
 		CFCB102CD9AA735C8BAF0E75 /* WorkRepository.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6E96D188E143CDC9D384C6BF /* WorkRepository.swift */; };
+		D00114EC35EA7AD585D15155 /* TurnSafeTranscriptTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0CB697EA9621AF99842DBDC4 /* TurnSafeTranscriptTests.swift */; };
 		D240AECBED85AA6D2B161A83 /* ChatStoreSeedParityTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = FDE99B5373A56D4136876F8A /* ChatStoreSeedParityTests.swift */; };
 		D24E4533176CDBC7005C89F8 /* SecurePromptView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0B493ECAAA09AFD2AA200978 /* SecurePromptView.swift */; };
 		D419C374DD4551228BC592ED /* UsageView.swift in Sources */ = {isa = PBXBuildFile; fileRef = FFAC17CF4510CF16B2BBCB9E /* UsageView.swift */; };
@@ -478,6 +480,7 @@
 		0960C22D07E2D26B15D28C6D /* OfflineSearchTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OfflineSearchTests.swift; sourceTree = "<group>"; };
 		0B493ECAAA09AFD2AA200978 /* SecurePromptView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SecurePromptView.swift; sourceTree = "<group>"; };
 		0C028EAA9312823746769CE4 /* VoiceRecorder.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VoiceRecorder.swift; sourceTree = "<group>"; };
+		0CB697EA9621AF99842DBDC4 /* TurnSafeTranscriptTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TurnSafeTranscriptTests.swift; sourceTree = "<group>"; };
 		0CC10F89B2FA3A66A6A5977C /* ConnectionMode.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ConnectionMode.swift; sourceTree = "<group>"; };
 		0EB3FD807B7D0204CCB7B5F7 /* MathSegmentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MathSegmentView.swift; sourceTree = "<group>"; };
 		0F5215BA6361020AB4BA7DC3 /* ChatStoreLatestAssistantReplyTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ChatStoreLatestAssistantReplyTests.swift; sourceTree = "<group>"; };
@@ -681,6 +684,7 @@
 		AAD083DDFED5F0A023CABD3C /* ProtocolTypes.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProtocolTypes.swift; sourceTree = "<group>"; };
 		AB7DCE4E264FB2001D371685 /* RestClient+Webhooks.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "RestClient+Webhooks.swift"; sourceTree = "<group>"; };
 		AC652AA85E8F9CDEBB3D183A /* OutboxScopingTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OutboxScopingTests.swift; sourceTree = "<group>"; };
+		ACCF2E02057CCACF71FC3C63 /* ios_fix_mid_turn_tail.json */ = {isa = PBXFileReference; lastKnownFileType = text.json; path = ios_fix_mid_turn_tail.json; sourceTree = "<group>"; };
 		AD6B1AC7ACA4368D4298F05B /* OutboxStateProjectionTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OutboxStateProjectionTests.swift; sourceTree = "<group>"; };
 		AD93EAF61DC38B5AF0138633 /* SlashCommandModels.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SlashCommandModels.swift; sourceTree = "<group>"; };
 		AE19D7C1E8E4E62F18D09B5C /* SharedInboxDrainer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SharedInboxDrainer.swift; sourceTree = "<group>"; };
@@ -1387,6 +1391,7 @@
 				40846D67A3A6607EF75F8D4A /* TransferRepositoryTests.swift */,
 				CD9BA24C2FFFD5375F7683AE /* TransferURLProtocolTests.swift */,
 				E774EC330C69C004F1E247B5 /* TurnDockTests.swift */,
+				0CB697EA9621AF99842DBDC4 /* TurnSafeTranscriptTests.swift */,
 				1C31048AA9388AAF12D96C3E /* UX1PolishTests.swift */,
 				BF23BF6299D648E0914BCBE7 /* ViewA11yTests.swift */,
 				A2F4CBCA9ADD167081BFA1AA /* VoiceConversationControllerTests.swift */,
@@ -1455,6 +1460,7 @@
 			isa = PBXGroup;
 			children = (
 				BF2DED54169133EB1CBE30D2 /* ios_fix_long_prose.json */,
+				ACCF2E02057CCACF71FC3C63 /* ios_fix_mid_turn_tail.json */,
 			);
 			path = Fixtures;
 			sourceTree = "<group>";
@@ -1813,6 +1819,7 @@
 			buildActionMask = 2147483647;
 			files = (
 				8FF2DE2A228F022AE4D1C9C0 /* ios_fix_long_prose.json in Resources */,
+				455245A6F857E57C9D20D85A /* ios_fix_mid_turn_tail.json in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -2046,6 +2053,7 @@
 				F57EDD9D0F94583EC9125989 /* TransferRepositoryTests.swift in Sources */,
 				A9E3D70713678ED33A667345 /* TransferURLProtocolTests.swift in Sources */,
 				40D91EDEDE77DCE06B0BD41C /* TurnDockTests.swift in Sources */,
+				D00114EC35EA7AD585D15155 /* TurnSafeTranscriptTests.swift in Sources */,
 				ABC7A7B8AD81C3D71C7BAE28 /* UX1PolishTests.swift in Sources */,
 				7967EF3FCFB8FF62F5A6A11C /* ViewA11yTests.swift in Sources */,
 				008861246FF59FC970E36245 /* VoiceConversationControllerTests.swift in Sources */,

@@ -7,6 +7,21 @@ struct TranscriptPageFetch: Sendable {
     let messages: [StoredMessage]
     let oldestId: Int?
     let hasMoreBefore: Bool
+    /// Absolute zero-based offset of ``messages.first`` in the gateway's active
+    /// raw-row transcript. Nil for injected/legacy fetchers that cannot report it.
+    let offset: Int?
+
+    init(
+        messages: [StoredMessage],
+        oldestId: Int?,
+        hasMoreBefore: Bool,
+        offset: Int? = nil
+    ) {
+        self.messages = messages
+        self.oldestId = oldestId
+        self.hasMoreBefore = hasMoreBefore
+        self.offset = offset
+    }
 }
 
 struct TranscriptAroundFetch: Sendable {
@@ -49,11 +64,121 @@ func fetchStockTranscriptPage(
         return TranscriptPageFetch(
             messages: messages,
             oldestId: messages.first?.wireId,
-            hasMoreBefore: pageOffset > 0 && !messages.isEmpty
+            hasMoreBefore: pageOffset > 0 && !messages.isEmpty,
+            offset: pageOffset
         )
     } catch {
         return nil
     }
+}
+
+/// A raw transcript page is renderable only when it starts at a user turn.
+/// Assistant/tool rows are stateful: `toChatMessages` needs the preceding
+/// assistant tool call to attach a tool result and the preceding user row to
+/// delimit the assistant turn.
+private func turnBoundaryIndex(in messages: [StoredMessage]) -> Int? {
+    messages.firstIndex { $0.role == ChatRole.user.rawValue }
+}
+
+/// Refresh the active raw-row count before computing a tail offset. Drawer
+/// summaries can lag a running session; using their stale count fetches a page
+/// behind the real tail and makes a terminal reconcile miss the completed turn.
+private func currentStockMessageCount(
+    rest: RestClient,
+    sessionId: String,
+    profile: String?
+) async -> Int? {
+    let encodedId = sessionId.addingPercentEncoding(
+        withAllowedCharacters: .urlPathAllowed
+    ) ?? sessionId
+    var path = "/api/sessions/\(encodedId)"
+    if let profile, !profile.isEmpty {
+        var components = URLComponents()
+        components.queryItems = [URLQueryItem(name: "profile", value: profile)]
+        path += "?" + (components.percentEncodedQuery ?? "")
+            .replacingOccurrences(of: "+", with: "%2B")
+    }
+    guard let data = try? await rest.get(path: path),
+          let root = try? rest.decodeJSONValue(
+              from: data, context: "stockSessionDetail"
+          ) else {
+        return nil
+    }
+    return root["message_count"]?.intValue
+}
+
+/// Expand a requested stock page backward until its first raw row is a user
+/// turn boundary. Both the gateway request and the combined client window stay
+/// bounded at 500 rows, so lazy loading never degrades into a full-history read.
+func fetchTurnSafeStockTranscriptPage(
+    rest: RestClient,
+    sessionId: String,
+    profile: String?,
+    limit: Int,
+    offset: Int,
+    maximumRows: Int = 500
+) async -> TranscriptPageFetch? {
+    let boundedLimit = max(1, min(limit, maximumRows))
+    var startOffset = max(0, offset)
+    guard let firstPage = await fetchStockTranscriptPage(
+        rest: rest,
+        sessionId: sessionId,
+        profile: profile,
+        limit: boundedLimit,
+        offset: startOffset
+    ) else {
+        return nil
+    }
+    var messages = firstPage.messages
+
+    while startOffset > 0,
+          turnBoundaryIndex(in: messages) == nil,
+          messages.count < maximumRows {
+        let precedingLimit = min(
+            boundedLimit,
+            min(startOffset, maximumRows - messages.count)
+        )
+        guard precedingLimit > 0 else { break }
+        let precedingOffset = startOffset - precedingLimit
+        guard let preceding = await fetchStockTranscriptPage(
+            rest: rest,
+            sessionId: sessionId,
+            profile: profile,
+            limit: precedingLimit,
+            offset: precedingOffset
+        ), !preceding.messages.isEmpty else {
+            break
+        }
+
+        let existingWireIds = Set(messages.compactMap(\.wireId))
+        let uniquePreceding = preceding.messages.filter { message in
+            guard let wireId = message.wireId else { return true }
+            return !existingWireIds.contains(wireId)
+        }
+        messages.insert(contentsOf: uniquePreceding, at: 0)
+        startOffset = precedingOffset
+    }
+
+    if let boundary = turnBoundaryIndex(in: messages), boundary > 0 {
+        messages.removeFirst(boundary)
+        startOffset += boundary
+    } else if turnBoundaryIndex(in: messages) == nil,
+              let assistant = messages.firstIndex(where: {
+                  $0.role == ChatRole.assistant.rawValue
+              }), assistant > 0 {
+        // A single agentic turn can exceed the 500-row safety bound. In that
+        // case discard leading orphan tool results and start at the first
+        // assistant row available instead of synthesizing detached tool cards.
+        messages.removeFirst(assistant)
+        startOffset += assistant
+    }
+
+    return TranscriptPageFetch(
+        messages: messages,
+        oldestId: messages.first?.wireId,
+        hasMoreBefore: startOffset > 0 && !messages.isEmpty,
+        offset: startOffset
+    )
 }
 
 /// Read only the recent stock-gateway transcript window needed to paint a chat.
@@ -66,9 +191,14 @@ func fetchBoundedStockTranscript(
     limit: Int
 ) async throws -> [StoredMessage] {
     let boundedLimit = max(1, limit)
-    if messageCount > 0 {
-        let offset = max(0, messageCount - boundedLimit)
-        if let page = await fetchStockTranscriptPage(
+    let currentCount = await currentStockMessageCount(
+        rest: rest,
+        sessionId: sessionId,
+        profile: profile
+    ) ?? messageCount
+    if currentCount > 0 {
+        let offset = max(0, currentCount - boundedLimit)
+        if let page = await fetchTurnSafeStockTranscriptPage(
             rest: rest,
             sessionId: sessionId,
             profile: profile,
@@ -78,10 +208,20 @@ func fetchBoundedStockTranscript(
             return page.messages
         }
     }
-    return Array(
-        try await rest.messages(sessionId: sessionId, profile: profile)
-            .suffix(boundedLimit)
-    )
+    let all = try await rest.messages(sessionId: sessionId, profile: profile)
+    guard all.count > boundedLimit else { return all }
+    var start = all.count - boundedLimit
+    let lowerBound = max(0, all.count - 500)
+    while start > lowerBound, all[start].role != ChatRole.user.rawValue {
+        start -= 1
+    }
+    if all[start].role != ChatRole.user.rawValue,
+       let assistant = all[start...].firstIndex(where: {
+           $0.role == ChatRole.assistant.rawValue
+       }) {
+        start = assistant
+    }
+    return Array(all[start...])
 }
 
 /// Plugin-only target-centered transcript fetch for jump/search/artifact opens.
@@ -955,6 +1095,10 @@ final class ChatStore {
         // should not auto-drain into a session that just errored.
         onTurnDiscarded?()
         lastError = message
+        Task { [weak self] in
+            guard let self, !self.isStreaming else { return }
+            await self.reconcileAuthoritativeTranscript(surfaceFailure: false)
+        }
     }
 
     /// Handle a frame classified as FOREIGN by ``ownership(of:)`` — another client
@@ -1362,7 +1506,19 @@ final class ChatStore {
         expireTurnScopedPrompts(includeSecure: false)
 
         // The turn finished — let the queue drain its next item (if any).
+        // Arm the existing local-assistant adoption slot before the terminal
+        // REST reconcile. The authoritative row has a gateway-derived UUID,
+        // while the live bubble has a runtime UUID; without this marker a UNION
+        // would append a second assistant bubble for the same completed turn.
+        pendingReconnectReconcileID = id
         onTurnComplete?()
+        // The live stream is only an immediate projection. Re-read the bounded
+        // authoritative transcript once at the terminal boundary so dropped
+        // tool/delta frames are repaired and the settled turn reaches GRDB.
+        Task { [weak self] in
+            guard let self, !self.isStreaming else { return }
+            await self.reconcileAuthoritativeTranscript(surfaceFailure: false)
+        }
     }
 
     /// Expire the turn-scoped prompt cards: a pending approval/clarification
@@ -3570,7 +3726,7 @@ final class ChatStore {
         noteTranscriptPaging(
             oldestId: page.oldestId,
             hasMoreBefore: page.hasMoreBefore,
-            oldestOffset: usesStockPaging ? pageCursor : nil
+            oldestOffset: usesStockPaging ? (page.offset ?? pageCursor) : nil
         )
     }
 
@@ -3624,8 +3780,8 @@ final class ChatStore {
     /// row count are preserved (no blink, no restack). Cleared once consumed.
     private var pendingForeignReconcileID: UUID?
 
-    /// The id of a genuinely-local assistant row that was cut off by a transport
-    /// drop and left visible with a "Connection lost" warning (ABH-276/278).
+    /// The id of a genuinely-local assistant row awaiting an authoritative REST
+    /// reconcile, either after a transport drop or a normal terminal frame.
     ///
     /// During reconnect, REST backfill and resumed WS frames race each other:
     ///  - if REST returns first, the server may not have persisted the resumed
@@ -4422,7 +4578,18 @@ final class ChatStore {
     /// `isStreaming` reflects only a local turn.
     func backfill() async {
         guard !isStreaming else { return }
+        await reconcileAuthoritativeTranscript()
+    }
+
+    /// Fetch and persist the authoritative bounded transcript even while a live
+    /// turn is streaming. A live projection is never replaced mid-turn; once
+    /// settled, the same snapshot is unioned into the existing rows in place.
+    /// This is used by broadcast-gap and terminal checkpoints so a missed live
+    /// frame cannot also leave the durable cache stale.
+    func reconcileAuthoritativeTranscript(surfaceFailure: Bool = true) async {
         guard let storedId = sessions?.activeStoredId else { return }
+        let turnTokenAtStart = localTurnToken
+        let mirroredRuntimeAtStart = mirroringRuntimeId
         let fetch = resolvedBackfillFetch
         guard let fetch else { return }
         #if DEBUG
@@ -4430,29 +4597,36 @@ final class ChatStore {
         #endif
         do {
             let stored = try await fetch(storedId)
-            // The world may have moved while the REST fetch was in flight
-            // (R1 #12/#21): a local turn the user just started must not be
-            // wiped by `seed()`'s unconditional `cancelStreaming()`, and a
-            // session switched away from must not have the OLD session's
-            // history seeded over it (the stale fetch result is simply
-            // dropped — the new session runs its own seed). Mirrors the
-            // post-await guard in `seedContextUsageFromStatus`.
-            guard !isStreaming, storedId == sessions?.activeStoredId else { return }
-            // QA-2 R15: a recovery reseed is a KNOWN-PARTIAL snapshot — union it onto the
-            // merged timeline so settled history the snapshot does not cover
-            // survives (the stuck-episode segment drop). Same-session guard
-            // above keeps the union from ever bleeding across sessions.
-            seed(from: stored, policy: .union)
-            noteTranscriptSeedWindow(stored)
-            // P3 write-through: the foreground/reconnect reconcile re-fetched the
-            // authoritative transcript — persist it so the next open paints from
-            // disk. Fire-and-forget, OFF the UI path; CacheStore no-ops for cron
-            // sessions (never transcript-cached, per the decided scope).
-            if let cacheStore {
-                if let identity = sessions?.cacheIdentity(storedId) {
-                    Task { try? await cacheStore.saveTranscript(identity: identity, messages: stored) }
+            guard storedId == sessions?.activeStoredId,
+                  turnTokenAtStart == localTurnToken,
+                  mirroredRuntimeAtStart == mirroringRuntimeId else { return }
+
+            if let cacheStore,
+               let identity = sessions?.cacheIdentity(storedId) {
+                do {
+                    try await cacheStore.saveTranscript(
+                        identity: identity, messages: stored
+                    )
+                } catch {
+                    // Cache remains a non-fatal projection; the live transcript
+                    // and gateway authority continue even when disk is unavailable.
+                    chatLog.error("authoritative transcript cache write failed for session \(storedId, privacy: .public): \(error.localizedDescription, privacy: .public)")
                 }
             }
+
+            // A new/local live turn may have started while the REST request was
+            // in flight. Its UI remains untouched; the completed snapshot above
+            // is still safely persisted for restart recovery.
+            guard !isStreaming, storedId == sessions?.activeStoredId else {
+                lastBackfillError = nil
+                return
+            }
+
+            let normalized = Self.toChatMessages(stored)
+            reconcileMessages(with: normalized, policy: .union)
+            rebuildUserOrdinals()
+            transcriptGeneration += 1
+            noteTranscriptSeedWindow(stored)
             lastBackfillError = nil
         } catch {
             // Backfill is best-effort for the transcript (we keep what we have),
@@ -4465,7 +4639,8 @@ final class ChatStore {
             // A failure from a superseded fetch (the session switched while it
             // was in flight) belongs to a session that is no longer on screen —
             // never surface it on the NEW session (R1 #21's catch-side twin).
-            guard storedId == sessions?.activeStoredId else { return }
+            guard surfaceFailure,
+                  storedId == sessions?.activeStoredId else { return }
             let description = (error as? LocalizedError)?.errorDescription
                 ?? error.localizedDescription
             lastBackfillError = description
@@ -4497,7 +4672,7 @@ final class ChatStore {
         guard let rest = connection?.rest else { return nil }
         let profile = sessions?.activeSummary?.profile
         return { sessionId, limit, offset in
-            await fetchStockTranscriptPage(
+            await fetchTurnSafeStockTranscriptPage(
                 rest: rest,
                 sessionId: sessionId,
                 profile: profile,
@@ -4963,6 +5138,12 @@ final class ChatStore {
         activeToolCallId = nil
         streamingIsForeign = false
         setStreaming(false, reason: "teardownForeignStream")
+        if preservePlaceholderForReconcile {
+            // The adopted live projection ended before the authoritative row
+            // replaces it. Preserve the existing Live Activity discard seam;
+            // the completion callback fires after the reconcile.
+            onTurnDiscarded?()
+        }
     }
 
     /// Tear down whatever stream the just-dropped transport was feeding. A dead

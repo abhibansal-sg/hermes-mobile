@@ -39,11 +39,15 @@ final class ChatStoreReconnectReconcileTests: XCTestCase {
         ]))!
     }
 
-    private func storedMessage(role: String, text: String) -> StoredMessage {
-        StoredMessage(json: .object([
+    private func storedMessage(
+        role: String, text: String, wireId: Int? = nil
+    ) -> StoredMessage {
+        var json: [String: JSONValue] = [
             "role": .string(role),
             "content": .string(text),
-        ]))!
+        ]
+        if let wireId { json["id"] = .number(Double(wireId)) }
+        return StoredMessage(json: .object(json))!
     }
 
     private func beginLocalPartialTurn(_ chat: ChatStore) -> ChatMessage {
@@ -186,5 +190,64 @@ final class ChatStoreReconnectReconcileTests: XCTestCase {
         XCTAssertFalse(assistantRows.first?.isStreaming ?? true)
         XCTAssertEqual(warningTexts(in: assistantRows.first), ["Agent failed after reconnect"],
                        "a failed/warning-bearing resumed completion must keep its warning part instead of clearing it as stale")
+    }
+
+    func testAuthoritativeReconcilePersistsGapSnapshotWithoutReplacingLiveProjection() async {
+        var fetches = 0
+        let (chat, _) = makeStore { _ in
+            fetches += 1
+            return [
+                self.storedMessage(
+                    role: "user", text: "prompt before drop", wireId: 1
+                ),
+                self.storedMessage(
+                    role: "assistant", text: "persisted partial", wireId: 2
+                ),
+            ]
+        }
+        _ = beginLocalPartialTurn(chat)
+
+        await chat.reconcileAuthoritativeTranscript()
+
+        XCTAssertEqual(fetches, 1, "a broadcast-gap checkpoint must not no-op while streaming")
+        XCTAssertTrue(chat.isStreaming)
+        XCTAssertEqual(
+            chat.messages.filter { $0.role == .assistant }.count,
+            1,
+            "the live projection stays in place while the authoritative snapshot is fetched"
+        )
+        XCTAssertTrue(
+            chat.messages.last?.text.contains("partial reply") == true,
+            "a gap reconcile must not replace a newer live bubble mid-turn"
+        )
+    }
+
+    func testLocalCompletionReconcilesOntoExistingBubbleWithoutDuplicate() async {
+        let fetched = expectation(description: "terminal authoritative transcript fetched")
+        let (chat, _) = makeStore { _ in
+            fetched.fulfill()
+            return [
+                self.storedMessage(
+                    role: "user", text: "prompt before drop", wireId: 1
+                ),
+                self.storedMessage(
+                    role: "assistant", text: "authoritative final", wireId: 2
+                ),
+            ]
+        }
+        let live = beginLocalPartialTurn(chat)
+
+        chat.handle(event: localFrame(
+            type: "message.complete",
+            payload: ["text": "frame final", "status": "complete"]
+        ))
+        await fulfillment(of: [fetched], timeout: 1)
+        for _ in 0..<5 { await Task.yield() }
+
+        let assistants = chat.messages.filter { $0.role == .assistant }
+        XCTAssertEqual(assistants.count, 1)
+        XCTAssertEqual(assistants.first?.id, live.id)
+        XCTAssertEqual(assistants.first?.text, "authoritative final")
+        XCTAssertFalse(chat.isStreaming)
     }
 }
