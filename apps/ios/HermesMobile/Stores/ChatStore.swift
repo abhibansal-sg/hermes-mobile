@@ -16,47 +16,7 @@ struct TranscriptAroundFetch: Sendable {
     let containsTarget: Bool
 }
 
-/// Plugin-only backward-paged transcript fetch. Kept outside RestClient.swift for
-/// ABH-400's narrow scope fence; it reuses RestClient's internal request/JSON
-/// helpers without changing the existing no-param delta handshake method.
-func fetchTranscriptPage(
-    rest: RestClient,
-    sessionId: String,
-    limit: Int,
-    before: Int? = nil,
-    shape: String? = nil
-) async -> TranscriptPageFetch? {
-    guard rest.pathStyle == .plugin else { return nil }
-    let encodedId = sessionId.addingPercentEncoding(
-        withAllowedCharacters: .urlPathAllowed
-    ) ?? sessionId
-    // WS-5.1: `shape` is a PARAMETER now (was hardcoded `skeleton`, which stranded
-    // reopened chats on text-only rows with no hydrate). Default `nil` ⇒ FULL; the
-    // cold-open seed passes `skeleton` and pairs it with a background hydrate.
-    var path = "\(rest.pathStyle.mobileAPIPrefix)/sessions/\(encodedId)/messages"
-        + "?limit=\(max(1, limit))"
-    if let before, before > 0 {
-        path += "&before=\(before)"
-    }
-    if let shape, !shape.isEmpty {
-        path += "&shape=\(shape)"
-    }
-    do {
-        let data = try await rest.get(path: path)
-        let root = try rest.decodeJSONValue(from: data, context: "messagesPage")
-        guard let array = root["messages"]?.arrayValue else { return nil }
-        let page = root["page"]
-        return TranscriptPageFetch(
-            messages: array.compactMap(StoredMessage.init(json:)),
-            oldestId: page?["oldest_id"]?.intValue,
-            hasMoreBefore: page?["has_more_before"]?.boolValue ?? false
-        )
-    } catch {
-        return nil
-    }
-}
-
-/// Stock gateway transcript page used by the transparent relay path.
+/// Stock gateway transcript page shared by open, backfill, and load-earlier.
 func fetchStockTranscriptPage(
     rest: RestClient,
     sessionId: String,
@@ -94,6 +54,34 @@ func fetchStockTranscriptPage(
     } catch {
         return nil
     }
+}
+
+/// Read only the recent stock-gateway transcript window needed to paint a chat.
+/// Notification plugin availability never changes this route.
+func fetchBoundedStockTranscript(
+    rest: RestClient,
+    sessionId: String,
+    profile: String?,
+    messageCount: Int,
+    limit: Int
+) async throws -> [StoredMessage] {
+    let boundedLimit = max(1, limit)
+    if messageCount > 0 {
+        let offset = max(0, messageCount - boundedLimit)
+        if let page = await fetchStockTranscriptPage(
+            rest: rest,
+            sessionId: sessionId,
+            profile: profile,
+            limit: boundedLimit,
+            offset: offset
+        ) {
+            return page.messages
+        }
+    }
+    return Array(
+        try await rest.messages(sessionId: sessionId, profile: profile)
+            .suffix(boundedLimit)
+    )
 }
 
 /// Plugin-only target-centered transcript fetch for jump/search/artifact opens.
@@ -700,8 +688,8 @@ final class ChatStore {
     var transcriptAroundFetch: ((String, Int, Int) async -> TranscriptAroundFetch?)?
 
     /// Test seam for the backward-page (``loadEarlierTranscript``) fetch. The
-    /// live app resolves the module-level ``fetchTranscriptPage`` against
-    /// `connection?.rest` directly; tests that need to control the timing of
+    /// live app resolves the stock offset-paged fetch against `connection?.rest`;
+    /// tests that need to control the timing of
     /// this specific fetch (e.g. proving the ABH-401 conflict guard against
     /// ``loadTranscriptAround``) inject an override here instead.
     var transcriptPageFetch: ((String, Int, Int?) async -> TranscriptPageFetch?)?
@@ -4525,17 +4513,15 @@ final class ChatStore {
     private var resolvedBackfillFetch: ((String) async throws -> [StoredMessage])? {
         if let backfillFetch { return backfillFetch }
         guard let rest = connection?.rest else { return nil }
-        // ABH-400: plugin gateways serve only the recent tail window on
-        // foreground/reconnect; legacy gateways keep the existing full/delta path.
-        return { [cacheStore] sessionId in
-            if let page = await fetchTranscriptPage(
+        return { [weak self] sessionId in
+            let summary = self?.sessions?.sessions.first { $0.id == sessionId }
+            return try await fetchBoundedStockTranscript(
                 rest: rest,
                 sessionId: sessionId,
+                profile: summary?.profile,
+                messageCount: summary?.messageCount ?? 0,
                 limit: ChatStore.transcriptOpenWindowLimit
-            ) {
-                return page.messages
-            }
-            return try await fetchTranscriptDeltaAware(rest: rest, cacheStore: cacheStore, sessionId: sessionId, identity: self.sessions?.cacheIdentity(sessionId))
+            )
         }
     }
 

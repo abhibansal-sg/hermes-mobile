@@ -75,7 +75,7 @@ final class ChatStoreOrdinalWindowingTests: XCTestCase {
                         + "must equal the gateway's absolute user_indices[35]")
 
         // Phase 2: ABH-400 cold-open windowing — only the newest 20 rows seed
-        // (mirrors `fetchTranscriptPage(limit: transcriptOpenWindowLimit)` +
+        // (mirrors `fetchBoundedStockTranscript(limit: transcriptOpenWindowLimit)` +
         // `seed(normalized: cached.suffix(50))` at a smaller scale for a fast test).
         let windowed = Array(all.suffix(20))
         chat.seed(from: windowed)

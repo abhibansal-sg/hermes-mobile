@@ -13,34 +13,6 @@ import XCTest
 /// `HermesMobileUITests/ChatFlowUITests.swift`.
 final class RestClientLiveTests: XCTestCase {
 
-    func testTranscriptPageFetchUsesPluginLimitAndBeforeCursor() async {
-        TranscriptPageStubProtocol.nextResponse = (
-            #"{"messages":[{"id":41,"role":"user","content":"older"}],"page":{"oldest_id":41,"has_more_before":true}}"#.data(using: .utf8)!,
-            200
-        )
-        TranscriptPageStubProtocol.requestedPath = nil
-        TranscriptPageStubProtocol.requestedQuery = nil
-        let rest = transcriptPageStubClient(pathStyle: .plugin)
-
-        let page = await fetchTranscriptPage(rest: rest, sessionId: "s 1", limit: 50, before: 42)
-
-        XCTAssertEqual(TranscriptPageStubProtocol.requestedPath, "/api/plugins/hermes-mobile/sessions/s%201/messages")
-        XCTAssertEqual(TranscriptPageStubProtocol.requestedQuery, "limit=50&before=42")
-        XCTAssertEqual(page?.messages.map(\.wireId), [41])
-        XCTAssertEqual(page?.oldestId, 41)
-        XCTAssertEqual(page?.hasMoreBefore, true)
-    }
-
-    func testTranscriptPageFetchIsPluginOnly() async {
-        TranscriptPageStubProtocol.requestedPath = nil
-        let rest = transcriptPageStubClient(pathStyle: .legacy)
-
-        let page = await fetchTranscriptPage(rest: rest, sessionId: "s1", limit: 50)
-
-        XCTAssertNil(page)
-        XCTAssertNil(TranscriptPageStubProtocol.requestedPath)
-    }
-
     func testStockTranscriptPageUsesOffsetAndProfile() async {
         TranscriptPageStubProtocol.nextResponse = (
             #"{"session_id":"s 1","messages":[{"id":11,"role":"user","content":"older"}],"pagination":{"limit":10,"offset":10,"returned":1}}"#.data(using: .utf8)!,
@@ -68,6 +40,35 @@ final class RestClientLiveTests: XCTestCase {
         )
         XCTAssertEqual(page?.messages.map(\.wireId), [11])
         XCTAssertEqual(page?.hasMoreBefore, true)
+    }
+
+    func testBoundedTranscriptTailIgnoresPluginPathStyle() async throws {
+        TranscriptPageStubProtocol.nextResponse = (
+            #"{"session_id":"s 1","messages":[{"id":51,"role":"assistant","content":"tail"}],"pagination":{"limit":50,"offset":10,"returned":1}}"#.data(using: .utf8)!,
+            200
+        )
+        TranscriptPageStubProtocol.requestedPath = nil
+        TranscriptPageStubProtocol.requestedQuery = nil
+        let rest = transcriptPageStubClient(pathStyle: .plugin)
+
+        let messages = try await fetchBoundedStockTranscript(
+            rest: rest,
+            sessionId: "s 1",
+            profile: "work profile",
+            messageCount: 60,
+            limit: 50
+        )
+
+        XCTAssertEqual(
+            TranscriptPageStubProtocol.requestedPath,
+            "/api/sessions/s%201/messages",
+            "Chat hydration must use the stock gateway even when notification plugin routes exist"
+        )
+        XCTAssertEqual(
+            TranscriptPageStubProtocol.requestedQuery,
+            "limit=50&offset=10&profile=work%20profile"
+        )
+        XCTAssertEqual(messages.map(\.wireId), [51])
     }
 
     /// `GET /api/sessions?order=recent` must round-trip with its query string

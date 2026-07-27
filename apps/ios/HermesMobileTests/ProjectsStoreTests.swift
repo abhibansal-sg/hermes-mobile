@@ -222,4 +222,150 @@ final class ProjectsStoreTests: XCTestCase {
         let cached = try await waitForProjectSessions(in: cache, id: target.id)
         XCTAssertEqual(cached?.map(\.id), ["fresh"])
     }
+
+    func testOfflineDetailAcceptsCachedEmptyAsLoadedState() async throws {
+        let cache = try makeCache()
+        let target = project("empty", count: 0)
+        try await cache.saveProjectSessions([], scope: scope, projectId: target.id)
+        let store = ProjectsStore()
+        store.attachCache(cache, scope: { [scope] in scope })
+
+        await store.refreshSessions(for: target)
+
+        XCTAssertEqual(store.sessions(for: target), [])
+        XCTAssertNil(
+            store.sessionsError(for: target),
+            "A persisted empty list is a valid loaded snapshot, not an offline cache miss"
+        )
+    }
+
+    func testDetailResponseCannotCrossCacheScope() async throws {
+        let cache = try makeCache()
+        let target = project("p1")
+        let otherScope = CacheScope(serverId: "https://other.example", profileId: "all")
+        var activeScope = scope
+        let gate = ProjectResponseGate()
+        let store = ProjectsStore()
+        store.attachCache(cache, scope: { activeScope })
+        store.gatewayRequest = { _, _ in
+            await gate.waitForRelease()
+        }
+
+        let request = Task { await store.refreshSessions(for: target) }
+        await gate.waitUntilStarted()
+        activeScope = otherScope
+        await gate.release(
+            try json(
+                #"{"project":{"id":"p1","label":"One","path":"/one","session_count":1,"repos":[{"groups":[{"sessions":[{"id":"stale","title":"Stale","message_count":2,"cwd":"/one"}]}]}]}}"#
+            )
+        )
+        await request.value
+
+        XCTAssertTrue(store.sessions(for: target).isEmpty)
+        let leaked = try await cache.loadProjectSessions(scope: otherScope, projectId: target.id)
+        XCTAssertNil(leaked)
+    }
+
+    func testNewestDetailRequestWinsWhenResponsesArriveOutOfOrder() async throws {
+        let target = project("p1")
+        let gate = OrderedProjectResponses(
+            first: try json(
+                #"{"project":{"id":"p1","label":"One","path":"/one","session_count":1,"repos":[{"groups":[{"sessions":[{"id":"old","title":"Old","message_count":2,"cwd":"/one"}]}]}]}}"#
+            ),
+            second: try json(
+                #"{"project":{"id":"p1","label":"One","path":"/one","session_count":1,"repos":[{"groups":[{"sessions":[{"id":"new","title":"New","message_count":2,"cwd":"/one"}]}]}]}}"#
+            )
+        )
+        let store = ProjectsStore()
+        store.gatewayRequest = { _, _ in await gate.next() }
+
+        let first = Task { await store.refreshSessions(for: target) }
+        await gate.waitUntilFirstStarted()
+        await store.refreshSessions(for: target)
+        await gate.releaseFirst()
+        await first.value
+
+        XCTAssertEqual(store.sessions(for: target).map(\.id), ["new"])
+        XCTAssertFalse(store.isLoadingSessions(for: target))
+    }
+
+    func testDetailResponseCannotCrossTransportGeneration() async throws {
+        let target = project("p1")
+        let gate = ProjectResponseGate()
+        var generation: UInt64 = 1
+        let store = ProjectsStore()
+        store.transportGenerationForTesting = { generation }
+        store.gatewayRequest = { _, _ in await gate.waitForRelease() }
+
+        let request = Task { await store.refreshSessions(for: target) }
+        await gate.waitUntilStarted()
+        generation = 2
+        await gate.release(
+            try json(
+                #"{"project":{"id":"p1","label":"One","path":"/one","session_count":1,"repos":[{"groups":[{"sessions":[{"id":"stale","title":"Stale","message_count":2,"cwd":"/one"}]}]}]}}"#
+            )
+        )
+        await request.value
+
+        XCTAssertTrue(store.sessions(for: target).isEmpty)
+        XCTAssertFalse(store.isLoadingSessions(for: target))
+    }
+}
+
+private actor ProjectResponseGate {
+    private var started = false
+    private var startedWaiters: [CheckedContinuation<Void, Never>] = []
+    private var response: CheckedContinuation<JSONValue, Never>?
+
+    func waitForRelease() async -> JSONValue {
+        started = true
+        startedWaiters.forEach { $0.resume() }
+        startedWaiters.removeAll()
+        return await withCheckedContinuation { response = $0 }
+    }
+
+    func waitUntilStarted() async {
+        if started { return }
+        await withCheckedContinuation { startedWaiters.append($0) }
+    }
+
+    func release(_ value: JSONValue) {
+        response?.resume(returning: value)
+        response = nil
+    }
+}
+
+private actor OrderedProjectResponses {
+    private let first: JSONValue
+    private let second: JSONValue
+    private var callCount = 0
+    private var firstStarted = false
+    private var firstStartedWaiters: [CheckedContinuation<Void, Never>] = []
+    private var firstResponse: CheckedContinuation<JSONValue, Never>?
+
+    init(first: JSONValue, second: JSONValue) {
+        self.first = first
+        self.second = second
+    }
+
+    func next() async -> JSONValue {
+        callCount += 1
+        if callCount == 1 {
+            firstStarted = true
+            firstStartedWaiters.forEach { $0.resume() }
+            firstStartedWaiters.removeAll()
+            return await withCheckedContinuation { firstResponse = $0 }
+        }
+        return second
+    }
+
+    func waitUntilFirstStarted() async {
+        if firstStarted { return }
+        await withCheckedContinuation { firstStartedWaiters.append($0) }
+    }
+
+    func releaseFirst() {
+        firstResponse?.resume(returning: first)
+        firstResponse = nil
+    }
 }

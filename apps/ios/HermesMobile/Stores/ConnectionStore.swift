@@ -1730,14 +1730,11 @@ final class ConnectionStore {
             }
         }
         // The initial slice is deliberately provisional. Reconcile the normal
-        // compression-aware recent snapshot off the reveal path, then warm its
-        // transcripts. The same task also recovers when the 8s fallback cancelled
-        // the first-paint request.
+        // compression-aware recent snapshot off the reveal path. The same task
+        // also recovers when the 8s fallback cancelled the first-paint request.
         Task { [weak self] in
             guard let self, self.isActiveGeneration(generation) else { return }
             await self.sessionStore.refresh()
-            guard self.isActiveGeneration(generation) else { return }
-            self.sessionStore.prefetchRecentTranscripts()
         }
         // Hygiene (WhatsApp bar): run the daily-throttled eviction sweep so the
         // cache never grows unbounded. Self-throttled to once/24h in CacheStore.
@@ -1841,9 +1838,6 @@ final class ConnectionStore {
         activeModelName = nil
         // Clear the per-session hot-swap state so the next session starts clean.
         clearSessionState()
-        // CACHE-FIRST coverage (WhatsApp bar): stop any paced background prefetch
-        // so it never outlives the connection it ran under.
-        sessionStore.cancelPrefetch()
         // Finalize any in-flight stream explicitly and SYNCHRONOUSLY (R1
         // #9/#42), before the teardown await opens a suspension window. The
         // live state observer will also see the `.closed` transition below and
@@ -3060,9 +3054,6 @@ final class ConnectionStore {
         }
         await sessionStore.refresh()
         guard isActiveGeneration(generation) else { return false }
-        // CACHE-FIRST coverage (WhatsApp bar): re-warm the recent transcripts now
-        // the list is current again — covers sessions that moved while offline.
-        sessionStore.prefetchRecentTranscripts()
         return true
     }
 
@@ -3075,13 +3066,10 @@ final class ConnectionStore {
     /// IMMEDIATE reconnect attempt — the client must not sit in a multi-second
     /// backoff window while the user is staring at the screen. Then always
     /// backfill the transcript over REST to re-sync with other clients.
-    /// `.background`/`.inactive`: cancel the paced transcript prefetch (WhatsApp
-    /// bar) so it doesn't run against a socket iOS is about to kill; otherwise a
-    /// no-op — the socket may be killed and we recover on the next foreground.
+    /// `.background`/`.inactive`: record that the phone left the foreground; the
+    /// socket may be killed and we recover on the next foreground.
     func handleScenePhase(_ scenePhase: ScenePhase) {
         guard scenePhase == .active else {
-            // Leaving the foreground: stop any in-flight prefetch sweep.
-            sessionStore.cancelPrefetch()
             updatePhoneForeground(nil)
             return
         }

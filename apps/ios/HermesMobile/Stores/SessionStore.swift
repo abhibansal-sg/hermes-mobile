@@ -183,7 +183,6 @@ final class SessionStore {
     /// the long-lived store graph and reappearing during an immediate re-pair.
     func removeForgottenGatewayState() {
         invalidateConnectionWork()
-        cancelPrefetch()
         searchTask?.cancel()
         searchTask = nil
         searchLoadMoreTask?.cancel()
@@ -1323,11 +1322,6 @@ final class SessionStore {
     var searchFetch: ((String, Int) async throws -> ([SessionSearchResult], Bool))?
     #endif
 
-    /// In-flight transcript prefetch sweep (WhatsApp bar — coverage). Cancelled on
-    /// disconnect/background so a paced background fetch never outlives the
-    /// connection it was started under. At most one sweep runs at a time.
-    private var prefetchTask: Task<Void, Never>?
-
     init(defaults: UserDefaults = .standard) {
         if let stored = defaults.array(forKey: DefaultsKeys.pinnedSessions) as? [String] {
             pinnedIds = Set(stored)
@@ -2065,177 +2059,9 @@ final class SessionStore {
         }
     }
 
-    // MARK: - Transcript prefetch (WhatsApp bar — coverage)
-
-    /// How many most-recent human Recents sessions the post-hydration sweep warms.
-    private static let prefetchSessionCount = 30
-    /// Concurrency ceiling for the prefetch sweep — gentle pacing so it never
-    /// contends with a live turn or the user's own open. 3 in flight at a time.
-    private static let prefetchConcurrency = 3
-
-    /// Background-prefetch transcripts for the top ~30 most-recent human Recents
-    /// sessions so nearly every drawer tap is a DISK hit (cache-first open paints
-    /// instantly). Called after connect + hydration settles and after a reconnect.
-    ///
-    /// Discipline (per the WhatsApp-bar spec):
-    ///   - skips sessions already cached FRESH for their current `lastActive`
-    ///     (`CacheStore.transcriptIsFresh`), so a warm cache costs zero network;
-    ///   - skips cron sessions (never transcript-cached) and the actively-open one
-    ///     (its own open path owns the fetch);
-    ///   - paces at `prefetchConcurrency` (3) in flight, LOW priority;
-    ///   - cancels on disconnect/background via ``cancelPrefetch()``;
-    ///   - writes through the existing `saveTranscript` (cron-guarded in CacheStore).
-    ///
-    /// A no-op when there is no cache or no REST client (tests/previews/offline) —
-    /// purely additive coverage, never a correctness dependency. At most one sweep
-    /// runs at a time; a new call supersedes any in-flight sweep.
-    func prefetchRecentTranscripts() {
-        guard let cacheStore, let fetch = resolvedPrefetchFetch else { return }
-
-        // Snapshot the prefetch targets on the main actor (newest-first human
-        // Recents, excluding the open session). `visibleSessions` already applies
-        // source/count filters and sorts by recency, so it is the right source. Map to a Sendable tuple so
-        // the detached sweep captures plain values, not SessionSummary state.
-        let openId = activeStoredId
-        guard let cacheScope = currentCacheScope else { return }
-        let targets: [(identity: CacheIdentity, lastActive: Double?)] = visibleSessions
-            .filter { $0.id != openId }
-            .prefix(Self.prefetchSessionCount)
-            .map {
-                let profile = $0.profile ?? (cacheScope.profileId == CacheScope.allProfilesKey ? "default" : cacheScope.profileId)
-                return (CacheIdentity(serverId: cacheScope.serverId, profileId: profile, sessionId: $0.id), $0.lastActive)
-            }
-        guard !targets.isEmpty else { return }
-
-        let concurrency = Self.prefetchConcurrency
-        prefetchTask?.cancel()
-        // The sweep captures only Sendable values: the `@Sendable` fetch closure,
-        // the `CacheStore` actor, and the (id, lastActive) tuples. No MainActor
-        // store state crosses the boundary, so it is Swift-6 strict-concurrency
-        // clean without hopping back per session.
-        prefetchTask = Task(priority: .utility) {
-            await withTaskGroup(of: Void.self) { group in
-                var inFlight = 0
-                for target in targets {
-                    if Task.isCancelled { break }
-                    // Skip a session whose disk copy is already current.
-                    if (try? await cacheStore.transcriptIsFresh(
-                        target.identity, lastActive: target.lastActive)) == true {
-                        continue
-                    }
-                    if inFlight >= concurrency {
-                        await group.next()
-                        inFlight -= 1
-                    }
-                    let identity = target.identity
-                    let sessionId = identity.sessionId
-                    group.addTask(priority: .utility) {
-                        if Task.isCancelled { return }
-                        guard let stored = try? await fetch(identity) else { return }
-                        if Task.isCancelled { return }
-                        try? await cacheStore.saveTranscript(
-                            identity: identity, messages: stored)
-                    }
-                    inFlight += 1
-                }
-                await group.waitForAll()
-            }
-        }
-    }
-
-    /// Injectable `@Sendable` transcript fetch for the prefetch sweep (tests stage
-    /// a recorder without a live gateway). Distinct from ``transcriptFetch`` (the
-    /// open-path seam, MainActor-bound and non-Sendable) because the prefetch runs
-    /// in a detached task group where every captured value must be Sendable. `nil`
-    /// (default) resolves the live REST client below.
-    var prefetchFetch: (@Sendable (String) async throws -> [StoredMessage])?
-
-    /// Profile-aware variant of the prefetch seam. The legacy one-argument
-    /// seam remains for existing tests, while production and new coverage carry
-    /// the exact profile from the cached row all the way to the REST request.
-    var prefetchFetchWithProfile: (@Sendable (String, String) async throws -> [StoredMessage])?
-
     /// Serializes persisted drawer selection. A newer selection waits for any
     /// already-started write, then re-checks its token before committing.
     private var lastOpenPersistenceTask: Task<Void, Never>?
-
-    #if DEBUG
-    /// DEBUG-only RestClient seam for exercising the live prefetch fetch resolver
-    /// with a stubbed URLSession. The production path still resolves through the
-    /// live ``ConnectionStore/rest`` client; tests use this only when they need to
-    /// assert which REST endpoint the default prefetch sweep chose.
-    var prefetchRestClientForTesting: RestClient?
-    #endif
-
-    /// The injected ``prefetchFetch``, or a `@Sendable` closure built from the live
-    /// `RestClient` (a Sendable value struct — safe to capture across the task-group
-    /// boundary). `nil` when unconfigured/offline, which makes the whole sweep a
-    /// no-op (purely additive coverage, never a correctness dependency).
-    private var resolvedPrefetchFetch: (@Sendable (CacheIdentity) async throws -> [StoredMessage])? {
-        if let prefetchFetchWithProfile {
-            return { identity in try await prefetchFetchWithProfile(identity.sessionId, identity.profileId) }
-        }
-        if let prefetchFetch {
-            return { identity in try await prefetchFetch(identity.sessionId) }
-        }
-        #if DEBUG
-        let resolvedRest = prefetchRestClientForTesting ?? connection?.rest
-        #else
-        let resolvedRest = connection?.rest
-        #endif
-        guard let rest = resolvedRest else { return nil }
-        return { [cacheStore] identity in
-            let sessionId = identity.sessionId
-            // Cursor-bearing cached transcripts take the delta-aware path first so
-            // an unchanged background sweep pays only the cheap cursor check. Rows
-            // without a cursor keep the ABH-400 page-window prefetch behavior.
-            if let cacheStore {
-                do {
-                    if let cursor = try await cacheStore.deltaCursor(for: identity),
-                       cursor.afterId > 0 {
-                        // Profile-scoped rows use the profile endpoint. Its
-                        // current protocol lacks a delta equivalent, so prefer
-                        // correctness over the aggregate-only delta shortcut.
-                        if identity.profileId != "default" {
-                            return try await rest.messages(sessionId: sessionId, profile: identity.profileId)
-                        }
-                        return try await fetchTranscriptDeltaAware(
-                            rest: rest,
-                            cacheStore: cacheStore,
-                            sessionId: sessionId,
-                            identity: identity
-                        )
-                    }
-                } catch {
-                    // Treat a cursor read failure like "no cursor"; the fetch path
-                    // below preserves the previous best-effort prefetch semantics.
-                }
-            }
-            if identity.profileId != "default" {
-                return try await rest.messages(sessionId: sessionId, profile: identity.profileId)
-            }
-            if let page = await fetchTranscriptPage(
-                rest: rest,
-                sessionId: sessionId,
-                limit: ChatStore.transcriptOpenWindowLimit
-            ) {
-                return page.messages
-            }
-            return try await fetchTranscriptDeltaAware(
-                rest: rest,
-                cacheStore: cacheStore,
-                sessionId: sessionId,
-                identity: identity
-            )
-        }
-    }
-
-    /// Cancel any in-flight prefetch sweep (WhatsApp bar). Called on disconnect /
-    /// background so a paced background fetch never outlives its connection.
-    func cancelPrefetch() {
-        prefetchTask?.cancel()
-        prefetchTask = nil
-    }
 
     /// Run the daily-throttled transcript eviction sweep (WhatsApp bar hygiene).
     /// Fire-and-forget, OFF the UI path; CacheStore self-throttles to once/24h, so
@@ -4729,17 +4555,6 @@ final class SessionStore {
     /// invoke the stored-transcript fetch with the row's owning profile.
     var transcriptFetchWithProfile: ((String, String?) async throws -> [StoredMessage])?
 
-    /// Shape-aware transcript seam (WS-5.1 skeleton cold-open). The third argument
-    /// is the requested payload tier (`"skeleton"` for the fast cold-open paint,
-    /// `"full"` for the background hydrate). Preferred over the legacy seams when
-    /// present so a test can assert BOTH the skeleton request and the full hydrate.
-    var transcriptFetchShaped: ((String, String?, String) async throws -> [StoredMessage])?
-
-    /// Test override for ``skeletonColdOpenEligible`` — forces the cold-open seed
-    /// to request the skeleton tier (and hydrate) regardless of the live gateway
-    /// path style, so the two-phase behavior is deterministically exercisable.
-    var skeletonColdOpenForced: Bool?
-
     /// Profile-aware delete seam for ABH-408. The live path resolves to
     /// `RestClient.deleteSession(id:profile:)`; tests inject this to assert that
     /// All-profiles row deletes target the row's owning profile store.
@@ -4959,15 +4774,8 @@ final class SessionStore {
         // settled content rather than reconciling mid-slide (R40).
         signalFirstPaint()
 
-        // Phase 2 — authoritative network seed, reconciled in place.
-        // WS-5.1: on plugin gateways, seed with the SKELETON tier (conversational
-        // text only; heavy reasoning_content + tool_calls nulled server-side) so
-        // the network seed paints instantly and never blocks behind a full fetch;
-        // a background task then hydrates the heavy fields to full and reconciles
-        // in place. Stock gateways ignore `shape` and keep the single full fetch.
-        let seedShape: String? = skeletonColdOpenEligible ? "skeleton" : nil
-        let seedWasSkeleton = seedShape != nil
-        guard let fetch = resolvedTranscriptFetch(shape: seedShape) else { return }
+        // Phase 2 — authoritative bounded stock seed, reconciled in place.
+        guard let fetch = resolvedTranscriptFetch() else { return }
         do {
             // ARCH37 STEP 3 — skip the redundant network seed only when the SAME
             // DISK copy we just painted is FRESH. A memory snapshot is an instant
@@ -5014,7 +4822,7 @@ final class SessionStore {
             chat.noteTranscriptSeedWindow(stored)
             #if DEBUG
             Self.logOpenLatency(
-                phase: seedWasSkeleton ? "network-painted(skeleton)" : "network-painted",
+                phase: "network-painted",
                 storedId: storedId, since: openClock)
             let networkMs = Self.openLatencyMilliseconds(since: openClock)
             os_signpost(
@@ -5024,9 +4832,6 @@ final class SessionStore {
             #endif
             // P3 write-through: persist the freshly-fetched transcript so the
             // next open paints it from disk. Fire-and-forget, OFF the UI path.
-            // The skeleton tier writes ALL rows (heavy fields nulled, row count
-            // unchanged) so it is a valid intermediate; the hydrate below
-            // overwrites it with the full payload if it lands.
             if let cacheStore, let identity = capturedIdentity {
                 Task { [weak self] in
                     guard let self,
@@ -5036,24 +4841,6 @@ final class SessionStore {
                               transportEpoch: transportEpoch
                           ) else { return }
                     try? await cacheStore.saveTranscript(identity: identity, messages: stored)
-                }
-            }
-            // WS-5.1: background-hydrate the heavy fields the skeleton tier nulled.
-            // The skeleton is a fully-usable read (conversational text intact), so
-            // hydration is best-effort and never blocks the UI. It reconciles in
-            // place by deterministic wire id — rows do not remount, only their
-            // reasoning/tool-call content enriches (no re-layout jump). This is the
-            // fix for reopened chats losing reasoning/tool-call content (#208).
-            if seedWasSkeleton {
-                Task(priority: .utility) { [weak self] in
-                    await self?.hydrateTranscriptToFull(
-                        storedId: storedId,
-                        networkProfile: networkProfile,
-                        cacheProfile: cacheProfile,
-                        token: token,
-                        workGeneration: workGeneration,
-                        transportEpoch: transportEpoch
-                    )
                 }
             }
         } catch {
@@ -5073,61 +4860,6 @@ final class SessionStore {
                     ?? error.localizedDescription
                 chat.noteTranscriptLoadFailure(description)
             }
-        }
-    }
-
-    /// WS-5.1 — background hydration of the skeleton cold-open seed. Fetches the
-    /// FULL transcript (heavy `reasoning_content` + `tool_calls` restored) and
-    /// reconciles it in place over the skeleton-painted rows, then overwrites the
-    /// intermediate skeleton cache with the full payload so the next open paints
-    /// the complete transcript from disk. Best-effort: the skeleton is a
-    /// fully-usable read, so any failure is swallowed (a later open re-attempts).
-    ///
-    /// Runs at `.utility` priority so it never contends with the open path or a
-    /// live turn; the network `await` and ``normalizeOffMain`` suspend off the
-    /// main actor. The in-place `chat.seed` reconcile is identity-preserving (by
-    /// deterministic wire id), so enriched rows don't remount — no visible jump.
-    /// The same supersession guards as the seed (`token` / `workGeneration` /
-    /// `transportEpoch`) abort a hydration a newer open/reconnect superseded.
-    private func hydrateTranscriptToFull(
-        storedId: String,
-        networkProfile: String?,
-        cacheProfile: String,
-        token: UUID,
-        workGeneration: UInt64,
-        transportEpoch: UInt64
-    ) async {
-        guard isCurrentTranscriptNetworkWork(
-            token: token, workGeneration: workGeneration, transportEpoch: transportEpoch
-        ), let chat else { return }
-        guard let fetch = resolvedTranscriptFetch(shape: nil) else { return }
-        do {
-            let full = try await fetch(storedId, networkProfile)
-            guard isCurrentTranscriptNetworkWork(
-                token: token, workGeneration: workGeneration, transportEpoch: transportEpoch
-            ) else { return }
-            let normalized = await Self.normalizeOffMain(full)
-            guard isCurrentTranscriptNetworkWork(
-                token: token, workGeneration: workGeneration, transportEpoch: transportEpoch
-            ) else { return }
-            rememberWarmOpenSnapshot(normalized, for: storedId)
-            // QA-2 R15: hydration reconciles the SAME session's full rows over
-            // the skeleton paint — union so any settled row painted since (or a
-            // live turn's history) survives the enrichment.
-            chat.seed(normalized: normalized, policy: .union)
-            chat.noteTranscriptSeedWindow(full)
-            // Overwrite the intermediate skeleton cache with the full payload.
-            if let cacheStore, let identity = cacheIdentity(storedId, profile: cacheProfile) {
-                try? await cacheStore.saveTranscript(identity: identity, messages: full)
-            }
-            #if DEBUG
-            Self.logOpenLatency(
-                phase: "network-hydrated(full)", storedId: storedId,
-                since: ContinuousClock.now)
-            #endif
-        } catch {
-            // Best-effort: skeleton remains the usable read. A later open or
-            // backfill will retry. Surface nothing to the UI.
         }
     }
 
@@ -5276,56 +5008,21 @@ final class SessionStore {
 
     /// The injected transcript seams, or the default that resolves the live
     /// REST client (mirrors `ChatStore.resolvedBackfillFetch`).
-    ///
-    /// `shape` (WS-5.1): tiers the requested payload — `"skeleton"` nulls the heavy
-    /// `reasoning_content` + `tool_calls` fields server-side for a faster cold-open
-    /// paint; `nil` (the default) is the shipped FULL fetch. Only the plugin mount
-    /// honors `shape`; a stock gateway ignores the unknown query param and returns
-    /// full, so this stays backward-safe. The shape-aware test seam
-    /// (``transcriptFetchShaped``) is preferred when present; otherwise the legacy
-    /// shape-ignorant seams are used as-is for the default (`nil`) shape only.
-    private func resolvedTranscriptFetch(
-        shape: String? = nil
-    ) -> ((String, String?) async throws -> [StoredMessage])? {
-        if let transcriptFetchShaped {
-            let seam = transcriptFetchShaped
-            return { sessionId, profile in
-                try await seam(sessionId, profile, shape ?? "full")
-            }
-        }
-        // Default (no shape requested): keep the legacy shape-ignorant seams
-        // byte-for-byte so existing tests/default-scope callers are unchanged.
-        if shape == nil {
-            if let transcriptFetchWithProfile { return transcriptFetchWithProfile }
-            if let transcriptFetch { return { sessionId, _ in try await transcriptFetch(sessionId) } }
-        }
+    private func resolvedTranscriptFetch() -> ((String, String?) async throws -> [StoredMessage])? {
+        if let transcriptFetchWithProfile { return transcriptFetchWithProfile }
+        if let transcriptFetch { return { sessionId, _ in try await transcriptFetch(sessionId) } }
         guard let rest = connection?.rest else { return nil }
         return { [weak self] sessionId, profile in
             let limit = ChatStore.transcriptOpenWindowLimit
             let total = self?.sessions.first(where: { $0.id == sessionId })?.messageCount ?? 0
-            let offset = max(0, total - limit)
-            if let page = await fetchStockTranscriptPage(
+            return try await fetchBoundedStockTranscript(
                 rest: rest,
                 sessionId: sessionId,
                 profile: profile,
+                messageCount: total,
                 limit: limit,
-                offset: offset
-            ) {
-                return page.messages
-            }
-            return try await rest.messages(sessionId: sessionId, profile: profile)
+            )
         }
-    }
-
-    /// Whether the cold-open network seed should request the `skeleton` tier and
-    /// then hydrate to full in the background (WS-5.1). True only on the plugin
-    /// mount — the sole route that honors `shape` (the stock endpoint ignores the
-    /// unknown query param and returns full, so a skeleton-then-hydrate there would
-    /// be a redundant double full fetch). Overridable by tests via
-    /// ``skeletonColdOpenForced``.
-    private var skeletonColdOpenEligible: Bool {
-        if let forced = skeletonColdOpenForced { return forced }
-        return false
     }
 
     /// The injected ``rpcSend``, or the default that forwards to the live gateway
@@ -5430,6 +5127,11 @@ final class ProjectsStore {
     /// Narrow test seam for the stock JSON-RPC boundary.
     var gatewayRequest: ((String, JSONValue) async throws -> JSONValue)?
 
+    #if DEBUG
+    /// Test-only transport epoch seam for proving stale reconnect responses drop.
+    var transportGenerationForTesting: (() -> UInt64)?
+    #endif
+
     // MARK: - Back-reference (injected by AppEnvironment)
 
     /// The connection store, for gateway access. `nil` until
@@ -5448,6 +5150,13 @@ final class ProjectsStore {
     /// (a profile/server switch re-partitions both). `nil` before there is a
     /// connection.
     private var cacheScopeProvider: (() -> CacheScope?)?
+
+    /// A request may publish only while its starting cache scope, transport
+    /// generation, and request token are still current.
+    private var activeCacheScope: CacheScope?
+    private var hasActivatedCacheScope = false
+    private var overviewRequestToken: UInt64 = 0
+    private var projectRequestTokens: [String: UInt64] = [:]
 
     init() {}
 
@@ -5489,15 +5198,50 @@ final class ProjectsStore {
         Task { await seedFromCache() }
     }
 
+    private var transportGeneration: UInt64 {
+        #if DEBUG
+        if let transportGenerationForTesting {
+            return transportGenerationForTesting()
+        }
+        #endif
+        return connection?.transportEpoch ?? 0
+    }
+
+    @discardableResult
+    private func activateCurrentScope() -> CacheScope? {
+        let scope = cacheScopeProvider?()
+        if hasActivatedCacheScope, scope != activeCacheScope {
+            overviewRequestToken &+= 1
+            projectRequestTokens.removeAll()
+            projects = nil
+            isLoading = false
+            loadError = nil
+            projectSessionsById.removeAll()
+            projectSessionsLoadingIds.removeAll()
+            projectSessionsErrorById.removeAll()
+        }
+        activeCacheScope = scope
+        hasActivatedCacheScope = true
+        return scope
+    }
+
+    private func requestOwnerIsCurrent(
+        scope: CacheScope?,
+        generation: UInt64
+    ) -> Bool {
+        cacheScopeProvider?() == scope && transportGeneration == generation
+    }
+
     /// Paint ``projects`` from the on-disk snapshot when nothing is loaded yet.
     /// No-op once a (possibly empty) network result has landed — the cache never
     /// clobbers fresher server data.
     func seedFromCache() async {
         guard projects == nil,
               let cache = cacheStore,
-              let scope = cacheScopeProvider?() else { return }
+              let scope = activateCurrentScope() else { return }
         if let cached = try? await cache.loadProjects(scope: scope),
            !cached.isEmpty,
+           cacheScopeProvider?() == scope,
            projects == nil {
             projects = cached
         }
@@ -5513,6 +5257,7 @@ final class ProjectsStore {
     /// ``loadError`` and leave the last successful ``projects`` intact so the
     /// UI doesn't flicker on a transient network blip.
     func refresh() async {
+        let scope = activateCurrentScope()
         guard connection != nil || gatewayRequest != nil else {
             // Offline: paint from disk so cold launch shows the last-known
             // projects instead of a blank "Not connected" list.
@@ -5520,20 +5265,29 @@ final class ProjectsStore {
             if projects == nil { loadError = "Not connected" }
             return
         }
+        overviewRequestToken &+= 1
+        let token = overviewRequestToken
+        let generation = transportGeneration
         isLoading = true
-        defer { isLoading = false }
+        defer {
+            if overviewRequestToken == token {
+                isLoading = false
+            }
+        }
         do {
             let payload: StockProjectTreePayload = try await request(
                 "projects.tree",
                 params: .object(["preview_limit": .number(3)])
             )
             let decoded = payload.projects.map(\.project)
+            guard overviewRequestToken == token,
+                  requestOwnerIsCurrent(scope: scope, generation: generation) else { return }
             projects = decoded
             loadError = nil
-            // Write-through: persist the fresh list so the next cold/offline
-            // launch paints instantly.
-            writeThroughProjects(decoded)
+            await writeThroughProjects(decoded, scope: scope)
         } catch {
+            guard overviewRequestToken == token,
+                  requestOwnerIsCurrent(scope: scope, generation: generation) else { return }
             // Preserve the last successful list so the UI doesn't blank out
             // on a transient failure — only surface the error when there is no
             // cached data to show. Seed from disk first so a transient network
@@ -5547,9 +5301,9 @@ final class ProjectsStore {
     }
 
     /// Persist the freshly-fetched projects overview to the on-disk snapshot.
-    private func writeThroughProjects(_ projects: [Project]) {
-        guard let cache = cacheStore, let scope = cacheScopeProvider?() else { return }
-        Task { try? await cache.saveProjects(projects, scope: scope) }
+    private func writeThroughProjects(_ projects: [Project], scope: CacheScope?) async {
+        guard let cache = cacheStore, let scope else { return }
+        try? await cache.saveProjects(projects, scope: scope)
     }
 
     // MARK: - Create (cache-first project creation)
@@ -5601,8 +5355,19 @@ final class ProjectsStore {
     /// successful list for this project intact so the UI doesn't flicker on a
     /// transient network blip.
     func refreshSessions(for project: Project) async {
+        let scope = activateCurrentScope()
+        projectRequestTokens[project.id, default: 0] &+= 1
+        guard let token = projectRequestTokens[project.id] else { return }
+        let generation = transportGeneration
         guard connection != nil || gatewayRequest != nil else {
-            await seedProjectSessionsFromCache(for: project)
+            await seedProjectSessionsFromCache(
+                for: project,
+                scope: scope,
+                token: token,
+                generation: generation
+            )
+            guard projectRequestTokens[project.id] == token,
+                  requestOwnerIsCurrent(scope: scope, generation: generation) else { return }
             if projectSessionsById[project.id] == nil {
                 projectSessionsErrorById[project.id] = "Not connected"
             }
@@ -5610,19 +5375,34 @@ final class ProjectsStore {
         }
         // Seed instantly from the per-project cache snapshot so the detail view
         // paints before the network returns (write-through repaints on success).
-        await seedProjectSessionsFromCache(for: project)
+        await seedProjectSessionsFromCache(
+            for: project,
+            scope: scope,
+            token: token,
+            generation: generation
+        )
+        guard projectRequestTokens[project.id] == token,
+              requestOwnerIsCurrent(scope: scope, generation: generation) else { return }
         projectSessionsLoadingIds.insert(project.id)
-        defer { projectSessionsLoadingIds.remove(project.id) }
+        defer {
+            if projectRequestTokens[project.id] == token {
+                projectSessionsLoadingIds.remove(project.id)
+            }
+        }
         do {
             let payload: StockProjectSessionsPayload = try await request(
                 "projects.project_sessions",
                 params: .object(["project_id": .string(project.id)])
             )
             let sessions = payload.project?.sessions ?? []
+            guard projectRequestTokens[project.id] == token,
+                  requestOwnerIsCurrent(scope: scope, generation: generation) else { return }
             projectSessionsById[project.id] = sessions
             projectSessionsErrorById[project.id] = nil
-            writeThroughProjectSessions(sessions, for: project)
+            await writeThroughProjectSessions(sessions, for: project, scope: scope)
         } catch {
+            guard projectRequestTokens[project.id] == token,
+                  requestOwnerIsCurrent(scope: scope, generation: generation) else { return }
             if projectSessionsById[project.id] == nil {
                 projectSessionsErrorById[project.id] =
                     (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
@@ -5633,22 +5413,31 @@ final class ProjectsStore {
     /// Paint `project`'s detail list from the on-disk snapshot when nothing is in
     /// memory yet. No-op when a cache/scope isn't wired, the snapshot is missing,
     /// or an in-memory list already exists (never clobber fresher data).
-    private func seedProjectSessionsFromCache(for project: Project) async {
+    private func seedProjectSessionsFromCache(
+        for project: Project,
+        scope: CacheScope?,
+        token: UInt64,
+        generation: UInt64
+    ) async {
         guard projectSessionsById[project.id] == nil,
               let cache = cacheStore,
-              let scope = cacheScopeProvider?() else { return }
+              let scope else { return }
         if let cached = try? await cache.loadProjectSessions(scope: scope, projectId: project.id),
-           !cached.isEmpty,
+           projectRequestTokens[project.id] == token,
+           requestOwnerIsCurrent(scope: scope, generation: generation),
            projectSessionsById[project.id] == nil {
             projectSessionsById[project.id] = cached
         }
     }
 
     /// Persist `project`'s freshly-fetched sessions to the on-disk snapshot.
-    private func writeThroughProjectSessions(_ sessions: [SessionSummary], for project: Project) {
-        guard let cache = cacheStore, let scope = cacheScopeProvider?() else { return }
-        let projectId = project.id
-        Task { try? await cache.saveProjectSessions(sessions, scope: scope, projectId: projectId) }
+    private func writeThroughProjectSessions(
+        _ sessions: [SessionSummary],
+        for project: Project,
+        scope: CacheScope?
+    ) async {
+        guard let cache = cacheStore, let scope else { return }
+        try? await cache.saveProjectSessions(sessions, scope: scope, projectId: project.id)
     }
 
     /// The server-scoped session list for `project`, or `[]` if it hasn't
