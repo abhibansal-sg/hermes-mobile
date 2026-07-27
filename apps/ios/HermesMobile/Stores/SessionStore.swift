@@ -2568,7 +2568,7 @@ final class SessionStore {
 
     private func bindSession(
         storedID: String,
-        runtimeID: String,
+        runtimeID: String?,
         mode: SessionBindingMode,
         generation: UInt64?
     ) {
@@ -2582,6 +2582,13 @@ final class SessionStore {
         if previous != storedID {
             chat?.pendingGateOwnerMoved(toStoredSession: storedID)
         }
+    }
+
+    /// Reconnects only need to restore ownership for work the phone was
+    /// actively driving. A watched or idle selection remains useful from its
+    /// cached/REST transcript without creating a gateway runtime.
+    var activeSessionRequiresRuntimeRecovery: Bool {
+        sessionBinding?.mode == .drive
     }
     /// The drawer's pending DISMISSAL INTENT (QA-1 B3). A drawer row tap hands
     /// its close here (`open(_:revealOnFirstPaint:)`); it fires on first paint
@@ -2940,12 +2947,17 @@ final class SessionStore {
             recordDrawerUserGesture()
         }
         let drawerIntentPending = pendingDrawerReveal != nil
-        if !reusableDrive {
-            activeRuntimeId = nil      // gates the composer until inspect/resume lands
-            activeRuntimeEpoch = nil
-        }
         activeStoredProfile = selectedProfileID(for: summary)
-        activeStoredId = summary.id
+        if reusableDrive {
+            activeStoredId = summary.id
+        } else {
+            bindSession(
+                storedID: summary.id,
+                runtimeID: nil,
+                mode: .watch,
+                generation: nil
+            )
+        }
         connection?.updatePhoneForeground(summary.id)
         if let cacheStore, let scope = currentCacheScope,
            let identity = cacheIdentity(summary.id, profile: summary.profile) {
@@ -3050,8 +3062,8 @@ final class SessionStore {
         // correct live target. Reopening the same row must not inspect or resume.
         if reusableDrive { return }
 
-        // Slow path: gateway resume — spins up the agent server-side; only
-        // prompt submission depends on it.
+        // Read-only inspection. Opening an idle row must never create or steal
+        // a gateway runtime; prompt submission owns that transition.
         let resumeTask = Task { [weak self] in
             guard let self, self.client != nil || self.resumeRPC != nil else { return }
             let usingResumeTestSeam = self.resumeRPC != nil
@@ -3089,121 +3101,10 @@ final class SessionStore {
                     self.sessionActionError = nil
                     return
                 case .absent, .unsupported:
-                    break
-                }
-                // Thread the row's profile scope so an All-profiles tap resumes in
-                // the row's owning profile home. Omitted for default/all/dormant
-                // cases — byte-for-byte the shipped resume.
-                var resumeParams: [String: JSONValue] = ["session_id": .string(summary.id)]
-                if let networkProfile {
-                    resumeParams["profile"] = .string(networkProfile)
-                }
-                let result = try await self.coalescedSessionResume(
-                    storedId: summary.id,
-                    profileId: cacheProfile,
-                    params: resumeParams,
-                    token: token,
-                    transportEpoch: bindingEpoch
-                )
-                guard self.isCurrentRuntimeBinding(
-                    token: token,
-                    storedId: summary.id,
-                    profileId: cacheProfile,
-                    connectionWorkGeneration: connectionWorkGeneration,
-                    transportEpoch: bindingEpoch,
-                    usingResumeTestSeam: usingResumeTestSeam
-                ) else {
-                    if !usingResumeTestSeam,
-                       self.connection?.transportEpoch != bindingEpoch {
-                        ReliabilityDiagnostics.shared.epochRejected(
-                            expected: bindingEpoch,
-                            received: self.connection?.transportEpoch
-                        )
-                    }
-                    if self.activeStoredId != summary.id || self.openToken != token {
-                        ReliabilityDiagnostics.shared.sessionSuperseded(identifier: summary.id)
-                    }
+                    self.lastError = nil
+                    self.sessionActionError = nil
                     return
-                }  // superseded or an older transport
-                self.bindSession(
-                    storedID: result.storedSessionId ?? summary.id,
-                    runtimeID: result.sessionId,
-                    mode: .drive,
-                    generation: bindingEpoch
-                )
-                ReliabilityDiagnostics.shared.sessionBound(
-                    identifier: summary.scopedIdentity, epoch: bindingEpoch
-                )
-                // Confirm/seed the active-profile pref from the server's echo: the
-                // WS path silently falls back to the launch profile on an unknown
-                // name, so trust the echo over the requested scope.
-                self.confirmActiveProfile(from: result.info)
-                // Seed the composer pill (model/provider/reasoning/fast) from
-                // the resume echo — the session's ACTUAL state (build-27 QA:
-                // the pill showed the previous session's model until the
-                // picker was opened).
-                if let info = result.info { self.connection?.applyRuntimeInfo(info) }
-                // Compression-chain projection: the gateway may resume a
-                // newer continuation of this conversation — follow it.
-                let boundStoredId = result.storedSessionId ?? summary.id
-                if boundStoredId != summary.id {
-                    // Re-stamp prompts queued under the parent id to the
-                    // continuation BEFORE the swap, so drain's affinity guard
-                    // doesn't skip them forever once activeStoredId moves.
-                    self.onStoredIdMigrated?(summary.id, boundStoredId)
-                    self.activeStoredId = boundStoredId
-                    // Same token: the chain-tip seed's REST await is just as
-                    // outrunnable by a newer open() as the fast path (R1 #43).
-                    await self.seedTranscript(
-                        storedId: boundStoredId,
-                        networkProfile: networkProfile,
-                        cacheProfile: cacheProfile,
-                        token: token,
-                        workGeneration: transcriptWorkGeneration,
-                        transportEpoch: transcriptTransportEpoch
-                    )
-                    // Surface the chain-tip row in the drawer immediately.
-                    Task { [weak self] in await self?.refresh() }
                 }
-                self.lastError = nil
-                self.sessionActionError = nil
-                // Runtime bound: clear the self-heal budget and flush anything the
-                // composer queued during this resume window (an idle desktop-driven
-                // session emits no turn-completion to trigger a drain otherwise).
-                // The drain no-ops while a foreign turn streams and is re-entrancy
-                self.ensureRuntimeAttempts = 0
-                // ABH-371 live re-entry: the transcript seed is persisted history,
-                // not proof the just-resumed runtime is idle. Wait for the open seed
-                // so a stale REST/cache snapshot cannot erase the placeholder, then
-                // reconcile against the stock resume snapshot. If it reports a
-                // turn in flight, ChatStore restores the streaming placeholder + Stop
-                // state immediately instead of showing a completed-turn action row.
-                // Run this BEFORE the runtime-bound queue drain; otherwise an idle
-                // queued prompt could slip into an already-running server turn during
-                // the resume/reconcile gap.
-                await seedTask.value
-                guard self.isCurrentRuntimeBinding(
-                    token: token,
-                    storedId: boundStoredId,
-                    profileId: self.activeStoredProfile,
-                    connectionWorkGeneration: connectionWorkGeneration,
-                    transportEpoch: bindingEpoch,
-                    usingResumeTestSeam: usingResumeTestSeam
-                ), self.activeRuntimeId == result.sessionId else { return }
-                await self.chat?.reconcileLiveTurnStatus(
-                    runtimeId: result.sessionId,
-                    snapshotRunning: result.snapshotRunning,
-                    inflight: result.inflight
-                )
-                // Runtime bound: flush anything the composer queued during this
-                // resume window. If live re-entry just restored a running turn, the
-                // queue's busy guards now see that state and leave prompts queued.
-                self.onActiveRuntimeBound?()
-                // Seed the context-window meter from session.usage so a resumed
-                // session shows occupancy before its first new turn (H1). Runs
-                // after the resume lands the runtime id; guarded against a newer
-                // open inside ChatStore via the runtime-id check.
-                await self.chat?.seedContextUsage(runtimeId: result.sessionId)
             } catch {
                 // A stale token/generation or a replaced epoch is a superseded
                 // binding, not an actionable open failure.
@@ -3292,6 +3193,8 @@ final class SessionStore {
             // every dormant case) — byte-for-byte the shipped create.
             var createParams: [String: JSONValue] = ["cols": .number(96)]
             applyProfileScope(to: &createParams)
+            let draftSelection = connection?.draftSelection
+            draftSelection?.apply(toCreateParams: &createParams)
             // ABH-351: new-session-in-project — pass the captured draft cwd so
             // the session starts rooted at the project's repo (the gateway's
             // session.create honors an optional `cwd` that, when it resolves to
@@ -3320,16 +3223,13 @@ final class SessionStore {
             )
             isDraft = false
             confirmActiveProfile(from: result.info)
-            // Seed the pill from the create echo (the fresh session's actual
-            // defaults) — the draft pick below then overrides via config.set
-            // + the session.info event.
+            // The create echo is already authoritative for the selection sent
+            // in the same request.
             if let info = result.info { connection?.applyRuntimeInfo(info) }
-            // Apply any model pick made while drafting BEFORE the caller
-            // (`ChatStore.send`) submits the first prompt — `config.set
-            // key=model` builds the session agent, so even the FIRST turn runs
-            // on the chosen model (ABH-84 draft-mode pick). Best-effort: a
-            // failure must not block the message.
-            await connection?.applyDraftSelection(sessionId: result.sessionId)
+            await connection?.finishDraftCreation(
+                selection: draftSelection,
+                sessionId: result.sessionId
+            )
             lastError = nil
             // Refresh the list in the background so the new row appears in the
             // drawer; don't block the prompt submission on it.
@@ -3344,7 +3244,10 @@ final class SessionStore {
     /// before the outbox submit continues. This keeps force-close/reopen honest
     /// while the network catches up.
     private func persistDraftBornCacheSeed(
-        storedID: String, echo: ChatMessage?
+        storedID: String,
+        echo: ChatMessage?,
+        profile: String?,
+        cwd: String?
     ) async {
         sessionLog.notice(
             "[ABH-519] persistDraftBornCacheSeed entry session=\(storedID, privacy: .public)"
@@ -3370,8 +3273,8 @@ final class SessionStore {
             messageCount: 1,
             source: nil,
             lastActive: now,
-            cwd: draftCwd,
-            profile: activeStoredProfile
+            cwd: cwd,
+            profile: profile
         )
         let listIdentity = sessionListIdentity(summary)
         if !sessions.contains(where: { sessionListIdentity($0) == listIdentity }) {
@@ -3383,7 +3286,7 @@ final class SessionStore {
             )
             return
         }
-        guard let identity = cacheIdentity(storedID) else {
+        guard let identity = cacheIdentity(storedID, profile: profile) else {
             sessionLog.error(
                 "[ABH-519] persistDraftBornCacheSeed guard-exit session=\(storedID, privacy: .public) reason=cacheIdentity-nil"
             )
@@ -3437,34 +3340,85 @@ final class SessionStore {
     /// Materialize the destination for one durable new-session prompt. The
     /// processor persists `storedSessionID` immediately after this returns and
     /// therefore retries/resumes that destination instead of creating another.
-    func createOutboxDestination(job: WorkJob? = nil) async throws -> OutboxDestination {
-        if !isDraft { startDraft() }
-        try await createDraftSession()
-        guard let runtimeSessionID = activeRuntimeId,
-              let storedSessionID = activeStoredId else {
-            throw OutboxProcessorError.destinationUnavailable
-        }
-        if let job {
-            let echo = ChatMessage(
-                role: .user,
-                clientMessageID: job.clientMessageID,
-                text: job.submissionText
+    func createOutboxDestination(job: WorkJob) async throws -> OutboxDestination {
+        guard let client else { throw GatewayError.notConnected }
+        var params: [String: JSONValue] = ["cols": .number(96)]
+        applyProfileScope(to: &params, selectedProfile: job.profileID)
+        if let cwd = job.cwd, !cwd.isEmpty { params["cwd"] = .string(cwd) }
+        let selection = job.modelSelectionJSON?
+            .data(using: .utf8)
+            .flatMap { try? JSONDecoder().decode(DraftModelSelection.self, from: $0) }
+        selection?.apply(toCreateParams: &params)
+
+        let result: SessionOpenResult = try await client.request(
+            "session.create",
+            params: .object(params),
+            timeout: .seconds(120)
+        )
+        let storedSessionID = result.storedSessionId ?? result.sessionId
+        let echo = ChatMessage(
+            role: .user,
+            clientMessageID: job.clientMessageID,
+            text: job.submissionText
+        )
+        let isStillVisibleDraft =
+            job.kind == .prompt
+            && job.intentKind == .newSession
+            && isDraft
+            && chat?.messages.contains(where: {
+                $0.clientMessageID == job.clientMessageID
+            }) == true
+        if isStillVisibleDraft {
+            bindSession(
+                storedID: storedSessionID,
+                runtimeID: result.sessionId,
+                mode: .drive,
+                generation: connection?.transportEpoch
             )
-            persistDurableEcho(storedId: storedSessionID, echo: echo)
+            activeStoredProfile = Self.normalizedProfileID(job.profileID)
+            isDraft = false
             transcriptPaintedStoredId = storedSessionID
-            await persistDraftBornCacheSeed(storedID: storedSessionID, echo: echo)
+            if let info = result.info { connection?.applyRuntimeInfo(info) }
+            await connection?.finishDraftCreation(
+                selection: selection,
+                sessionId: result.sessionId
+            )
+        } else if selection?.fast == false {
+            try? await connection?.sessionSetFast(false, sessionId: result.sessionId)
         }
+        await persistDraftBornCacheSeed(
+            storedID: storedSessionID,
+            echo: echo,
+            profile: job.profileID,
+            cwd: job.cwd
+        )
         return OutboxDestination(
-            runtimeSessionID: runtimeSessionID,
+            runtimeSessionID: result.sessionId,
             storedSessionID: storedSessionID
         )
     }
 
-    /// Resolve only the active affinity. A background queue item for session A
-    /// must never resume or submit into session B merely because B is visible.
+    /// Resolve the job's own destination without moving the visible selection.
     func runtimeForOutboxDestination(_ storedSessionID: String) async -> String? {
-        guard activeStoredId == storedSessionID else { return nil }
-        return await ensureActiveRuntime()
+        if activeStoredId == storedSessionID {
+            return await ensureActiveRuntime()
+        }
+        guard let client else { return nil }
+        do {
+            if case .found(let live) = try await inspectLiveSession(storedID: storedSessionID) {
+                return live.id
+            }
+            var params: [String: JSONValue] = ["session_id": .string(storedSessionID)]
+            applyProfileScope(to: &params)
+            let result: SessionOpenResult = try await client.request(
+                "session.resume",
+                params: .object(params),
+                timeout: .seconds(120)
+            )
+            return result.sessionId
+        } catch {
+            return nil
+        }
     }
 
     /// `prompt.submit` is the deliberate watch -> drive ownership edge. Claim
@@ -3527,6 +3481,9 @@ final class SessionStore {
             "cols": .number(96),
             "messages": .array(seed),
         ]
+        if let parent = activeStoredId, !parent.isEmpty {
+            params["parent_session_id"] = .string(parent)
+        }
         if let cwd, !cwd.isEmpty { params["cwd"] = .string(cwd) }
         // Branch into the active profile scope (same conditional spot as `cwd`).
         applyProfileScope(to: &params, selectedProfile: activeStoredProfile)
@@ -3708,6 +3665,7 @@ final class SessionStore {
         let token = openToken
         guard let storedId = activeStoredId,
               client != nil || resumeRPC != nil else { return nil }
+        let recoveryMode = sessionBinding?.mode ?? .watch
         let bindingProfile = activeStoredProfile
         let usingResumeTestSeam = resumeRPC != nil
         guard let bindingEpoch = await currentBindingEpoch(
@@ -3727,14 +3685,18 @@ final class SessionStore {
                 bindSession(
                     storedID: storedId,
                     runtimeID: live.id,
-                    mode: .watch,
-                    generation: nil
+                    mode: recoveryMode,
+                    generation: recoveryMode == .drive ? bindingEpoch : nil
                 )
                 lastError = nil
                 sessionActionError = nil
                 return live.id
             case .absent, .unsupported:
-                break
+                guard recoveryMode == .drive else {
+                    lastError = nil
+                    sessionActionError = nil
+                    return nil
+                }
             }
             // Re-resume into the same profile scope so a reconnect keeps the
             // session in its per-profile home. Omitted for the default/all scope.
@@ -3808,6 +3770,9 @@ final class SessionStore {
             sessionActionError = nil
             return result.sessionId
         } catch {
+            // Watching is observational. A failed active-list probe must not
+            // turn a readable cached session into a reconnect failure.
+            guard recoveryMode == .drive else { return nil }
             // The error belongs to an obsolete token/generation/epoch when the
             // transport changed while the RPC was suspended. Never surface it
             // into the current session's error channel.
@@ -3863,6 +3828,9 @@ final class SessionStore {
         }
         guard ensureRuntimeAttempts < Self.maxEnsureRuntimeAttempts else { return nil }
         ensureRuntimeAttempts += 1
+        // Reaching this method from send/edit/retry is the explicit ownership
+        // edge. Only now may reconnect support call session.resume.
+        sessionBinding?.mode = .drive
         let task = Task { [weak self] () -> String? in
             // resumeActiveAfterReconnect re-resumes `activeStoredId`, binds the
             // runtime, follows the chain tip (re-stamping the queue), and seeds the
@@ -4059,10 +4027,7 @@ final class SessionStore {
         }
     }
 
-    /// Execute the search against the best available endpoint: plugin first (richer
-    /// results + role-scoped + offset pagination), stock on 404 (older gateways).
-    /// Only falls back on a true 404/not-found — real 500/transport errors are
-    /// re-thrown so they surface as `lastError` and are not silently masked.
+    /// Execute search through the stock gateway endpoint.
     ///
     /// `offset` is forwarded to both the plugin and stock endpoints.
     ///
@@ -4076,25 +4041,13 @@ final class SessionStore {
     func fetchSearch(
         query: String, offset: Int = 0, api: RestClient
     ) async throws -> (results: [SessionSearchResult], rawPageFull: Bool) {
-        let roles = Self.roles(for: searchScope)
-        let sort = searchSort.rawValue
-        do {
-            // Plugin path: forward offset so load-more fetches subsequent
-            // message pages. rawPageFull keys on the raw (pre-collapse) count.
-            let (results, rawPageFull) = try await api.searchSessionsPlugin(
-                query: query, limit: Self.searchPageLimit, offset: offset, sort: sort, roles: roles
-            )
-            return (results, rawPageFull)
-        } catch RestError.badStatus(404, _) {
-            // Plugin endpoint not available on this gateway — fall back to stock.
-            let results = try await api.searchSessions(
-                query: query, limit: Self.searchPageLimit, offset: offset,
-                scope: searchScope.rawValue
-            )
-            // Stock path: rawPageFull = full session page (no pre-collapse step).
-            return (results, results.count == Self.searchPageLimit)
-        }
-        // Any other error (500, transport, decode) propagates to the caller.
+        let results = try await api.searchSessions(
+            query: query,
+            limit: Self.searchPageLimit,
+            offset: offset,
+            scope: searchScope.rawValue
+        )
+        return (results, results.count == Self.searchPageLimit)
     }
 
     /// Map the UI search scope to a list of `role` values for the plugin endpoint.

@@ -295,7 +295,7 @@ struct ComposerView: View {
             // session (so even the first turn runs on the chosen model).
             SessionModelPickerContent(
                 connection: connection,
-                sessionId: (sessions.activeRuntimeId?.isEmpty == false) ? sessions.activeRuntimeId : nil,
+                sessions: sessions,
                 themeStore: themeStore,
                 isPresented: $showModelPicker
             )

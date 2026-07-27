@@ -751,6 +751,8 @@ actor WorkRepository {
                 text: trimmed,
                 sourceURL: job.sourceURL,
                 comment: job.comment,
+                cwd: job.cwd,
+                modelSelectionJSON: job.modelSelectionJSON,
                 storedSessionID: job.storedSessionID,
                 assetHashes: try Self.assetHashes(db, jobID: job.jobID)
             )
@@ -800,6 +802,8 @@ actor WorkRepository {
                     text: job.text,
                     sourceURL: job.sourceURL,
                     comment: job.comment,
+                    cwd: job.cwd,
+                    modelSelectionJSON: job.modelSelectionJSON,
                     storedSessionID: newID,
                     assetHashes: try Self.assetHashes(db, jobID: job.jobID)
                 )
@@ -1107,7 +1111,17 @@ actor WorkRepository {
             guard let draft = try WorkDraft.fetchOne(db, key: draftID) else { throw WorkRepositoryError.draftNotFound }
             guard draft.revision == acknowledgedRevision else { throw WorkRepositoryError.draftNotFound }
             let links = try WorkDraftAsset.filter(Column("draft_id") == draftID).order(Column("ordinal")).fetchAll(db)
-            let input = WorkJobInput(jobID: jobID, kind: .prompt, scope: try WorkScope(serverID: draft.serverID, profileID: draft.profileID), state: .queued, text: draft.text, storedSessionID: draft.storedSessionID, createdAt: now)
+            let input = WorkJobInput(
+                jobID: jobID,
+                kind: .prompt,
+                scope: try WorkScope(serverID: draft.serverID, profileID: draft.profileID),
+                state: .queued,
+                text: draft.text,
+                cwd: draft.cwd,
+                modelSelectionJSON: draft.modelSelectionJSON,
+                storedSessionID: draft.storedSessionID,
+                createdAt: now
+            )
             let job = Self.makeJob(input, preparedAssets: [], now: timestamp)
             try job.insert(db)
             for link in links {
@@ -1232,6 +1246,8 @@ actor WorkRepository {
             text: input.text,
             sourceURL: input.sourceURL,
             comment: input.comment,
+            cwd: input.cwd,
+            modelSelectionJSON: input.modelSelectionJSON,
             storedSessionID: input.storedSessionID,
             destinationSessionID: nil,
             payloadHash: Self.payloadHash(
@@ -1240,6 +1256,8 @@ actor WorkRepository {
                 text: input.text,
                 sourceURL: input.sourceURL,
                 comment: input.comment,
+                cwd: input.cwd,
+                modelSelectionJSON: input.modelSelectionJSON,
                 storedSessionID: input.storedSessionID,
                 assetHashes: assetHashes
             ),
@@ -1404,11 +1422,14 @@ actor WorkRepository {
         text: String?,
         sourceURL: String?,
         comment: String?,
+        cwd: String? = nil,
+        modelSelectionJSON: String? = nil,
         storedSessionID: String?,
         assetHashes: [String]
     ) -> String {
         let payload = [kind.rawValue, intentKind?.rawValue ?? "", text ?? "",
-                       sourceURL ?? "", comment ?? "", storedSessionID ?? "",
+                       sourceURL ?? "", comment ?? "", cwd ?? "",
+                       modelSelectionJSON ?? "", storedSessionID ?? "",
                        assetHashes.joined(separator: ",")]
             .map { "\($0.utf8.count):\($0)" }.joined(separator: "|")
         return sha256(Data(payload.utf8))

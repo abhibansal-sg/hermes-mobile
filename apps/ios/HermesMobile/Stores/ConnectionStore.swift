@@ -13,6 +13,20 @@ struct DraftModelSelection: Codable, Equatable, Sendable {
     var provider: String
     var reasoningEffort: String?
     var fast: Bool?
+
+    func apply(toCreateParams params: inout [String: JSONValue]) {
+        if !model.isEmpty {
+            params["model"] = .string(model)
+            if !provider.isEmpty { params["provider"] = .string(provider) }
+        }
+        if let reasoningEffort {
+            params["reasoning_effort"] = .string(
+                reasoningEffort.isEmpty ? "none" : reasoningEffort)
+        }
+        // Stock session.create distinguishes true from omitted, but not an
+        // explicit false. False is normalized once after creation below.
+        if fast == true { params["fast"] = .bool(true) }
+    }
 }
 
 /// Observable owner of the gateway connection lifecycle.
@@ -235,22 +249,16 @@ final class ConnectionStore {
         draftSelection = nil
     }
 
-    /// Apply a pended draft pick to the just-created session. Best-effort BY
-    /// DESIGN: a failure must not block (or lose) the user's first message —
-    /// the session then simply runs on the global default and the pill follows
-    /// the server truth from `session.info`.
-    func applyDraftSelection(sessionId: String) async {
-        guard let d = draftSelection else { return }
+    /// Consume the selection already carried by stock `session.create`.
+    /// The only follow-up stock cannot express is explicit normal mode.
+    func finishDraftCreation(
+        selection: DraftModelSelection?,
+        sessionId: String
+    ) async {
+        guard draftSelection == selection else { return }
         draftSelection = nil
-        if !d.model.isEmpty {
-            let value = d.provider.isEmpty ? d.model : "\(d.model) --provider \(d.provider)"
-            try? await sessionSetModel(value, sessionId: sessionId)
-        }
-        if let effort = d.reasoningEffort {
-            try? await sessionSetReasoning(effort.isEmpty ? "none" : effort, sessionId: sessionId)
-        }
-        if let fast = d.fast {
-            try? await sessionSetFast(fast, sessionId: sessionId)
+        if selection?.fast == false {
+            try? await sessionSetFast(false, sessionId: sessionId)
         }
     }
 
@@ -3032,25 +3040,23 @@ final class ConnectionStore {
         // treating the old A failure as B's failure.
         var selectedIdentity = sessionStore.activeScopedIdentity
         while let expectedIdentity = selectedIdentity {
+            let requiresRuntime = sessionStore.activeSessionRequiresRuntimeRecovery
             let resumedRuntime = await sessionStore.resumeActiveAfterReconnect()
             guard isActiveGeneration(generation) else { return false }
             if resumedRuntime != nil { break }
 
             let latestIdentity = sessionStore.activeScopedIdentity
+            if latestIdentity == expectedIdentity, !requiresRuntime { break }
             guard latestIdentity != expectedIdentity else { return false }
             selectedIdentity = latestIdentity
         }
         if sessionStore.activeStoredId != nil {
             await chatStore.backfill()
             guard isActiveGeneration(generation) else { return false }
-            // Flush the offline outbox now the transcript is current — but only
-            // with a live runtime session, or the queue would burn through with
-            // a "No active session" error (see QueueStore drain notes).
-            if sessionStore.activeRuntimeId != nil {
-                // ABH-465: the durable outbox drains itself — wake() schedules the
-                // flush without blocking reconnect (drain-in-line was the old queue).
-                queueStore?.wake()
-            }
+            // The durable outbox resolves or creates its own runtime destination.
+            // A passively-opened session intentionally has no active runtime, so
+            // gating this wake on one would strand prompts queued while offline.
+            queueStore?.wake()
         }
         await sessionStore.refresh()
         guard isActiveGeneration(generation) else { return false }

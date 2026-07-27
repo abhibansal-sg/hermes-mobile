@@ -181,8 +181,7 @@ final class QueueSelfHealTests: XCTestCase {
         sessions.activeStoredId = nil    // …which has nothing to resume (no network)
         let accepted = await chat.send(text: "hello")
         XCTAssertFalse(accepted)
-        XCTAssertEqual(chat.lastError, "No active session",
-                       "a self-heal that can't bind still fails gracefully")
+        XCTAssertEqual(chat.lastError, "Outbox unavailable")
     }
 
     // MARK: - Supersession: a stale on-demand resume must not clobber a switch

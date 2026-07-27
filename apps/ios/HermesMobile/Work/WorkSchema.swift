@@ -135,6 +135,12 @@ enum WorkSchema {
                 table.add(column: "revision", .integer).notNull().defaults(to: 1)
             }
         }
+        migrator.registerMigration("work-v3-job-creation-context") { db in
+            try db.alter(table: "work_jobs") { table in
+                table.add(column: "cwd", .text)
+                table.add(column: "model_selection_json", .text)
+            }
+        }
         return migrator
     }
 }

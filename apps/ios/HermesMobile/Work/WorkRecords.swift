@@ -102,6 +102,8 @@ struct WorkJob: Codable, FetchableRecord, PersistableRecord, Equatable, Sendable
     var text: String?
     var sourceURL: String?
     var comment: String?
+    var cwd: String?
+    var modelSelectionJSON: String?
     var storedSessionID: String?
     var destinationSessionID: String?
     var payloadHash: String
@@ -153,6 +155,8 @@ struct WorkJob: Codable, FetchableRecord, PersistableRecord, Equatable, Sendable
         case text
         case sourceURL = "source_url"
         case comment
+        case cwd
+        case modelSelectionJSON = "model_selection_json"
         case storedSessionID = "stored_session_id"
         case destinationSessionID = "destination_session_id"
         case payloadHash = "payload_hash"
@@ -253,6 +257,8 @@ struct WorkJobInput: Sendable {
     var text: String?
     var sourceURL: String?
     var comment: String?
+    var cwd: String?
+    var modelSelectionJSON: String?
     var storedSessionID: String?
     var expiresAt: Date?
     var createdAt: Date?
@@ -266,6 +272,8 @@ struct WorkJobInput: Sendable {
         text: String? = nil,
         sourceURL: String? = nil,
         comment: String? = nil,
+        cwd: String? = nil,
+        modelSelectionJSON: String? = nil,
         storedSessionID: String? = nil,
         expiresAt: Date? = nil,
         createdAt: Date? = nil
@@ -278,6 +286,8 @@ struct WorkJobInput: Sendable {
         self.text = text
         self.sourceURL = sourceURL
         self.comment = comment
+        self.cwd = cwd
+        self.modelSelectionJSON = modelSelectionJSON
         self.storedSessionID = storedSessionID
         self.expiresAt = expiresAt
         self.createdAt = createdAt

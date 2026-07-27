@@ -154,22 +154,26 @@ final class OutboxProcessorTests: XCTestCase {
             intentKind: .newSession,
             text: "new chat"
         ))
-        var activeStored: String?
         var createCount = 0
+        var resolveCount = 0
+        var submittedRuntimes: [String] = []
         var failOnce = true
         let processor = OutboxProcessor(repository: harness.repository, dependencies: .init(
             currentScope: { harness.scope },
-            activeStoredSessionID: { activeStored },
+            activeStoredSessionID: { "visible-session" },
             isTransportReady: { true },
             createDestination: { _ in
                 createCount += 1
-                activeStored = "stored-created"
                 return OutboxDestination(runtimeSessionID: "runtime-created", storedSessionID: "stored-created")
             },
-            resolveRuntime: { stored in stored == "stored-created" ? "runtime-created" : nil },
+            resolveRuntime: { stored in
+                resolveCount += 1
+                return stored == "stored-created" ? "runtime-resumed" : nil
+            },
             uploadAsset: { _, _ in throw Ambiguous() },
             willSubmit: { _, _ in },
-            submit: { submitted, _, _ in
+            submit: { submitted, runtime, _ in
+                submittedRuntimes.append(runtime)
                 if failOnce { failOnce = false; throw Ambiguous() }
                 return OutboxSubmitResult(status: "streaming", accepted: true,
                                           clientMessageID: submitted.clientMessageID)
@@ -179,9 +183,13 @@ final class OutboxProcessorTests: XCTestCase {
         processor.wake(); await processor.waitUntilIdleForTesting()
         var persisted = try await harness.repository.job(id: job.jobID)
         XCTAssertEqual(persisted?.destinationSessionID, "stored-created")
+        XCTAssertEqual(submittedRuntimes, ["runtime-created"])
+        XCTAssertEqual(resolveCount, 0, "fresh create must use its returned runtime")
         processor.wake(); await processor.waitUntilIdleForTesting()
 
         XCTAssertEqual(createCount, 1)
+        XCTAssertEqual(submittedRuntimes, ["runtime-created", "runtime-resumed"])
+        XCTAssertEqual(resolveCount, 1)
         persisted = try await harness.repository.job(id: job.jobID)
         XCTAssertEqual(persisted?.state, .completed)
     }
@@ -514,7 +522,7 @@ final class OutboxProcessorTests: XCTestCase {
         var submitted: [String] = []
         let processor = OutboxProcessor(repository: harness.repository, dependencies: .init(
             currentScope: { harness.scope },
-            activeStoredSessionID: { "stored-B" },
+            activeStoredSessionID: { "visible-A" },
             isTransportReady: { true },
             // Session A is mid-turn; B is not.
             busySessionID: { "stored-A" },
@@ -531,7 +539,11 @@ final class OutboxProcessorTests: XCTestCase {
 
         processor.wake(); await processor.waitUntilIdleForTesting()
 
-        XCTAssertEqual(submitted, [job.clientMessageID], "session B drained past A's live turn")
+        XCTAssertEqual(
+            submitted,
+            [job.clientMessageID],
+            "session B must drain without becoming the visible selection"
+        )
         let persisted = try await harness.repository.job(id: job.jobID)
         XCTAssertEqual(persisted?.state, .completed)
     }

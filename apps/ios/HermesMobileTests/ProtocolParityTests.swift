@@ -226,7 +226,7 @@ final class ProtocolParityTests: XCTestCase {
         XCTAssertFalse(chat.localTurnInFlight)
     }
 
-    func testOpenResumesOnceWhenSessionIsNotLive() async {
+    func testPassiveOpenOfIdleSessionDoesNotResume() async {
         let chat = ChatStore()
         let sessions = SessionStore()
         let connection = ConnectionStore(sessionStore: sessions, chatStore: chat)
@@ -251,10 +251,16 @@ final class ProtocolParityTests: XCTestCase {
         ))
         await sessions.waitForPendingOpenForTesting()
 
-        XCTAssertEqual(resumeCalls, 1)
-        XCTAssertEqual(sessions.sessionBinding?.runtimeID, "runtime-phone")
+        XCTAssertEqual(resumeCalls, 0)
+        XCTAssertEqual(sessions.sessionBinding?.storedID, "stored-idle")
+        XCTAssertNil(sessions.sessionBinding?.runtimeID)
+        XCTAssertEqual(sessions.sessionBinding?.mode, .watch)
+        XCTAssertNil(sessions.sessionBinding?.generation)
+
+        let runtime = await sessions.ensureActiveRuntime()
+        XCTAssertEqual(resumeCalls, 1, "the first drive action owns the resume edge")
+        XCTAssertEqual(runtime, "runtime-phone")
         XCTAssertEqual(sessions.sessionBinding?.mode, .drive)
-        XCTAssertEqual(sessions.sessionBinding?.generation, 0)
     }
 
     func testSilentLocalTurnPreservesWorkingStockSessionWithoutHistoryFetch() async {

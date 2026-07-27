@@ -133,21 +133,13 @@ final class PluginSearchTests: XCTestCase {
                       "Query term must be percent-encoded in the URL, got \(query)")
     }
 
-    // MARK: - 3. Fallback on 404
+    // MARK: - 3. Stock product path
 
-    /// When the plugin endpoint returns 404, ``SessionStore/fetchSearch`` must
-    /// transparently call the stock ``/api/sessions/search`` and return its results.
-    /// `lastError` must remain nil — the degradation is silent (no user-visible error).
-    func testFallbackToStockOn404() async throws {
-        // Plugin → 404; stock → valid results.
-        let notFound = #"{"error":"not found"}"#.data(using: .utf8)!
+    func testSessionStoreUsesStockSearchDirectly() async throws {
         let stockJSON = """
         {"results":[{"session_id":"s1","snippet":"found it","role":"user","session_started":0}]}
         """.data(using: .utf8)!
-        SearchStubProtocol.responses = [
-            (notFound, 404),
-            (stockJSON, 200),
-        ]
+        SearchStubProtocol.responses = [(stockJSON, 200)]
 
         let api = pluginClient()
         let store = SessionStore()
@@ -155,18 +147,15 @@ final class PluginSearchTests: XCTestCase {
 
         let (results, rawPageFull) = try await store.fetchSearch(query: "found", api: api)
 
-        XCTAssertEqual(results.count, 1, "Stock fallback result must be returned")
+        XCTAssertEqual(results.count, 1)
         XCTAssertEqual(results[0].id, "s1", "Stock result session_id must parse correctly")
         // 1 result < searchPageLimit(20) → short page → rawPageFull = false.
         XCTAssertFalse(rawPageFull, "A short stock page must report rawPageFull = false")
-        // lastError is untouched (fetchSearch doesn't write it; the caller Task does).
-        XCTAssertEqual(SearchStubProtocol.capturedURLs.count, 2,
-                       "Both plugin and stock endpoints must be called")
-        // Verify the second URL is the stock path.
-        let stockURL = SearchStubProtocol.capturedURLs[1]
+        XCTAssertEqual(SearchStubProtocol.capturedURLs.count, 1)
+        let stockURL = SearchStubProtocol.capturedURLs[0]
         XCTAssertTrue(
             stockURL.path.hasPrefix("/api/sessions/search"),
-            "Fallback must use stock /api/sessions/search, got \(stockURL.path)"
+            "SessionStore must use stock /api/sessions/search, got \(stockURL.path)"
         )
     }
 
@@ -244,8 +233,8 @@ final class PluginSearchTests: XCTestCase {
     /// correctly identifies the stale case so the caller Task drops the result.
     func testStaleResponseGuard() async throws {
         let json = """
-        {"query":"old","results":[{"session_id":"stale","snippet":"stale","role":"user",
-         "session_started_at":0,"message_id":1,"timestamp":0}],"count":1,"offset":0}
+        {"results":[{"session_id":"stale","snippet":"stale","role":"user",
+         "session_started":0,"message_id":1}]}
         """
         SearchStubProtocol.responses = [(json.data(using: .utf8)!, 200)]
         let api = pluginClient()

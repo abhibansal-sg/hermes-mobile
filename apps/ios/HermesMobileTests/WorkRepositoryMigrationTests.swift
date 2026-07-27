@@ -25,6 +25,8 @@ final class WorkRepositoryMigrationTests: XCTestCase {
         XCTAssertTrue(jobColumns.contains("server_id"))
         XCTAssertTrue(jobColumns.contains("profile_id"))
         XCTAssertTrue(jobColumns.contains("client_message_id"))
+        XCTAssertTrue(jobColumns.contains("cwd"))
+        XCTAssertTrue(jobColumns.contains("model_selection_json"))
         XCTAssertFalse(jobColumns.contains { $0.localizedCaseInsensitiveContains("token") })
         XCTAssertFalse(jobColumns.contains { $0.localizedCaseInsensitiveContains("credential") })
         XCTAssertFalse(jobColumns.contains { $0.localizedCaseInsensitiveContains("absolute") })
@@ -33,6 +35,37 @@ final class WorkRepositoryMigrationTests: XCTestCase {
         XCTAssertEqual(pragmas.journalMode.lowercased(), "wal")
         XCTAssertTrue(pragmas.foreignKeysEnabled)
         XCTAssertEqual(pragmas.busyTimeoutMilliseconds, 5_000)
+    }
+
+    func testV2DeviceDatabaseMigratesWithoutLosingQueuedWork() async throws {
+        let test = try makeWorkRepositoryTestConfiguration()
+        defer { try? FileManager.default.removeItem(at: test.directory) }
+        var repository: WorkRepository? = try WorkRepository(configuration: test.configuration)
+        let queued = try await repository?.enqueue(WorkJobInput(
+            kind: .prompt,
+            scope: workTestScope(),
+            text: "survive migration",
+            storedSessionID: "stored-old"
+        ))
+        let queuedID = try XCTUnwrap(queued?.jobID)
+        repository = nil
+
+        let v2 = try DatabaseQueue(path: test.configuration.databaseURL.path)
+        try await v2.write { db in
+            try db.execute(sql: "ALTER TABLE work_jobs DROP COLUMN cwd")
+            try db.execute(sql: "ALTER TABLE work_jobs DROP COLUMN model_selection_json")
+            try db.execute(
+                sql: "DELETE FROM grdb_migrations WHERE identifier = ?",
+                arguments: ["work-v3-job-creation-context"]
+            )
+        }
+
+        let migrated = try WorkRepository(configuration: test.configuration)
+        let restored = try await migrated.job(id: queuedID)
+        XCTAssertEqual(restored?.text, "survive migration")
+        XCTAssertEqual(restored?.storedSessionID, "stored-old")
+        XCTAssertNil(restored?.cwd)
+        XCTAssertNil(restored?.modelSelectionJSON)
     }
 
     @MainActor
@@ -96,10 +129,13 @@ final class DraftRepositoryTests: XCTestCase {
         let test = try makeWorkRepositoryTestConfiguration(); defer { try? FileManager.default.removeItem(at: test.directory) }
         let repository = try WorkRepository(configuration: test.configuration)
         let scope = try workTestScope()
-        let saved = try await repository.saveDraft(scope: scope, contextKey: "new", storedSessionID: nil, text: "send me", cwd: nil, modelSelectionJSON: nil, assets: [])
+        let selection = #"{"model":"m","provider":"p","fast":true}"#
+        let saved = try await repository.saveDraft(scope: scope, contextKey: "new", storedSessionID: nil, text: "send me", cwd: "/repo", modelSelectionJSON: selection, assets: [])
         let first = try XCTUnwrap(saved)
         let job = try await repository.convertDraftToJob(draftID: first.draftID, acknowledgedRevision: first.revision)
         XCTAssertEqual(job.text, "send me")
+        XCTAssertEqual(job.cwd, "/repo")
+        XCTAssertEqual(job.modelSelectionJSON, selection)
         _ = try await repository.saveDraft(scope: scope, contextKey: "new", storedSessionID: nil, text: "later edit", cwd: nil, modelSelectionJSON: nil, assets: [])
         let retained = try await repository.draft(scope: scope, contextKey: "new")
         XCTAssertEqual(retained?.draft.text, "later edit")

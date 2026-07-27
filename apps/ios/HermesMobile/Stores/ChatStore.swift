@@ -2671,6 +2671,10 @@ final class ChatStore {
                 return nil
             }
         }
+        return await runtimeForUserAction()
+    }
+
+    private func runtimeForUserAction() async -> String? {
         if let activeSessionId { return activeSessionId }
         return await sessions?.ensureActiveRuntime()
     }
@@ -2758,139 +2762,39 @@ final class ChatStore {
         let hasAttachments = includeAttachments && (attachments?.hasPending ?? false)
         guard !trimmed.isEmpty || hasAttachments else { return false }
 
-        // Production sends enter the protected repository before session
-        // creation, upload, local echo, or prompt.submit. Unit-store graphs that
-        // do not install an outbox retain the legacy direct path below.
-        if let queueStore {
-            let assetInputs = hasAttachments ? (attachments?.draftAssetInputs() ?? []) : []
-            guard let queued = await queueStore.enqueue(
-                trimmed,
-                storedSessionId: sessions?.activeStoredId,
-                assets: assetInputs,
-                newSession: sessions?.isDraft == true,
-                wake: false
-            ) else {
-                lastError = "Couldn’t save this prompt to the outbox."
-                return false
-            }
-            attachments?.removeAll()
-            presentOutboxEcho(
-                clientMessageID: queued.clientMessageID,
-                text: queued.text,
-                remotePaths: []
-            )
-            lastError = nil
-            queueStore.wake()
-            return true
-        }
-        guard let connection, let client else {
-            lastError = "No active session"
+        // Every production send enters the protected repository before session
+        // creation, upload, local echo, or prompt.submit.
+        guard let queueStore else {
+            lastError = "Outbox unavailable"
             return false
         }
-
-        // STR-973A silent reconnect: during grace the transport is down but
-        // the user must never see a send error — enqueue to the offline
-        // outbox instead, same as a fully-offline send. Attachments aren't
-        // supported by the outbox (text-only), so let those fall through to
-        // the real (failing) send path below. `isDraining` guards against a
-        // `QueueStore.drain()` replay's own `chat.send()` call re-enqueuing
-        // itself — drain owns its own re-insert-on-failure semantics and must
-        // reach the real RPC attempt.
-        if connection.isInGrace, !hasAttachments, connection.queueStore?.isDraining != true {
-            _ = await connection.queueStore?.enqueue(trimmed, storedSessionId: sessions?.activeStoredId)
-            return true
+        let assetInputs = hasAttachments ? (attachments?.draftAssetInputs() ?? []) : []
+        let draftSelectionJSON = connection?.draftSelection.flatMap {
+            try? JSONEncoder().encode($0)
+        }.flatMap {
+            String(data: $0, encoding: .utf8)
         }
-
-        // Draft sessions: the first prompt materializes the real session
-        // (session.create) before anything is uploaded or submitted. On failure
-        // the user keeps their text and can retry without a half-started turn.
-        // After this, `activeSessionId` is non-nil for the rest of the send.
-        if sessions?.isDraft == true {
-            do {
-                try await sessions?.createDraftSession()
-            } catch {
-                lastError = sessions?.lastError
-                    ?? (error as? LocalizedError)?.errorDescription
-                    ?? error.localizedDescription
-                return false
-            }
-        }
-
-        // Resolve the runtime id, self-healing the "No active session" trap. A
-        // desktop-driven / cold-path session can leave `activeRuntimeId` nil (its
-        // gateway resume timed out or never landed), and NOTHING on the send/drain
-        // path re-attempts the resume — so every send AND every queue drain wedges
-        // here forever. Re-resume on demand before giving up; the queue drain calls
-        // send too, so this single edge fixes both.
-        let sessionId: String
-        if let rid = activeSessionId {
-            sessionId = rid
-        } else if let rid = await sessions?.ensureActiveRuntime() {
-            sessionId = rid
-        } else {
-            lastError = "No active session"
+        guard let queued = await queueStore.enqueue(
+            trimmed,
+            storedSessionId: sessions?.activeStoredId,
+            assets: assetInputs,
+            newSession: sessions?.isDraft == true,
+            cwd: sessions?.isDraft == true ? sessions?.draftCwd : nil,
+            modelSelectionJSON: sessions?.isDraft == true ? draftSelectionJSON : nil,
+            wake: false
+        ) else {
+            lastError = "Couldn’t save this prompt to the outbox."
             return false
         }
-
-        // The user has committed to a local turn. Claim local ownership NOW —
-        // BEFORE the (awaited) attachment upload — so any foreign frame that
-        // arrives during the upload is correctly refused adoption by the explicit
-        // `localTurnInFlight` token rather than racing an `isStreaming` heuristic.
-        // `beginLocalTurn()` also drops any foreign-mirror ownership: the user is
-        // now driving this stored session locally, so a stray foreign
-        // `message.complete` can never tear our turn down. ownership/display:
-        // LOCAL.
-        pendingReconnectReconcileID = nil
-        beginLocalTurn()
-
-        // Upload + attach any queued images first; abort the send on failure so
-        // the user keeps their text and can retry without a half-attached turn.
-        var uploadedImagePaths: [String] = []
-        if hasAttachments, let attachments {
-            setStreaming(true, reason: "send.uploadAttachments")  // display-only; ownership=LOCAL via token
-            lastError = nil
-            do {
-                uploadedImagePaths = try await attachments.uploadAndAttach(sessionId: sessionId, connection: connection)
-            } catch {
-                endLocalTurn()
-                setStreaming(false, reason: "send.uploadFailed")
-                lastError = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
-                return false
-            }
-        }
-
-        // Images-with-no-caption: prompt.submit needs text, so supply a default.
-        let outgoing = trimmed.isEmpty ? "Please look at the attached image." : trimmed
-        let localDisplay = Self.localSentImageDisplayText(
-            outgoing: outgoing,
-            uploadedImagePaths: uploadedImagePaths
+        attachments?.removeAll()
+        presentOutboxEcho(
+            clientMessageID: queued.clientMessageID,
+            text: queued.text,
+            remotePaths: []
         )
-        sessions?.resetComposerHistoryBrowse(for: sessions?.activeComposerDraftKey)
-        let userMessage = ChatMessage(role: .user, text: localDisplay)
-        userOrdinals[userMessage.id] = messages.lazy.filter { $0.role == .user }.count
-        messages.append(userMessage)
-        setStreaming(true, reason: "send.localTurn")  // ownership=LOCAL (token already held)
         lastError = nil
-        do {
-            _ = try await client.requestRaw(
-                "prompt.submit",
-                params: .object([
-                    "session_id": .string(sessionId),
-                    "text": .string(outgoing),
-                ])
-            )
-            return true
-        } catch let GatewayError.rpc(code, _) where code == GatewayErrorCode.sessionBusy {
-            endLocalTurn()
-            setStreaming(false, reason: "send.busy")
-            lastError = "Agent is busy"
-            return false
-        } catch {
-            endLocalTurn()
-            setStreaming(false, reason: "send.error")
-            lastError = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
-            return false
-        }
+        queueStore.wake()
+        return true
     }
 
     func prepareOutboxSubmission(job: WorkJob, remotePaths: [String]) {
@@ -2907,12 +2811,19 @@ final class ChatStore {
         remotePaths: [String]
     ) async throws -> OutboxSubmitResult {
         guard let client else { throw GatewayError.notConnected }
-        prepareOutboxSubmission(job: job, remotePaths: remotePaths)
-        pendingReconnectReconcileID = nil
-        beginLocalTurn()
-        setStreaming(true, reason: "outbox.submit")
-        lastError = nil
-        let priorBindingMode = sessions?.beginPromptSubmission(runtimeID: runtimeSessionID)
+        let presentsInActiveChat =
+            (job.destinationSessionID ?? job.storedSessionID) == sessions?.activeStoredId
+        let priorBindingMode: SessionBindingMode?
+        if presentsInActiveChat {
+            prepareOutboxSubmission(job: job, remotePaths: remotePaths)
+            pendingReconnectReconcileID = nil
+            beginLocalTurn()
+            setStreaming(true, reason: "outbox.submit")
+            lastError = nil
+            priorBindingMode = sessions?.beginPromptSubmission(runtimeID: runtimeSessionID)
+        } else {
+            priorBindingMode = nil
+        }
         do {
             let result = try await client.requestRaw(
                 "prompt.submit",
@@ -2923,6 +2834,7 @@ final class ChatStore {
                 ])
             )
             let receipt = OutboxSubmitResult(json: result)
+            guard presentsInActiveChat else { return receipt }
             if !(receipt.accepted && OutboxProcessor.acceptedDispositions.contains(receipt.status)) {
                 sessions?.restoreWatchAfterRejectedSubmission(
                     runtimeID: runtimeSessionID,
@@ -2933,6 +2845,7 @@ final class ChatStore {
             }
             return receipt
         } catch {
+            guard presentsInActiveChat else { throw error }
             sessions?.restoreWatchAfterRejectedSubmission(
                 runtimeID: runtimeSessionID,
                 priorMode: priorBindingMode
@@ -3134,7 +3047,11 @@ final class ChatStore {
         truncateBeforeUserOrdinal ordinal: Int,
         truncateFromIndex index: Int
     ) async {
-        guard let client, let sessionId = activeSessionId else {
+        guard let client else {
+            lastError = "No active session"
+            return
+        }
+        guard let sessionId = await runtimeForUserAction() else {
             lastError = "No active session"
             return
         }
@@ -3259,7 +3176,10 @@ final class ChatStore {
     /// or stop local streaming state. The gateway owns the compression lifecycle
     /// and returns before/after token counts for user feedback.
     func compressContext(focus: String? = nil) async -> ContextCompressionOutcome {
-        guard let client, let sessionId = activeSessionId else {
+        guard let client else {
+            return .error("No active session")
+        }
+        guard let sessionId = await runtimeForUserAction() else {
             return .error("No active session")
         }
         var params: [String: JSONValue] = ["session_id": .string(sessionId)]

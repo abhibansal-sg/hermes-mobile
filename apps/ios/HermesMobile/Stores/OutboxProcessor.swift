@@ -128,14 +128,11 @@ final class OutboxProcessor {
 
         guard let scope = dependencies.currentScope() else { return }
         while !Task.isCancelled {
-            let activeStoredID = dependencies.activeStoredSessionID()
             let transportReady = dependencies.isTransportReady()
             let job: WorkJob
             do {
                 guard let claimed = try await repository.claimNextJob(
                     scope: scope,
-                    activeStoredSessionID: activeStoredID,
-                    enforceSessionAffinity: true,
                     outboxOnly: true,
                     allowTransportJobs: transportReady,
                     owner: owner,
@@ -215,6 +212,7 @@ final class OutboxProcessor {
 
     private func process(_ claimed: WorkJob) async throws -> Bool {
         var job = claimed
+        var createdRuntimeID: String?
 
         if job.state == .retryWait {
             let assets = try await repository.jobAssets(jobID: job.jobID)
@@ -232,8 +230,7 @@ final class OutboxProcessor {
                 destinationID = nil
             } else {
                 guard let resolved = job.destinationSessionID
-                    ?? job.storedSessionID
-                    ?? dependencies.activeStoredSessionID() else {
+                    ?? job.storedSessionID else {
                     throw OutboxProcessorError.destinationUnavailable
                 }
                 destinationID = resolved
@@ -258,7 +255,6 @@ final class OutboxProcessor {
                 let next: WorkJobState = assets.isEmpty ? .submitting : .uploading
                 let destinationID = job.destinationSessionID
                     ?? job.storedSessionID
-                    ?? dependencies.activeStoredSessionID()
                 guard let destinationID else { throw OutboxProcessorError.destinationUnavailable }
                 job = try await repository.transitionJob(
                     id: job.jobID,
@@ -275,6 +271,7 @@ final class OutboxProcessor {
                 // State was committed before session.create. The returned stable
                 // destination is committed before upload or prompt submission.
                 let destination = try await dependencies.createDestination(job)
+                createdRuntimeID = destination.runtimeSessionID
                 let assets = try await repository.jobAssets(jobID: job.jobID)
                 let next: WorkJobState = assets.isEmpty ? .submitting : .uploading
                 job = try await repository.transitionJob(
@@ -319,7 +316,9 @@ final class OutboxProcessor {
 
         guard job.state == .submitting else { return false }
         let runtimeID: String
-        if let destinationID = job.destinationSessionID ?? job.storedSessionID,
+        if let createdRuntimeID {
+            runtimeID = createdRuntimeID
+        } else if let destinationID = job.destinationSessionID ?? job.storedSessionID,
            let resolved = await dependencies.resolveRuntime(destinationID) {
             runtimeID = resolved
         } else {

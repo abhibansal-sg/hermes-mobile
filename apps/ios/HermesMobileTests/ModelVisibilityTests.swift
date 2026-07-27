@@ -182,16 +182,29 @@ final class ModelVisibilityTests: XCTestCase {
     }
 
     @MainActor
-    func testApplyDraftSelectionIsBestEffortAndOneShot() async {
+    func testDraftSelectionBuildsAtomicCreateParameters() {
+        var params: [String: JSONValue] = ["cols": .number(96)]
+        DraftModelSelection(
+            model: "m", provider: "p", reasoningEffort: "low", fast: true
+        ).apply(toCreateParams: &params)
+
+        XCTAssertEqual(params["model"], .string("m"))
+        XCTAssertEqual(params["provider"], .string("p"))
+        XCTAssertEqual(params["reasoning_effort"], .string("low"))
+        XCTAssertEqual(params["fast"], .bool(true))
+    }
+
+    @MainActor
+    func testDraftSelectionExplicitNormalIsBestEffortAndOneShot() async {
         let store = ConnectionStore(sessionStore: SessionStore(), chatStore: ChatStore())
-        // No connected client: every config.set throws — apply must swallow
-        // (the first message must never be blocked) and still clear the pend.
+        // Stock create cannot distinguish false from omitted. The one normal-
+        // mode follow-up remains best-effort and cannot block the first message.
         store.draftSelection = DraftModelSelection(model: "m", provider: "p", reasoningEffort: "low", fast: false)
-        await store.applyDraftSelection(sessionId: "s1")
-        XCTAssertNil(store.draftSelection, "apply is one-shot — pend cleared even on failure")
+        await store.finishDraftCreation(selection: store.draftSelection, sessionId: "s1")
+        XCTAssertNil(store.draftSelection, "normalization is one-shot even on failure")
 
         // No pend → no-op.
-        await store.applyDraftSelection(sessionId: "s1")
+        await store.finishDraftCreation(selection: nil, sessionId: "s1")
         XCTAssertNil(store.draftSelection)
     }
 

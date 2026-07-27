@@ -330,6 +330,8 @@ final class QueueStore {
         storedSessionId: String? = nil,
         assets: [WorkAssetInput] = [],
         newSession: Bool = false,
+        cwd: String? = nil,
+        modelSelectionJSON: String? = nil,
         wake: Bool = false,
         clientMessageID: String? = nil
     ) async -> QueuedPrompt? {
@@ -349,6 +351,8 @@ final class QueueStore {
                 scope: scope,
                 intentKind: newSession ? .newSession : nil,
                 text: outgoing,
+                cwd: cwd,
+                modelSelectionJSON: modelSelectionJSON,
                 storedSessionID: storedSessionId
             )
             if let clientMessageID, let reused = UUID(uuidString: clientMessageID) {

@@ -167,9 +167,7 @@ final class AppEnvironment {
                         remotePath: upload.upload.path
                     )
                 },
-                willSubmit: { [weak chatStore] job, paths in
-                    chatStore?.prepareOutboxSubmission(job: job, remotePaths: paths)
-                },
+                willSubmit: { _, _ in },
                 submit: { [weak chatStore] job, runtimeID, paths in
                     guard let chatStore else { throw GatewayError.notConnected }
                     return try await chatStore.submitOutboxPrompt(

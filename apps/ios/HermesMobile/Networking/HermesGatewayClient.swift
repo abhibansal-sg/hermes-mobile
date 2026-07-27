@@ -148,7 +148,7 @@ actor HermesGatewayClient {
     /// How long `probeLiveness` waits for the ping pong before declaring the
     /// socket dead. Kept as a named constant so tests can reason about its value
     /// without depending on a magic number.
-    static let livenessPingTimeout: Duration = .seconds(4)
+    static let livenessPingTimeout: Duration = .seconds(15)
 
     /// Probe whether the current socket is still alive by sending a WebSocket
     /// ping and waiting for the pong (or a timeout). Read-only: if the ping
