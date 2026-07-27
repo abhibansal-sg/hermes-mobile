@@ -3,11 +3,11 @@ import SwiftUI
 /// First-run brand moment shown when ``ConnectionStore/Phase`` is `.needsSetup`.
 ///
 /// Owns the `needsSetup` surface (B1 routes to it from ``RootView``). Three
-/// paths off the welcome screen — one per ``ConnectionMode``:
+/// Four paths off the welcome screen — one per ``ConnectionMode``:
 ///   - **Shared dashboard** (QR) — presents ``QRScannerView`` full-screen.
 ///   - **Remote URL / Local desktop** — presents ``ConnectionSetupView`` (the
-///     URL+token form) in a native slide-up sheet. Local desktop defaults the
-///     URL field to a LAN/loopback hint; real discovery is Increment 3.
+///     stock URL/auth form) in a native slide-up sheet.
+///   - **Hermes Cloud** — signs in to the portal and discovers hosted agents.
 ///
 /// The user first picks a mode via the segmented mode picker; the CTA below
 /// it adapts to that choice. The selected mode is persisted so a relaunch
@@ -22,6 +22,9 @@ struct WelcomeView: View {
 
     /// Drives the slide-up manual-setup sheet.
     @State private var showingManualSetup = false
+
+    /// Drives the stock Hermes Cloud discovery flow.
+    @State private var showingCloudSetup = false
 
     /// The mode the user is picking. Initialized from the persisted value so
     /// relaunches land on the previously-chosen mode.
@@ -82,6 +85,10 @@ struct WelcomeView: View {
                 .presentationDetents([.medium, .large])
                 .presentationDragIndicator(.visible)
                 .hermesThemed(themeStore)
+            }
+            .sheet(isPresented: $showingCloudSetup) {
+                HermesCloudSetupView()
+                    .hermesThemed(themeStore)
             }
         }
         .hermesThemed(themeStore)
@@ -263,6 +270,19 @@ struct WelcomeView: View {
                 .foregroundStyle(theme.midground.contrastingForeground)
                 .background(theme.midground, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
                 .accessibilityIdentifier("enterURLButton")
+
+            case .hermesCloud:
+                Button {
+                    showingCloudSetup = true
+                } label: {
+                    Label("Sign in to Hermes Cloud", systemImage: "cloud")
+                        .font(.body.weight(.semibold))
+                        .frame(maxWidth: .infinity)
+                        .frame(height: 52)
+                }
+                .foregroundStyle(theme.midground.contrastingForeground)
+                .background(theme.midground, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+                .accessibilityIdentifier("connectCloudButton")
             }
 
             // A1 — onboarding for self-hosters with NO gateway yet. The button

@@ -3,7 +3,7 @@ import Foundation
 // Voice REST endpoints (transcribe / speak) layered onto ``RestClient`` as an
 // extension, mirroring the sibling ``RestClient+Sessions.swift`` pattern. These
 // reuse ``RestClient``'s shared `makeRequest`/`perform`/`decode`/`encodeBody`
-// plumbing (loopback `Host: 127.0.0.1` override, `X-Hermes-Session-Token` auth,
+// plumbing (Host derivation, gateway authentication,
 // 15s timeout, ``RestError`` mapping) rather than cloning it.
 //
 // ``AudioSpeakResult`` declares explicit snake_case `CodingKeys`, so its decode

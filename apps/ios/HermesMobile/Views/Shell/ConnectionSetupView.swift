@@ -1,14 +1,12 @@
 import SwiftUI
 
 /// First-run / re-auth screen shown when ``ConnectionStore/Phase`` is
-/// `.needsSetup`. Collects a gateway URL and session token, probes the
-/// connection via ``ConnectionStore/configure(urlString:token:)``, and surfaces
-/// any failure inline. On success the phase flips to `.connected` and
-/// ``RootView`` re-renders into the main UI automatically.
+/// `.needsSetup`. It first runs Desktop's public auth probe, then either asks
+/// for a session token or opens the stock gateway login page. On success the
+/// phase flips to `.connected` and ``RootView`` re-renders automatically.
 struct ConnectionSetupView: View {
     /// The connection mode this form is serving. Influences the URL placeholder
-    /// text (Local desktop gets a LAN/loopback hint) and the form title. Does
-    /// NOT change transport behaviour — all modes call `configure(urlString:token:)`.
+    /// text (Local desktop gets a LAN/loopback hint) and the form title.
     var initialMode: ConnectionMode = .remoteURL
 
     @Environment(ConnectionStore.self) private var connection
@@ -17,8 +15,11 @@ struct ConnectionSetupView: View {
 
     @State private var urlString = ""
     @State private var token = ""
+    @State private var authProbe: GatewayAuthProbe?
     @State private var errorText: String?
     @State private var isConnecting = false
+    @State private var isProbing = false
+    @State private var showingGatewayLogin = false
     /// A Tailscale hint surfaced when a connection to a `*.ts.net` host fails;
     /// `nil` clears the banner.
     @State private var tailscaleHint: TailscaleHint?
@@ -35,9 +36,30 @@ struct ConnectionSetupView: View {
     }
 
     private var canConnect: Bool {
-        !urlString.trimmingCharacters(in: .whitespaces).isEmpty
-            && !token.trimmingCharacters(in: .whitespaces).isEmpty
-            && !isConnecting
+        guard !urlString.trimmingCharacters(in: .whitespaces).isEmpty,
+              !isConnecting, !isProbing else { return false }
+        guard let authProbe else { return true }
+        return authProbe.mode == .session
+            || !token.trimmingCharacters(in: .whitespaces).isEmpty
+    }
+
+    private var connectLabel: String {
+        if isProbing { return "Checking gateway…" }
+        if isConnecting { return "Connecting…" }
+        guard let authProbe else { return "Continue" }
+        return authProbe.mode == .session ? sessionSignInLabel : "Connect"
+    }
+
+    private var sessionSignInLabel: String {
+        let providers = authProbe?.providers ?? []
+        if providers.count == 1 {
+            return "Sign in with \(providers[0].displayName)"
+        }
+        return "Sign in to gateway"
+    }
+
+    private var gatewayURL: URL? {
+        URL(string: urlString.trimmingCharacters(in: .whitespacesAndNewlines))
     }
 
     /// URL placeholder text — adapts to the connection mode.
@@ -45,7 +67,7 @@ struct ConnectionSetupView: View {
         switch initialMode {
         case .localDesktop:
             return "http://192.168.x.x:9119"
-        case .remoteURL, .sharedDashboard:
+        case .remoteURL, .hermesCloud, .sharedDashboard:
             return "https://your-mac.tailnet.ts.net:9443"
         }
     }
@@ -55,6 +77,7 @@ struct ConnectionSetupView: View {
         switch initialMode {
         case .localDesktop:    return "Local gateway"
         case .remoteURL:       return "Connect to Hermes"
+        case .hermesCloud:     return "Hermes Cloud"
         case .sharedDashboard: return "Connect to Hermes"
         }
     }
@@ -73,7 +96,7 @@ struct ConnectionSetupView: View {
                         Text("Connect manually")
                             .font(.title2.bold())
                             .foregroundStyle(theme.fg)
-                        Text("Enter your gateway URL and session token.")
+                        Text("Enter your gateway URL. Hermes will use the authentication method that gateway provides.")
                             .font(.subheadline)
                             .foregroundStyle(theme.mutedFg)
                     }
@@ -104,26 +127,30 @@ struct ConnectionSetupView: View {
                     .autocorrectionDisabled()
                     .submitLabel(.next)
                     .focused($focusedField, equals: .url)
-                    .onSubmit { focusedField = .token }
+                    .onSubmit { if canConnect { connect() } }
+                    .onChange(of: urlString) {
+                        authProbe = nil
+                        token = ""
+                        errorText = nil
+                    }
                     .focusRing(active: focusedField == .url, color: theme.composerRing)
                     // A11y: placeholder text is not read as a label on all VoiceOver
                     // configurations; an explicit label guarantees "Gateway URL, text field".
                     .accessibilityLabel("Gateway URL")
                     .accessibilityIdentifier("gatewayURLField")
 
-                    SecureField("Session token", text: $token)
-                        .textContentType(.password)
-                        .textInputAutocapitalization(.never)
-                        .autocorrectionDisabled()
-                        .submitLabel(.go)
-                        .focused($focusedField, equals: .token)
-                        .onSubmit { if canConnect { connect() } }
-                        .focusRing(active: focusedField == .token, color: theme.composerRing)
-                        // A11y: explicit label for SecureField (placeholder alone is
-                        // insufficient when the field is filled — VoiceOver reads the
-                        // secure-entry-replacement bullets, not the placeholder).
-                        .accessibilityLabel("Session token")
-                        .accessibilityIdentifier("sessionTokenField")
+                    if authProbe?.mode == .token {
+                        SecureField("Session token", text: $token)
+                            .textContentType(.password)
+                            .textInputAutocapitalization(.never)
+                            .autocorrectionDisabled()
+                            .submitLabel(.go)
+                            .focused($focusedField, equals: .token)
+                            .onSubmit { if canConnect { connect() } }
+                            .focusRing(active: focusedField == .token, color: theme.composerRing)
+                            .accessibilityLabel("Session token")
+                            .accessibilityIdentifier("sessionTokenField")
+                    }
                 } header: {
                     Text("Gateway")
                 } footer: {
@@ -136,7 +163,13 @@ struct ConnectionSetupView: View {
                             Text(errorText)
                                 .foregroundStyle(theme.destructive)
                         } else {
-                            Text("On the gateway host, run \u{201C}hermes mobile-pair\u{201D} to print the server URL and token (or scan its QR from the welcome screen). \u{201C}hermes token\u{201D} prints the token alone.")
+                            if authProbe?.mode == .session {
+                                Text("This gateway uses its stock sign-in page. Hermes never stores your username or password.")
+                            } else if authProbe?.mode == .token {
+                                Text("This gateway uses a session token. Run \u{201C}hermes token\u{201D} on the gateway host.")
+                            } else {
+                                Text("Hermes will check the gateway before asking you to sign in.")
+                            }
                         }
                         Link(destination: HelpLinks.setupGuide) {
                             Text("Don\u{2019}t have a gateway yet? Set one up \u{2192}")
@@ -151,11 +184,11 @@ struct ConnectionSetupView: View {
                     Button(action: connect) {
                         HStack {
                             Spacer()
-                            if isConnecting {
+                            if isConnecting || isProbing {
                                 ProgressView()
                                     .tint(theme.midground.contrastingForeground)
                             } else {
-                                Text("Connect")
+                                Text(connectLabel)
                                     .fontWeight(.semibold)
                             }
                             Spacer()
@@ -173,7 +206,7 @@ struct ConnectionSetupView: View {
                     // When the spinner replaces the button label, VoiceOver would
                     // read a bare ProgressView with no context. Provide an explicit
                     // label that reflects the current state.
-                    .accessibilityLabel(isConnecting ? "Connecting" : "Connect")
+                    .accessibilityLabel(connectLabel)
                 }
             }
             .scrollContentBackground(.hidden)
@@ -193,7 +226,7 @@ struct ConnectionSetupView: View {
             // `pendingPair` alert in RootView (QR/deep-link re-pair path).
             .alert("Replace current connection?", isPresented: $showingReplaceConfirmation) {
                 Button("Disconnect & Connect", role: .destructive) {
-                    performConnect()
+                    performSelectedConnection()
                 }
                 Button("Cancel", role: .cancel) { }
             } message: {
@@ -204,21 +237,66 @@ struct ConnectionSetupView: View {
                     Text("This will disconnect your current session and pair with the new gateway.")
                 }
             }
+            .sheet(isPresented: $showingGatewayLogin) {
+                if let gatewayURL {
+                    GatewayWebLoginView(
+                        baseURL: gatewayURL,
+                        kind: .gateway(interactive: true)
+                    ) {
+                        completeSessionConnection()
+                    }
+                }
+            }
     }
 
     private func connect() {
         guard canConnect else { return }
+        guard authProbe != nil else {
+            probeGateway()
+            return
+        }
         // If already paired to a gateway, require explicit confirmation before
         // proceeding — a silent swap is surprising and can drop an active session.
         if connection.hasConnected {
             showingReplaceConfirmation = true
             return
         }
-        performConnect()
+        performSelectedConnection()
     }
 
-    /// Performs the actual `configure` call after any confirmation gate has passed.
-    private func performConnect() {
+    private func probeGateway() {
+        focusedField = nil
+        isProbing = true
+        errorText = nil
+        Task {
+            do {
+                authProbe = try await connection.probeAuthentication(urlString: urlString)
+                if authProbe?.mode == .token {
+                    focusedField = .token
+                }
+            } catch {
+                errorText = (error as? LocalizedError)?.errorDescription
+                    ?? error.localizedDescription
+                tailscaleHint = TailscaleHint.make(
+                    serverURLString: urlString,
+                    failureReason: errorText
+                )
+            }
+            isProbing = false
+        }
+    }
+
+    private func performSelectedConnection() {
+        guard let authProbe else { return }
+        switch authProbe.mode {
+        case .token:
+            performTokenConnection()
+        case .session:
+            showingGatewayLogin = true
+        }
+    }
+
+    private func performTokenConnection() {
         guard canConnect else { return }
         focusedField = nil
         isConnecting = true
@@ -229,6 +307,19 @@ struct ConnectionSetupView: View {
             errorText = failure
             // On failure to a tailnet host, surface the "Is Tailscale connected?"
             // hint; clear it on success or for non-tailnet hosts.
+            tailscaleHint = failure == nil
+                ? nil
+                : TailscaleHint.make(serverURLString: urlString, failureReason: failure)
+        }
+    }
+
+    private func completeSessionConnection() {
+        isConnecting = true
+        errorText = nil
+        Task {
+            let failure = await connection.configureAuthenticatedSession(urlString: urlString)
+            isConnecting = false
+            errorText = failure
             tailscaleHint = failure == nil
                 ? nil
                 : TailscaleHint.make(serverURLString: urlString, failureReason: failure)

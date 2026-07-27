@@ -413,7 +413,7 @@ final class PushRegistrar {
         )
     }
 
-    /// The current gateway base URL + session token + REST path family, or
+    /// The current gateway base URL + REST authentication + path family, or
     /// `nil` when unconfigured. Reused by the notification-action backend
     /// (which needs the same loopback URL + Keychain token to respond to
     /// approvals and register Live-Activity tokens) so there's a single
@@ -434,10 +434,14 @@ final class PushRegistrar {
         if let envURL = env["HERMES_URL"], envURL == urlString,
            let envToken = env["HERMES_TOKEN"], !envToken.isEmpty {
             token = envToken
+        } else if GatewayAuthMode.saved() == .session {
+            // Cookie-authenticated Desktop path. Empty means "do not add the
+            // token header"; URLSession attaches the persisted gateway cookie.
+            token = ""
         } else {
             token = KeychainService.loadToken(server: urlString)
         }
-        guard let token, !token.isEmpty else { return nil }
+        guard let token else { return nil }
         let pathStyle: APIPathStyle =
             connection.capabilities.pluginMount == .available
             ? .plugin
@@ -503,9 +507,11 @@ struct PushTokenPoster: Sendable {
         self.token = token
         self.pathStyle = pathStyle
         self.deviceID = deviceID
-        let config = URLSessionConfiguration.ephemeral
+        let config = URLSessionConfiguration.default
         config.timeoutIntervalForRequest = Self.timeout
         config.waitsForConnectivity = false
+        config.httpCookieStorage = .shared
+        config.httpShouldSetCookies = true
         self.session = URLSession(configuration: config)
     }
 
@@ -630,9 +636,12 @@ struct PushTokenPoster: Sendable {
             timeoutInterval: Self.timeout
         )
         request.httpMethod = method
-        // Loopback Host override — the gateway validates Host against its bind.
-        request.setValue("127.0.0.1", forHTTPHeaderField: "Host")
-        request.setValue(token, forHTTPHeaderField: "X-Hermes-Session-Token")
+        if let host = WSURLBuilder.effectiveHost(for: baseURL, mode: .remoteURL) {
+            request.setValue(host, forHTTPHeaderField: "Host")
+        }
+        if !token.isEmpty {
+            request.setValue(token, forHTTPHeaderField: "X-Hermes-Session-Token")
+        }
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.setValue("application/json", forHTTPHeaderField: "Accept")
 

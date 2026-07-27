@@ -1,14 +1,7 @@
 import XCTest
 @testable import HermesMobile
 
-/// Unit tests for ``WSURLBuilder`` — Inc 2 Host-header derivation.
-///
-/// Spec (CONTRACT-CONNECTION-MODES.md §Inc2):
-///   - Non-loopback `.remoteURL` target → NO Host override (URLSession sends the
-///     real host so the `0.0.0.0`-bound gateway accepts it).
-///   - Loopback target or `.sharedDashboard`/`.localDesktop` mode → Host pinned
-///     to `127.0.0.1` (the Tailscale-Serve→loopback contract, unchanged).
-///   - Regression: the Serve/loopback path must STILL pin loopback after Inc 2.
+/// Stock-gateway URL and authentication request tests.
 final class WSURLBuilderTests: XCTestCase {
 
     // MARK: - Helpers
@@ -31,22 +24,16 @@ final class WSURLBuilderTests: XCTestCase {
 
     // MARK: - effectiveHost
 
-    func testEffectiveHost_sharedDashboard_alwaysLoopback() {
+    func testEffectiveHost_sharedDashboard_remoteTargetPinsLoopback() {
         let nonLoopback = URL(string: "http://192.168.1.100:9123")!
         let host = WSURLBuilder.effectiveHost(for: nonLoopback, mode: .sharedDashboard)
-        XCTAssertEqual(
-            host, "127.0.0.1",
-            ".sharedDashboard must always pin loopback regardless of the target IP"
-        )
+        XCTAssertEqual(host, "127.0.0.1")
     }
 
-    func testEffectiveHost_localDesktop_alwaysLoopback() {
+    func testEffectiveHost_localDesktop_remoteTargetPinsLoopback() {
         let nonLoopback = URL(string: "http://10.0.0.5:9123")!
         let host = WSURLBuilder.effectiveHost(for: nonLoopback, mode: .localDesktop)
-        XCTAssertEqual(
-            host, "127.0.0.1",
-            ".localDesktop must always pin loopback (Tailscale-Serve path in Inc 1/2)"
-        )
+        XCTAssertEqual(host, "127.0.0.1")
     }
 
     func testEffectiveHost_remoteURL_loopbackTarget_pinsLoopback() {
@@ -89,10 +76,7 @@ final class WSURLBuilderTests: XCTestCase {
 
     func testWsRequest_sharedDashboard_nonLoopback_hasLoopbackHost() {
         let req = wsRequest(urlString: "http://192.168.1.42:9123", mode: .sharedDashboard)
-        XCTAssertEqual(
-            req.value(forHTTPHeaderField: "Host"), "127.0.0.1",
-            "WS request in .sharedDashboard mode must carry loopback Host"
-        )
+        XCTAssertEqual(req.value(forHTTPHeaderField: "Host"), "127.0.0.1")
     }
 
     func testWsRequest_remoteURL_nonLoopback_hasRealHost() {
@@ -116,14 +100,36 @@ final class WSURLBuilderTests: XCTestCase {
         )
     }
 
+    func testWsTicketRequest_usesTicketWithoutToken() {
+        let request = WSURLBuilder.wsTicketRequest(
+            baseURL: URL(string: "https://gateway.example")!,
+            ticket: "single-use",
+            mode: .remoteURL
+        )
+        let items = URLComponents(
+            url: request.url!,
+            resolvingAgainstBaseURL: false
+        )?.queryItems
+        XCTAssertEqual(items?.first(where: { $0.name == "ticket" })?.value, "single-use")
+        XCTAssertNil(items?.first(where: { $0.name == "token" }))
+        XCTAssertEqual(request.url?.path, "/api/ws")
+        XCTAssertEqual(request.url?.scheme, "wss")
+    }
+
+    func testEffectiveHost_cloudUsesRemoteHost() {
+        XCTAssertNil(
+            WSURLBuilder.effectiveHost(
+                for: URL(string: "https://agent.hermes.example")!,
+                mode: .hermesCloud
+            )
+        )
+    }
+
     // MARK: - restRequest Host header
 
     func testRestRequest_sharedDashboard_nonLoopback_hasLoopbackHost() {
         let req = restRequest(urlString: "http://192.168.1.42:9123", mode: .sharedDashboard)
-        XCTAssertEqual(
-            req.value(forHTTPHeaderField: "Host"), "127.0.0.1",
-            "REST request in .sharedDashboard mode must carry loopback Host"
-        )
+        XCTAssertEqual(req.value(forHTTPHeaderField: "Host"), "127.0.0.1")
     }
 
     func testRestRequest_remoteURL_nonLoopback_omitsLoopbackHost() {
@@ -170,21 +176,19 @@ final class WSURLBuilderTests: XCTestCase {
 
     // MARK: - Regression: Serve/loopback path still pins loopback
 
-    func testRegression_serveLoopbackPath_stillPinsLoopback_ws() {
-        // This is the EXISTING shared-dashboard flow: a Tailscale-Serve URL
-        // resolving to localhost. Must still pin loopback after Inc 2.
+    func testRegression_explicitLoopbackPath_stillPinsLoopback_ws() {
         let req = wsRequest(urlString: "http://127.0.0.1:8080", mode: .sharedDashboard)
         XCTAssertEqual(
             req.value(forHTTPHeaderField: "Host"), "127.0.0.1",
-            "REGRESSION: shared-dashboard WS request must pin loopback Host"
+            "An explicit loopback WS URL must pin loopback Host"
         )
     }
 
-    func testRegression_serveLoopbackPath_stillPinsLoopback_rest() {
+    func testRegression_explicitLoopbackPath_stillPinsLoopback_rest() {
         let req = restRequest(urlString: "http://127.0.0.1:8080", mode: .sharedDashboard)
         XCTAssertEqual(
             req.value(forHTTPHeaderField: "Host"), "127.0.0.1",
-            "REGRESSION: shared-dashboard REST request must pin loopback Host"
+            "An explicit loopback REST URL must pin loopback Host"
         )
     }
 

@@ -190,7 +190,7 @@ class TestResolveMagicdnsHostname:
 
 
 class TestDetectServeUrl:
-    def test_selects_relay_front_door_from_production_shaped_status(self, monkeypatch):
+    def test_selects_gateway_front_door_from_production_shaped_status(self, monkeypatch):
         monkeypatch.setattr(
             mobile_pair,
             "_tailscale_serve_status",
@@ -207,8 +207,8 @@ class TestDetectServeUrl:
         )
 
         assert (
-            mobile_pair._detect_serve_url(mobile_pair.DEFAULT_RELAY_PORT)
-            == "https://mymac.ts.net:9445"
+            mobile_pair._detect_serve_url(mobile_pair.DEFAULT_DASHBOARD_PORT)
+            == "https://mymac.ts.net:9443"
         )
 
     def test_does_not_return_unrelated_first_serve_entry(self, monkeypatch):
@@ -224,7 +224,7 @@ class TestDetectServeUrl:
             },
         )
 
-        assert mobile_pair._detect_serve_url(mobile_pair.DEFAULT_RELAY_PORT) is None
+        assert mobile_pair._detect_serve_url(mobile_pair.DEFAULT_DASHBOARD_PORT) is None
 
 
 # ---------------------------------------------------------------------------
@@ -235,17 +235,17 @@ class TestDetectServeUrl:
 class TestDetectPairAddress:
     """Spec-required tests for ``_detect_pair_address()``.
 
-    Case (i):  Relay Serve front door available → stable address.
+    Case (i):  Gateway Serve front door available → stable address.
     Case (ii): No tailnet / only loopback → ephemeral fallback.
     Case (iii): Malformed tailscale output → clean fallback, no crash.
     """
 
     # ------------------------------------------------------------------
-    # Case (i): Tailscale Serve exposes the phone-facing relay
+    # Case (i): Tailscale Serve exposes the stock gateway
     # ------------------------------------------------------------------
 
-    def test_case_i_relay_serve_url_used_and_stability_is_stable(self, monkeypatch):
-        """The relay's real HTTPS front door wins over a synthesized URL."""
+    def test_case_i_gateway_serve_url_used_and_stability_is_stable(self, monkeypatch):
+        """The gateway's real HTTPS front door wins over a synthesized URL."""
         monkeypatch.setattr(
             mobile_pair,
             "_resolve_magicdns_hostname",
@@ -255,20 +255,16 @@ class TestDetectPairAddress:
         monkeypatch.setattr(
             mobile_pair,
             "_detect_serve_url",
-            lambda port: (
-                "https://mymac.tailnet.ts.net:9445"
-                if port == mobile_pair.DEFAULT_RELAY_PORT
-                else None
-            ),
+            lambda port: "https://mymac.tailnet.ts.net:9443",
         )
 
         result = mobile_pair._detect_pair_address()
 
-        assert result.url == "https://mymac.tailnet.ts.net:9445"
+        assert result.url == "https://mymac.tailnet.ts.net:9443"
         assert result.address_stability == mobile_pair.STABILITY_STABLE
-        assert result.source == "tailscale serve relay"
+        assert result.source == "tailscale serve gateway"
 
-    def test_case_i_relay_serve_wins_over_magicdns_and_desktop(self, monkeypatch):
+    def test_case_i_gateway_serve_wins_over_magicdns_and_desktop(self, monkeypatch):
         magicdns_called = {"n": 0}
         desktop_called = {"n": 0}
 
@@ -285,20 +281,20 @@ class TestDetectPairAddress:
         monkeypatch.setattr(
             mobile_pair,
             "_detect_serve_url",
-            lambda port: "https://mymac.tailnet.ts.net:9445",
+            lambda port: "https://mymac.tailnet.ts.net:9443",
         )
 
         result = mobile_pair._detect_pair_address()
 
-        assert result.url == "https://mymac.tailnet.ts.net:9445"
+        assert result.url == "https://mymac.tailnet.ts.net:9443"
         assert magicdns_called["n"] == 0
         assert desktop_called["n"] == 0
 
-    def test_case_i_relay_serve_url_embedded_in_pair_link(self, monkeypatch):
+    def test_case_i_gateway_serve_url_embedded_in_pair_link(self, monkeypatch):
         monkeypatch.setattr(
             mobile_pair,
             "_detect_serve_url",
-            lambda port: "https://mymac.tailnet.ts.net:9445",
+            lambda port: "https://mymac.tailnet.ts.net:9443",
         )
 
         result = mobile_pair._detect_pair_address()
@@ -306,7 +302,7 @@ class TestDetectPairAddress:
             result.url, "TOK", address_stability=result.address_stability
         )
         q = parse_qs(urlparse(link).query)
-        assert q["url"] == ["https://mymac.tailnet.ts.net:9445"]
+        assert q["url"] == ["https://mymac.tailnet.ts.net:9443"]
         assert q["addr_stability"] == ["stable"]
 
     # ------------------------------------------------------------------

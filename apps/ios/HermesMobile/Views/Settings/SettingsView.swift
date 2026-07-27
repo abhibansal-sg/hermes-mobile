@@ -73,7 +73,7 @@ import UserNotifications
 /// @-mentions), **Agent & Panels** (Usage, Automations, Skills, Learning
 /// Journey, Artifacts, Webhooks), **Advanced** (approval-bypass escalation,
 /// Gateway Status, System Logs, Share debug report, the
-/// experimental relay-transport toggle), and **About**. Every row from the
+/// Gateway Status and System Logs), and **About**. Every row from the
 /// prior flat layout remains reachable — only headers, grouping, and a few
 /// jargon-y labels changed; no bindings or behavior moved. Appearance stays
 /// second (right after Account) deliberately: it is the row a pre-existing
@@ -130,11 +130,6 @@ struct SettingsView: View {
     @AppStorage(DefaultsKeys.displayName) private var displayName = ""
     /// Whether typing `@` in the composer opens the file-mention autocomplete.
     @AppStorage(DefaultsKeys.mentionAutocompleteEnabled) private var mentionAutocompleteEnabled = true
-
-    // MARK: Transparent proxy
-
-    /// Optional proxy address. Empty uses the paired gateway address directly.
-    @AppStorage(DefaultsKeys.relayURLOverride) private var relayURLOverride = ""
 
     // MARK: Per-event push prefs (F2-A / A4)
 
@@ -656,25 +651,6 @@ struct SettingsView: View {
         }
     }
 
-    // MARK: - Transparent proxy
-
-    @ViewBuilder
-    private var experimentalTransportSection: some View {
-        Section {
-            TextField("https://<tailnet-host>:8788", text: $relayURLOverride)
-                .textInputAutocapitalization(.never)
-                .autocorrectionDisabled()
-                .keyboardType(.URL)
-                .foregroundStyle(theme.fg)
-                .listRowBackground(theme.card)
-                .accessibilityIdentifier("settingsRelayTransportURLField")
-        } header: {
-            Text("Gateway proxy")
-        } footer: {
-            Text("Optional. Enter the relay address used for both gateway WebSocket and HTTP traffic, then reconnect. Leave blank to use the paired gateway address.")
-        }
-    }
-
     // MARK: - Agent & Panels (control panels needing a live control client)
 
     @ViewBuilder
@@ -997,10 +973,6 @@ struct SettingsView: View {
             Text("Advanced")
         }
 
-        // The experimental relay-transport toggle keeps its own header/footer
-        // (it is a distinct, clearly-labeled "Experimental" sub-block) and
-        // works exactly as before — only its position moved, into Advanced.
-        experimentalTransportSection
     }
 
     // MARK: - About (version inline + push)

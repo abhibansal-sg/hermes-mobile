@@ -6,10 +6,9 @@ Usage:
 
 What it does
 ------------
-1. Resolves the public mobile URL by reading the local Tailscale Serve config
-   (``tailscale serve status --json``): it prefers the HTTPS proxy whose
-   handler forwards to the phone-facing relay, then uses the existing gateway
-   fallbacks.
+1. Resolves the public gateway URL by reading the local Tailscale Serve config
+   (``tailscale serve status --json``): it selects the HTTPS proxy whose
+   handler forwards to the stock dashboard/gateway.
 2. Reads the dashboard session token from ``<HERMES_HOME>/dashboard.token``
    (overridable via ``HERMES_DASHBOARD_SESSION_TOKEN``).
 3. Mints a revocable per-device token by default, then builds the deep link
@@ -92,7 +91,6 @@ class _PairAddress:
 # `dashboard` subcommand defaults --port to 9119). A Tailscale Serve handler
 # whose Proxy targets this port is the dashboard's public HTTPS front door.
 DEFAULT_DASHBOARD_PORT = 9119
-DEFAULT_RELAY_PORT = 8788
 
 # The iOS custom URL scheme + host the app routes on (mirrors
 # HermesURLRouter.scheme / the "pair" route in the Swift client).
@@ -635,31 +633,28 @@ def _detect_pair_address(port: int = DEFAULT_DASHBOARD_PORT) -> "_PairAddress":
 
     Priority (first success wins)
     --------------------------------
-    1. **Tailscale Serve relay front door** (``stable``) — the HTTPS handler
-       that proxies to the standard phone-facing relay port.
+    1. **Tailscale Serve gateway front door** (``stable``) — the HTTPS handler
+       that proxies to the stock dashboard/gateway port.
     2. **Tailscale MagicDNS hostname** (``stable``) — ``tailscale status --json``
        ``Self.DNSName``.  Reuses the same trusted Tailscale binary and JSON
        parsing already used by ``_tailscale_serve_status()``; no new dependency.
     3. **Desktop-owned gateway** (stability depends on source) — reads
        ``connection.json`` as in Increment 3a.  A ``remote`` URL is ``stable``
        (explicit configured address); a loopback probe result is ``ephemeral``.
-    4. **Tailscale Serve HTTPS front door** (``stable``) — existing Serve path
-       (``tailscale serve status --json``); Serve publishes over the MagicDNS
-       hostname so its result is stable.
-    5. **Loopback ephemeral fallback** (``ephemeral``) — ``None``-returning
+    4. **Loopback ephemeral fallback** (``ephemeral``) — ``None``-returning
        fallback: returns a loopback URL on the default port, marked ephemeral.
 
     This function is the increment-4a entry point.  ``_detect_dashboard_url()``
     is kept UNCHANGED (returns ``Optional[str]``) so existing callers and tests
     are unaffected.
     """
-    # --- Priority 1: phone-facing relay front door ---
-    relay_url = _detect_serve_url(DEFAULT_RELAY_PORT)
-    if relay_url:
+    # --- Priority 1: stock gateway front door ---
+    serve_url = _detect_serve_url(port)
+    if serve_url:
         return _PairAddress(
-            url=relay_url,
+            url=serve_url,
             address_stability=STABILITY_STABLE,
-            source="tailscale serve relay",
+            source="tailscale serve gateway",
         )
 
     # --- Priority 2: MagicDNS hostname ---
@@ -686,17 +681,7 @@ def _detect_pair_address(port: int = DEFAULT_DASHBOARD_PORT) -> "_PairAddress":
             source=f"connection.json ({desktop.source})",
         )
 
-    # --- Priority 4: Tailscale Serve HTTPS front door ---
-    # Use _detect_serve_url() directly so we don't re-run Desktop discovery.
-    serve_url = _detect_serve_url(port)
-    if serve_url:
-        return _PairAddress(
-            url=serve_url,
-            address_stability=STABILITY_STABLE,
-            source="tailscale serve",
-        )
-
-    # --- Priority 5: Ephemeral loopback fallback ---
+    # --- Priority 4: Ephemeral loopback fallback ---
     return _PairAddress(
         url=f"http://127.0.0.1:{port}",
         address_stability=STABILITY_EPHEMERAL,

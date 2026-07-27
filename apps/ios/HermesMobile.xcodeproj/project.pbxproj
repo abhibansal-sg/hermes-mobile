@@ -197,6 +197,7 @@
 		7B5BF26785CFA4741743C94B /* ChatStoreF4ATests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6AED0A12B048B9FFDDAEF815 /* ChatStoreF4ATests.swift */; };
 		7B8140F779118190E6591AAD /* WorkRepository.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6E96D188E143CDC9D384C6BF /* WorkRepository.swift */; };
 		7BB35989069A769F80A8412C /* WorkingDirectory.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0FB2B9112BE331DC9936D694 /* WorkingDirectory.swift */; };
+		7CDA4221B771053A9980784C /* GatewayWebLoginView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A195F1B839BA179D2C889F89 /* GatewayWebLoginView.swift */; };
 		7D721541C7EA25D790505B9C /* AutoUpgradeGuardLatchTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = FC9C27DE26B8F86D42C41ADC /* AutoUpgradeGuardLatchTests.swift */; };
 		7F5D97CEBF633C917292FB2C /* ConnectionMode.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0CC10F89B2FA3A66A6A5977C /* ConnectionMode.swift */; };
 		7F7423F461E7EF8BA2DB0ED6 /* WorkRepositoryTestSupport.swift in Sources */ = {isa = PBXBuildFile; fileRef = DA888FF14E9C336AE9CC9046 /* WorkRepositoryTestSupport.swift */; };
@@ -244,6 +245,7 @@
 		A0580A5DDE956E58669DAE6E /* GRDB in Frameworks */ = {isa = PBXBuildFile; productRef = F4626C6249AB0179602E1A85 /* GRDB */; };
 		A117120024F9527BF9B4FF00 /* WorkRepositoryLeaseTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = C519677EC4A864D666F994E9 /* WorkRepositoryLeaseTests.swift */; };
 		A12D4D30BBC90E1D34D82856 /* TailscaleHint.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2773490F4AAB597813CD38ED /* TailscaleHint.swift */; };
+		A1A484444345884956F22716 /* HermesCloudSetupView.swift in Sources */ = {isa = PBXBuildFile; fileRef = BA75333497C487A50F33827F /* HermesCloudSetupView.swift */; };
 		A2515EC12E8908E570E8CB97 /* HydrationLoadingView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 770AB1AEE920970C238FC68B /* HydrationLoadingView.swift */; };
 		A2943D1F2A04330B46D480B0 /* ConnectionSetupView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 593C32B854B0F50330A70BF8 /* ConnectionSetupView.swift */; };
 		A3D4B08636BA8BCB9B57D5D1 /* GRDB in Frameworks */ = {isa = PBXBuildFile; productRef = 3C4F900E6E60934A27EA3F19 /* GRDB */; };
@@ -256,6 +258,7 @@
 		A7D750D48A76745831A30416 /* FileViewerView.swift in Sources */ = {isa = PBXBuildFile; fileRef = DDD02A71A20A460F3F659C3F /* FileViewerView.swift */; };
 		A7F2D1D43111EF5D7F2B6981 /* HermesTurnAttributes.swift in Sources */ = {isa = PBXBuildFile; fileRef = 389E9BFD5D355E9F4ECDDD8A /* HermesTurnAttributes.swift */; };
 		A9E3D70713678ED33A667345 /* TransferURLProtocolTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = CD9BA24C2FFFD5375F7683AE /* TransferURLProtocolTests.swift */; };
+		AA0651C77A10E2C56DA51FFC /* GatewayAuthenticationTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 743DCD8C724D17C4018BC1F7 /* GatewayAuthenticationTests.swift */; };
 		AA1F52005EE7E017C1C68020 /* AttachmentStoreFileTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 90BBEB6F11FCB913411B78D8 /* AttachmentStoreFileTests.swift */; };
 		AB56243E038D94D8428A467F /* RichURLEmbedDetector.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6DA42D7D5AF43BF2719120FA /* RichURLEmbedDetector.swift */; };
 		AB5DDBC15EB15FE1BBF332B3 /* WelcomeView.swift in Sources */ = {isa = PBXBuildFile; fileRef = BD46373BB6BCAF54435E77F3 /* WelcomeView.swift */; };
@@ -607,6 +610,7 @@
 		73F68A4F83ED6589FDA3C69E /* PushDeviceIdFallbackTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PushDeviceIdFallbackTests.swift; sourceTree = "<group>"; };
 		73FD52047156F6657E537A20 /* ConnectTrace.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ConnectTrace.swift; sourceTree = "<group>"; };
 		7415F1022EC37DEE884D4629 /* DevicesView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DevicesView.swift; sourceTree = "<group>"; };
+		743DCD8C724D17C4018BC1F7 /* GatewayAuthenticationTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GatewayAuthenticationTests.swift; sourceTree = "<group>"; };
 		754F5BA4B9A747C03880905A /* WorkRepositoryMacTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = WorkRepositoryMacTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		76A75917E8436E51B6A1A7FE /* LiveActivity.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LiveActivity.swift; sourceTree = "<group>"; };
 		76B8E4AB9DC64DCB277679D7 /* FileMarkdownBodyView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FileMarkdownBodyView.swift; sourceTree = "<group>"; };
@@ -664,6 +668,7 @@
 		9EE4E918B241C8300CE2495F /* ConnectionStatusBanner.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ConnectionStatusBanner.swift; sourceTree = "<group>"; };
 		9F71339DD287CB3578CF78E7 /* GatewayEvent.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GatewayEvent.swift; sourceTree = "<group>"; };
 		A07CAFC0C98646198A9CAF3B /* QueueReorderTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = QueueReorderTests.swift; sourceTree = "<group>"; };
+		A195F1B839BA179D2C889F89 /* GatewayWebLoginView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GatewayWebLoginView.swift; sourceTree = "<group>"; };
 		A2F4CBCA9ADD167081BFA1AA /* VoiceConversationControllerTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VoiceConversationControllerTests.swift; sourceTree = "<group>"; };
 		A340CBE22C7B505DEB9EAB30 /* BatchHTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BatchHTests.swift; sourceTree = "<group>"; };
 		A3FA998F08661C5AF08D0EBD /* KilledAppInboxReconciliationValidation.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KilledAppInboxReconciliationValidation.swift; sourceTree = "<group>"; };
@@ -708,6 +713,7 @@
 		B9B3A5A512228E30192F9A46 /* ModelVisibility.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ModelVisibility.swift; sourceTree = "<group>"; };
 		BA441E7FEC2DFE3614EEBDB7 /* RawErrorSanitizer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RawErrorSanitizer.swift; sourceTree = "<group>"; };
 		BA4896DDBA7CF70C375E4561 /* FileViewerExportTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FileViewerExportTests.swift; sourceTree = "<group>"; };
+		BA75333497C487A50F33827F /* HermesCloudSetupView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HermesCloudSetupView.swift; sourceTree = "<group>"; };
 		BD46373BB6BCAF54435E77F3 /* WelcomeView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WelcomeView.swift; sourceTree = "<group>"; };
 		BD558422C711DA2EE477416E /* ModelPresetTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ModelPresetTests.swift; sourceTree = "<group>"; };
 		BDF7565021D98C23C8E221C3 /* WorkingSectionView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkingSectionView.swift; sourceTree = "<group>"; };
@@ -1226,6 +1232,8 @@
 			isa = PBXGroup;
 			children = (
 				DDD67353734396D293D8AF13 /* BrandAppIcon.swift */,
+				A195F1B839BA179D2C889F89 /* GatewayWebLoginView.swift */,
+				BA75333497C487A50F33827F /* HermesCloudSetupView.swift */,
 				FA40DF869418B593356B8F5F /* ManualTokenPromptView.swift */,
 				81DC25B8CA2D9C02AD703712 /* QRScannerView.swift */,
 				BD46373BB6BCAF54435E77F3 /* WelcomeView.swift */,
@@ -1294,6 +1302,7 @@
 				25CD4BCFC2986F455FFF84DF /* FileViewerMarkdownTests.swift */,
 				DEDC0F7E139A7013182E1248 /* FileViewerModeTests.swift */,
 				B53D03C61746CA48FDD7B53D /* GamboardL03Tests.swift */,
+				743DCD8C724D17C4018BC1F7 /* GatewayAuthenticationTests.swift */,
 				C68E72D6495C064DA6BD4534 /* GatewayControlTests.swift */,
 				DE603ED5026151CFBF2F48C3 /* GatewayEventTests.swift */,
 				20D320FFC594DB49727B2728 /* GatewayForgetCoordinatorTests.swift */,
@@ -1953,6 +1962,7 @@
 				7877664DD876AF1320717A4D /* FileViewerMarkdownTests.swift in Sources */,
 				EDA792A1A46E4B69B9D0363B /* FileViewerModeTests.swift in Sources */,
 				82EAFBE8ADF099C70D5CB431 /* GamboardL03Tests.swift in Sources */,
+				AA0651C77A10E2C56DA51FFC /* GatewayAuthenticationTests.swift in Sources */,
 				ECD5D0D59C5D22F3792891EC /* GatewayControlTests.swift in Sources */,
 				88C0481109DF7ACFF08AF996 /* GatewayEventTests.swift in Sources */,
 				5336CA51D8125EF3EEC0B0D6 /* GatewayForgetCoordinatorTests.swift in Sources */,
@@ -2109,8 +2119,10 @@
 				11CC00C5E9D4EBB5319915FF /* GatewayEvent.swift in Sources */,
 				1AE73FED337E66196610BB86 /* GatewayForgetCoordinator.swift in Sources */,
 				9789BF602C6B31308B21F74B /* GatewayStatusView.swift in Sources */,
+				7CDA4221B771053A9980784C /* GatewayWebLoginView.swift in Sources */,
 				5675C935E246127C3E340670 /* HelpLinks.swift in Sources */,
 				4A4E4B679BB380E73D89252A /* HermesAppIntents.swift in Sources */,
+				A1A484444345884956F22716 /* HermesCloudSetupView.swift in Sources */,
 				0B3F2A34BD64AFF0701D3591 /* HermesGatewayClient+LearningJourney.swift in Sources */,
 				B5917650986E361D4991F328 /* HermesGatewayClient+SlashCommands.swift in Sources */,
 				F105D97CCADAD7AEB38481DB /* HermesGatewayClient.swift in Sources */,

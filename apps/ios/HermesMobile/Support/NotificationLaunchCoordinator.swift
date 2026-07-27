@@ -10,6 +10,7 @@ struct PersistedNotificationEndpointResolver {
         UserDefaults.standard.string(forKey: DefaultsKeys.serverURL)
     }
     var loadToken: (String) -> String? = { KeychainService.loadToken(server: $0) }
+    var loadAuthMode: () -> GatewayAuthMode = { .saved() }
     var loadPathStyle: (String) -> APIPathStyle = {
         ServerCapabilities.cachedPathStyle(serverURL: $0)
     }
@@ -19,9 +20,14 @@ struct PersistedNotificationEndpointResolver {
               !rawURL.isEmpty,
               let url = URL(string: rawURL),
               url.scheme != nil,
-              url.host != nil,
-              let token = loadToken(rawURL),
-              !token.isEmpty else { return nil }
+              url.host != nil else { return nil }
+        let token: String
+        if loadAuthMode() == .session {
+            token = ""
+        } else {
+            guard let savedToken = loadToken(rawURL), !savedToken.isEmpty else { return nil }
+            token = savedToken
+        }
         return NotificationService.ActionEndpoint(
             baseURL: url, token: token, pathStyle: loadPathStyle(rawURL)
         )

@@ -2,19 +2,10 @@ import Foundation
 
 /// Builds the `URLRequest`s that talk to the hermes gateway.
 ///
-/// Two transports share the same host: the WebSocket upgrade (JSON-RPC stream)
-/// and the REST API. Both must override the `Host` header to `127.0.0.1` — the
-/// server validates `Host` against its loopback bind, and a fronting proxy
-/// (e.g. Tailscale Serve) would otherwise leak the public hostname and be
-/// rejected. REST additionally carries the session token in a custom header.
-///
-/// **Inc 2 — Host-header derivation:**
-/// The `Host` override is mode-aware. For `.sharedDashboard` and `.localDesktop`
-/// modes (and any loopback target) the header stays pinned to `127.0.0.1`,
-/// preserving the Tailscale Serve→loopback contract. For `.remoteURL` pointing
-/// at a non-loopback host (e.g. a `0.0.0.0`-bound gateway on a LAN/remote
-/// machine) the override is omitted — URLSession then sends the real host from
-/// the URL, which the gateway accepts on its `0.0.0.0` bind.
+/// Builds stock-gateway REST and WebSocket requests. Like Desktop, direct
+/// remote requests keep the URL's real Host. Local Desktop/shared-dashboard
+/// entry points may be fronted by Tailscale Serve and therefore retain the
+/// gateway's loopback Host.
 enum WSURLBuilder {
     /// Loopback host the gateway expects in the `Host` header when
     /// Tailscale Serve is in the path.
@@ -32,11 +23,40 @@ enum WSURLBuilder {
         token: String,
         mode: ConnectionMode = .remoteURL
     ) -> URLRequest {
+        authenticatedWSRequest(
+            baseURL: baseURL,
+            queryName: "token",
+            credential: token,
+            mode: mode
+        )
+    }
+
+    /// Build Desktop's gated-gateway WebSocket request. `ticket` is short-lived
+    /// and single-use; the caller must mint a new one before every invocation.
+    static func wsTicketRequest(
+        baseURL: URL,
+        ticket: String,
+        mode: ConnectionMode = .remoteURL
+    ) -> URLRequest {
+        authenticatedWSRequest(
+            baseURL: baseURL,
+            queryName: "ticket",
+            credential: ticket,
+            mode: mode
+        )
+    }
+
+    private static func authenticatedWSRequest(
+        baseURL: URL,
+        queryName: String,
+        credential: String,
+        mode: ConnectionMode
+    ) -> URLRequest {
         var components = URLComponents(url: baseURL, resolvingAgainstBaseURL: false)
             ?? URLComponents()
         components.scheme = webSocketScheme(for: baseURL.scheme)
         components.path = joinedPath(base: baseURL.path, suffix: "/api/ws")
-        components.queryItems = [URLQueryItem(name: "token", value: token)]
+        components.queryItems = [URLQueryItem(name: queryName, value: credential)]
 
         // Fall back to a string-built URL if components somehow can't resolve;
         // in practice `components.url` is always non-nil for a valid base.
@@ -72,23 +92,20 @@ enum WSURLBuilder {
 
     // MARK: - Host-header derivation (Inc 2)
 
-    /// Return the `Host` header value to use for `baseURL` under `mode`, or `nil`
-    /// to omit the override (URLSession then sends the URL's own host).
+    /// Return the Host expected by the selected topology.
     ///
-    /// Rules:
-    /// - `.sharedDashboard`: always loopback (Tailscale Serve fronts it).
-    /// - `.localDesktop`: always loopback (same Serve path in Inc 1/2; Inc 3
-    ///   re-routes to the real LAN address but that is a future extension).
-    /// - `.remoteURL` with a loopback target (`127.0.0.1` or `localhost`): pin
-    ///   loopback — the user pointed us at a local Serve endpoint.
-    /// - `.remoteURL` with a non-loopback target: return `nil` — URLSession uses
-    ///   the real host, which the `0.0.0.0`-bound remote gateway accepts.
+    /// Shared-dashboard and Local Desktop URLs can be public Tailscale Serve
+    /// addresses proxying a loopback-bound gateway. Explicit remote and cloud
+    /// URLs instead preserve their real Host.
     static func effectiveHost(for baseURL: URL, mode: ConnectionMode) -> String? {
+        if isLoopback(baseURL.host) {
+            return loopbackHost
+        }
         switch mode {
         case .sharedDashboard, .localDesktop:
             return loopbackHost
-        case .remoteURL:
-            return isLoopback(baseURL.host) ? loopbackHost : nil
+        case .remoteURL, .hermesCloud:
+            return nil
         }
     }
 

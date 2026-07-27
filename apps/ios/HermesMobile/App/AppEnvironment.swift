@@ -365,8 +365,15 @@ final class AppEnvironment {
             loadPairing: {
                 let defaults = UserDefaults.standard
                 guard let url = defaults.string(forKey: DefaultsKeys.serverURL)?.trimmingCharacters(in: .whitespacesAndNewlines),
-                      !url.isEmpty,
-                      let token = KeychainService.loadToken(server: url), !token.isEmpty else { return nil }
+                      !url.isEmpty else { return nil }
+                let token: String
+                if GatewayAuthMode.saved(defaults) == .session {
+                    token = ""
+                } else {
+                    guard let savedToken = KeychainService.loadToken(server: url),
+                          !savedToken.isEmpty else { return nil }
+                    token = savedToken
+                }
                 let profile = defaults.string(forKey: DefaultsKeys.activeProfile) ?? DefaultsKeys.allProfilesScope
                 return BackgroundManifestScope(gatewayURL: url, scope: profile, token: token)
             },

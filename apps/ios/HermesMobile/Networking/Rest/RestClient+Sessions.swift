@@ -4,7 +4,7 @@ import Foundation
 //
 // These are true ``RestClient`` extension members: they reuse the shared
 // `makeRequest`/`get`/`perform`/`decode` plumbing from `RestClient.swift` (loopback
-// `Host: 127.0.0.1` override, `X-Hermes-Session-Token` auth, 15s timeout, and
+// Host derivation, gateway authentication, 15s timeout, and
 // ``RestError`` mapping) rather than duplicating it. ``SessionStore`` calls them
 // through the active connection's ``RestClient`` (`ConnectionStore.rest`).
 //

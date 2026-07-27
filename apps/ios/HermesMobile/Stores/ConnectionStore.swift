@@ -503,45 +503,6 @@ final class ConnectionStore {
         capabilities.upload != .unavailable
     }
 
-    /// Base address for the transparent stock-protocol lane. The existing relay
-    /// override selects the proxy host; without one, direct gateway behavior is
-    /// preserved during the Phase 2 rollout.
-    private func stockProxyOverrideURL() -> URL? {
-        let rawOverride: String?
-        #if DEBUG
-        let environmentOverride = ProcessInfo.processInfo.environment["HERMES_RELAY_URL"]?
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        rawOverride = environmentOverride?.isEmpty == false
-            ? environmentOverride
-            : DefaultsKeys.relayURLOverrideValue()
-        #else
-        rawOverride = DefaultsKeys.relayURLOverrideValue()
-        #endif
-        guard let rawOverride,
-              let override = URL(string: rawOverride),
-              var components = URLComponents(url: override, resolvingAgainstBaseURL: false)
-        else { return nil }
-        switch override.scheme?.lowercased() {
-        case "https", "wss": components.scheme = "https"
-        case "http", "ws": components.scheme = "http"
-        default: return nil
-        }
-        components.path = ""
-        components.queryItems = nil
-        return components.url
-    }
-
-    func stockProxyURL(forGateway gatewayURL: URL) -> URL {
-        stockProxyOverrideURL() ?? gatewayURL
-    }
-
-    /// A relay URL is the public WebSocket endpoint, so its real Host header
-    /// must survive the upgrade. Direct gateway connections keep their configured
-    /// mode (including the shared-dashboard loopback override).
-    func stockProxyWebSocketMode(forGateway gatewayURL: URL) -> ConnectionMode {
-        stockProxyOverrideURL() == nil ? connectionMode : .remoteURL
-    }
-
     /// The accepted transport generation. Runtime bindings use this value to
     /// reject work produced by a prior socket after reconnect.
     private(set) var transportEpoch: UInt64 = 0
@@ -575,10 +536,12 @@ final class ConnectionStore {
         // `_restOverrideForTesting`.
         if let _restOverrideForTesting { return _restOverrideForTesting }
         #endif
-        guard let url = URL(string: serverURLString), let token = currentToken else { return nil }
-        let baseURL = stockProxyURL(forGateway: url)
-        return RestClient(
-            baseURL: baseURL, token: token, pathStyle: capabilities.resolvedPathStyle
+        guard let url = URL(string: serverURLString) else { return nil }
+        return restClient(
+            baseURL: url,
+            authMode: activeAuthMode,
+            token: currentToken,
+            pathStyle: capabilities.resolvedPathStyle
         )
     }
 
@@ -660,10 +623,12 @@ final class ConnectionStore {
         // control-surface client is equally stubbable in unit tests.
         if let _restOverrideForTesting { return _restOverrideForTesting }
         #endif
-        guard let url = URL(string: serverURLString), let token = currentToken else { return nil }
-        let baseURL = stockProxyURL(forGateway: url)
-        return RestClient(
-            baseURL: baseURL, token: token, pathStyle: capabilities.resolvedPathStyle
+        guard let url = URL(string: serverURLString) else { return nil }
+        return restClient(
+            baseURL: url,
+            authMode: activeAuthMode,
+            token: currentToken,
+            pathStyle: capabilities.resolvedPathStyle
         )
     }
 
@@ -699,8 +664,34 @@ final class ConnectionStore {
     private let sessionStore: SessionStore
     private let chatStore: ChatStore
 
-    /// The token for the active connection (kept in memory; also in Keychain).
+    /// The token for the active connection; nil for cookie sessions.
     private var currentToken: String?
+    private var activeAuthMode: GatewayAuthMode = .saved()
+
+    private func restClient(
+        baseURL: URL,
+        authMode: GatewayAuthMode,
+        token: String?,
+        pathStyle: APIPathStyle = .legacy
+    ) -> RestClient? {
+        switch authMode {
+        case .token:
+            guard let token, !token.isEmpty else { return nil }
+            return RestClient(
+                baseURL: baseURL,
+                token: token,
+                pathStyle: pathStyle,
+                connectionMode: connectionMode
+            )
+        case .session:
+            return RestClient(
+                baseURL: baseURL,
+                token: "",
+                pathStyle: pathStyle,
+                connectionMode: connectionMode
+            )
+        }
+    }
     /// Monotonic ownership token for every connection lifecycle. Any task that
     /// crosses an await captures this value and must revalidate it before it can
     /// publish connection state or schedule more work. Configure and every
@@ -1216,7 +1207,11 @@ final class ConnectionStore {
             await paintCacheFirst(serverURLString: url)
             guard isCurrentGeneration(generation) else { return }
             _ = await configure(
-                urlString: url, token: token, issuedDeviceId: nil, generation: generation
+                urlString: url,
+                token: token,
+                authMode: .token,
+                issuedDeviceId: nil,
+                generation: generation
             )
             guard isCurrentGeneration(generation) else { return }
             isBootstrapping = false
@@ -1235,7 +1230,9 @@ final class ConnectionStore {
             await paintCacheFirst(serverURLString: savedURL)
             guard isCurrentGeneration(generation) else { return }
 
-            guard let token = KeychainService.loadToken(server: savedURL) else {
+            let authMode = GatewayAuthMode.saved()
+            let token = KeychainService.loadToken(server: savedURL)
+            if authMode == .token && token == nil {
                 // A cached URL still identifies a returning user even when the
                 // token is unavailable on this install. Keep the cached shell
                 // visible; a fresh install has no saved URL and still reaches
@@ -1246,7 +1243,11 @@ final class ConnectionStore {
             }
 
             _ = await configure(
-                urlString: savedURL, token: token, issuedDeviceId: nil, generation: generation
+                urlString: savedURL,
+                token: token,
+                authMode: authMode,
+                issuedDeviceId: nil,
+                generation: generation
             )
             guard isCurrentGeneration(generation) else { return }
             isBootstrapping = false
@@ -1345,19 +1346,80 @@ final class ConnectionStore {
         return await configure(
             urlString: urlString,
             token: token,
+            authMode: .token,
             issuedDeviceId: issuedDeviceId,
             generation: generation
         )
     }
 
+    func configureAuthenticatedSession(urlString: String) async -> String? {
+        let generation = advanceConnectionGeneration()
+        return await configure(
+            urlString: urlString,
+            token: nil,
+            authMode: .session,
+            issuedDeviceId: nil,
+            generation: generation
+        )
+    }
+
+    func probeAuthentication(urlString: String) async throws -> GatewayAuthProbe {
+        let trimmed = urlString.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let url = URL(string: trimmed),
+              let scheme = url.scheme?.lowercased(),
+              ["http", "https"].contains(scheme),
+              url.host != nil else {
+            throw RestError.network("That doesn't look like a valid server URL.")
+        }
+        return try await RestClient(
+            baseURL: url,
+            token: "",
+            connectionMode: connectionMode
+        ).authProbe()
+    }
+
+    private func connectGateway(
+        baseURL: URL,
+        authMode: GatewayAuthMode,
+        token: String?,
+        mode: ConnectionMode
+    ) async throws {
+        switch authMode {
+        case .token:
+            guard let token, !token.isEmpty else {
+                throw RestError.network("Missing gateway token")
+            }
+            if let connectRPC {
+                try await connectRPC(baseURL, token, mode)
+            } else {
+                try await client.connect(baseURL: baseURL, token: token, mode: mode)
+            }
+        case .session:
+            guard let rest = restClient(
+                baseURL: baseURL,
+                authMode: .session,
+                token: nil
+            ) else {
+                throw RestError.network("Gateway session unavailable")
+            }
+            let ticket = try await rest.webSocketTicket()
+            if let connectRPC {
+                try await connectRPC(baseURL, ticket, mode)
+            } else {
+                try await client.connect(baseURL: baseURL, ticket: ticket, mode: mode)
+            }
+        }
+    }
+
     private func configure(
         urlString: String,
-        token: String,
+        token: String?,
+        authMode: GatewayAuthMode,
         issuedDeviceId: String?,
         generation: UInt64
     ) async -> String? {
         let trimmedURL = urlString.trimmingCharacters(in: .whitespacesAndNewlines)
-        let trimmedToken = token.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmedToken = token?.trimmingCharacters(in: .whitespacesAndNewlines)
         let previousServerURL = serverURLString.trimmingCharacters(in: .whitespacesAndNewlines)
 
         // Scheme is restricted to http/https — `URL(string:)` happily accepts
@@ -1369,12 +1431,12 @@ final class ConnectionStore {
             phase = .offline("Invalid server URL")
             return "That doesn't look like a valid server URL."
         }
-        guard !trimmedToken.isEmpty else {
+        if authMode == .token && (trimmedToken?.isEmpty != false) {
             phase = .offline("Missing token")
             return "A session token is required."
         }
-        let stockTransportURL = stockProxyURL(forGateway: url)
-        let stockTransportMode = stockProxyWebSocketMode(forGateway: url)
+        let stockTransportURL = url
+        let stockTransportMode = connectionMode
 
         // Cancel any reconnect loop tied to a previous configuration.
         reconnectTask?.cancel()
@@ -1404,18 +1466,31 @@ final class ConnectionStore {
 
         // Probe REST first to fail fast with a clear message before opening WS.
         let previousToken = KeychainService.loadToken(server: trimmedURL)
-        let isSavedTokenReuse = issuedDeviceId == nil && previousToken == trimmedToken
+        let isSavedTokenReuse =
+            authMode == .token && issuedDeviceId == nil && previousToken == trimmedToken
 
         do {
             #if DEBUG
-            if let statusRPC {
+            if authMode == .token, let statusRPC, let trimmedToken {
                 try await statusRPC(stockTransportURL, trimmedToken)
             } else {
-                let probe = RestClient(baseURL: stockTransportURL, token: trimmedToken)
+                guard let probe = restClient(
+                    baseURL: stockTransportURL,
+                    authMode: authMode,
+                    token: trimmedToken
+                ) else {
+                    throw RestError.network("Missing gateway credential")
+                }
                 _ = try await probe.status()
             }
             #else
-            let probe = RestClient(baseURL: stockTransportURL, token: trimmedToken)
+            guard let probe = restClient(
+                baseURL: stockTransportURL,
+                authMode: authMode,
+                token: trimmedToken
+            ) else {
+                throw RestError.network("Missing gateway credential")
+            }
             _ = try await probe.status()
             #endif
         } catch {
@@ -1434,15 +1509,12 @@ final class ConnectionStore {
 
         do {
             beginTransportAttempt()
-            if let connectRPC {
-                try await connectRPC(stockTransportURL, trimmedToken, stockTransportMode)
-            } else {
-                try await client.connect(
-                    baseURL: stockTransportURL,
-                    token: trimmedToken,
-                    mode: stockTransportMode
-                )
-            }
+            try await connectGateway(
+                baseURL: stockTransportURL,
+                authMode: authMode,
+                token: trimmedToken,
+                mode: stockTransportMode
+            )
         } catch {
             guard isCurrentGeneration(generation) else { return nil }
             markTransportUnavailable()
@@ -1471,9 +1543,15 @@ final class ConnectionStore {
 
         // Persist only after a verified connection.
         serverURLString = trimmedURL
-        currentToken = trimmedToken
+        activeAuthMode = authMode
+        currentToken = authMode == .token ? trimmedToken : nil
         UserDefaults.standard.set(trimmedURL, forKey: DefaultsKeys.serverURL)
-        try? KeychainService.saveToken(trimmedToken, server: trimmedURL)
+        UserDefaults.standard.set(authMode.rawValue, forKey: DefaultsKeys.gatewayAuthMode)
+        if authMode == .token, let trimmedToken {
+            try? KeychainService.saveToken(trimmedToken, server: trimmedURL)
+        } else {
+            KeychainService.deleteToken(server: trimmedURL)
+        }
 
         // W3A-A QR v2: a `kind=device` pairing handed us a device token + its
         // server-minted `device_id`. Record the (non-secret) id so the panel can
@@ -1916,7 +1994,15 @@ final class ConnectionStore {
             defaults.set(data, forKey: DefaultsKeys.gatewayCleanupTombstone)
         }
         var remoteFailed = false
-        do { try await remoteCleanup?() } catch { remoteFailed = true }
+        do {
+            if let remoteCleanup {
+                try await remoteCleanup()
+            } else if activeAuthMode == .session {
+                try await rest?.logoutSession()
+            }
+        } catch {
+            remoteFailed = true
+        }
         guard isCurrentGeneration(generation) else { return }
         await stopLiveWork(returningTo: nil, clearSpotlight: true, generation: generation)
         guard isCurrentGeneration(generation) else { return }
@@ -1935,6 +2021,7 @@ final class ConnectionStore {
         await AttachmentBlobCache.shared.clearAll()
         LiveActivityManager.shared.end()
         defaults.removeObject(forKey: DefaultsKeys.serverURL)
+        defaults.removeObject(forKey: DefaultsKeys.gatewayAuthMode)
         defaults.removeObject(forKey: DefaultsKeys.connectionOffline)
         defaults.removeObject(forKey: DefaultsKeys.serverCapabilities)
         defaults.removeObject(forKey: DefaultsKeys.pushLastDeviceToken)
@@ -1944,8 +2031,13 @@ final class ConnectionStore {
         defaults.removeObject(forKey: DefaultsKeys.pushRegistrationHealthy)
         DefaultsKeys.setDeviceId(nil, server: server)
         KeychainService.deleteToken(server: server)
+        if let url = URL(string: server),
+           let cookies = HTTPCookieStorage.shared.cookies(for: url) {
+            cookies.forEach(HTTPCookieStorage.shared.deleteCookie)
+        }
         serverURLString = ""
         currentToken = nil
+        activeAuthMode = .token
         if remoteFailed {
             if let data = try? JSONEncoder().encode(GatewayCleanupTombstone(
                 server: server, deviceId: deviceId, remoteRetryNeeded: true
@@ -2442,7 +2534,7 @@ final class ConnectionStore {
                 guard !Task.isCancelled, self.isActiveGeneration(generation) else { return }
 
                 guard let url = URL(string: self.serverURLString),
-                      let token = self.currentToken else {
+                      self.activeAuthMode == .session || self.currentToken != nil else {
                     // Config vanished mid-loop (e.g. a disconnect raced the
                     // backoff sleep). Route to setup WITH `hasConnected`
                     // cleared — leaving it true would strand the user on the
@@ -2455,20 +2547,17 @@ final class ConnectionStore {
                     self.reconnectTask = nil
                     return
                 }
-                let stockTransportURL = self.stockProxyURL(forGateway: url)
-                let stockTransportMode = self.stockProxyWebSocketMode(forGateway: url)
+                let stockTransportURL = url
+                let stockTransportMode = self.connectionMode
 
                 do {
                     self.beginTransportAttempt()
-                    if let hook = self.connectRPC {
-                        try await hook(stockTransportURL, token, stockTransportMode)
-                    } else {
-                        try await self.client.connect(
-                            baseURL: stockTransportURL,
-                            token: token,
-                            mode: stockTransportMode
-                        )
-                    }
+                    try await self.connectGateway(
+                        baseURL: stockTransportURL,
+                        authMode: self.activeAuthMode,
+                        token: self.currentToken,
+                        mode: stockTransportMode
+                    )
                     guard !Task.isCancelled,
                           self.isActiveGeneration(generation) else { return }
                     // End grace immediately on the successful connect, BEFORE
@@ -2524,7 +2613,7 @@ final class ConnectionStore {
                     // rejects repeatedly".)
                     self.consecutiveReconnectFailures += 1
                     if self.consecutiveReconnectFailures >= Self.authReprobeThreshold,
-                       await self.probeIsAuthRevoked(url: url, token: token) {
+                       await self.probeIsAuthRevoked(url: url) {
                         guard !Task.isCancelled,
                               self.isActiveGeneration(generation) else { return }
                         // A hard auth revocation must never be swallowed by
@@ -2553,14 +2642,17 @@ final class ConnectionStore {
     /// outcome (success, network error, other status) returns `false` so the
     /// reconnect loop keeps retrying rather than dumping the user to re-pair on a
     /// transient outage.
-    private func probeIsAuthRevoked(url: URL, token: String) async -> Bool {
+    private func probeIsAuthRevoked(url: URL) async -> Bool {
         #if DEBUG
         if let hook = probeIsAuthRevokedRPC { return await hook() }
         #endif
         do {
-            _ = try await RestClient(
-                baseURL: stockProxyURL(forGateway: url), token: token
-            ).status()
+            guard let rest = restClient(
+                baseURL: url,
+                authMode: activeAuthMode,
+                token: currentToken
+            ) else { return true }
+            _ = try await rest.status()
             return false
         } catch {
             return Self.isAuthFailure(error)
@@ -2681,6 +2773,7 @@ final class ConnectionStore {
     /// telemetered, written to UserDefaults, or held in a `@Snapshotable`
     /// accessor. Only the non-secret `device_id` is persisted to UserDefaults.
     func autoUpgradeToDeviceTokenIfNeeded(serverURL: String) async {
+        guard activeAuthMode == .token else { return }
         // The server must advertise the capability — never issue against a stock
         // gateway (it has no route) or on an unsettled/flaky probe.
         guard capabilities.devices == .available else { return }
@@ -2789,6 +2882,7 @@ final class ConnectionStore {
         let generation = advanceConnectionGeneration()
         serverURLString = serverURL
         currentToken = token
+        activeAuthMode = .token
         hasConnected = true
         reauthRequired = false
         phase = .connected
@@ -2805,6 +2899,7 @@ final class ConnectionStore {
         advanceConnectionGeneration()
         serverURLString = serverURL
         currentToken = token
+        activeAuthMode = .token
         hasConnected = true
         reauthRequired = false
         phase = .connected

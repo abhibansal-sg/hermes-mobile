@@ -52,10 +52,9 @@ enum APIPathStyle: String, Sendable, Codable {
 
 /// Stateless HTTP client for the hermes gateway's REST surface.
 ///
-/// Every request overrides the `Host` header to `127.0.0.1` (the server validates
-/// Host against its loopback bind; Tailscale Serve preserves the public hostname
-/// otherwise) and carries the `X-Hermes-Session-Token` auth header. All requests
-/// use a 15-second timeout and throw ``RestError`` on failure.
+/// Token gateways receive `X-Hermes-Session-Token`; session gateways use the
+/// system cookie jar. Remote requests keep their real Host, matching Desktop.
+/// All requests use a 15-second timeout and throw ``RestError`` on failure.
 ///
 /// The core endpoint groups live in `extension RestClient` files
 /// (`RestClient+Sessions.swift`, `RestClient+Control.swift`, `RestClient+Audio.swift`).
@@ -66,6 +65,7 @@ struct RestClient: Sendable {
     let baseURL: URL
     let token: String
     let session: URLSession
+    let connectionMode: ConnectionMode
     /// The injected-session initializer is used by tests to keep uploads on the
     /// same URLProtocol-backed transport as the other REST calls. Production
     /// clients always use the durable background transfer path below.
@@ -79,16 +79,22 @@ struct RestClient: Sendable {
     ///   - token: The session token sent as `X-Hermes-Session-Token`.
     ///   - pathStyle: Path family for the mobile endpoint group.
     init(
-        baseURL: URL, token: String, pathStyle: APIPathStyle = .legacy
+        baseURL: URL,
+        token: String,
+        pathStyle: APIPathStyle = .legacy,
+        connectionMode: ConnectionMode = .remoteURL
     ) {
-        let config = URLSessionConfiguration.ephemeral
+        let config = URLSessionConfiguration.default
         config.timeoutIntervalForRequest = Self.timeout
         config.waitsForConnectivity = false
+        config.httpCookieStorage = .shared
+        config.httpShouldSetCookies = true
         self.init(
             baseURL: baseURL,
             token: token,
             session: URLSession(configuration: config),
             pathStyle: pathStyle,
+            connectionMode: connectionMode,
             usesInjectedUploadSession: false
         )
     }
@@ -100,13 +106,15 @@ struct RestClient: Sendable {
         baseURL: URL,
         token: String,
         session: URLSession,
-        pathStyle: APIPathStyle = .legacy
+        pathStyle: APIPathStyle = .legacy,
+        connectionMode: ConnectionMode = .remoteURL
     ) {
         self.init(
             baseURL: baseURL,
             token: token,
             session: session,
             pathStyle: pathStyle,
+            connectionMode: connectionMode,
             usesInjectedUploadSession: true
         )
     }
@@ -116,12 +124,14 @@ struct RestClient: Sendable {
         token: String,
         session: URLSession,
         pathStyle: APIPathStyle,
+        connectionMode: ConnectionMode,
         usesInjectedUploadSession: Bool
     ) {
         self.baseURL = baseURL
         self.token = token
         self.session = session
         self.pathStyle = pathStyle
+        self.connectionMode = connectionMode
         self.usesInjectedUploadSession = usesInjectedUploadSession
     }
 
@@ -132,6 +142,7 @@ struct RestClient: Sendable {
             token: token,
             session: session,
             pathStyle: style,
+            connectionMode: connectionMode,
             usesInjectedUploadSession: usesInjectedUploadSession
         )
     }
@@ -147,6 +158,35 @@ struct RestClient: Sendable {
     func status() async throws -> ServerStatus {
         let data = try await get(path: "/api/status")
         return try decode(ServerStatus.self, from: data, context: "status")
+    }
+
+    func authProbe() async throws -> GatewayAuthProbe {
+        let status = try await status()
+        guard status.authRequired == true else {
+            return GatewayAuthProbe(mode: .token, providers: [], version: status.version)
+        }
+        let data = try await get(path: "/api/auth/providers")
+        struct Envelope: Decodable {
+            let providers: [GatewayAuthProvider]
+        }
+        let providers = try decode(Envelope.self, from: data, context: "auth providers").providers
+        return GatewayAuthProbe(mode: .session, providers: providers, version: status.version)
+    }
+
+    func webSocketTicket() async throws -> String {
+        var request = makeRequest(path: "/api/auth/ws-ticket", method: "POST")
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        let data = try await perform(request)
+        struct Ticket: Decodable { let ticket: String }
+        let ticket = try decode(Ticket.self, from: data, context: "WebSocket ticket").ticket
+        guard !ticket.isEmpty else {
+            throw RestError.decoding("WebSocket ticket was empty")
+        }
+        return ticket
+    }
+
+    func logoutSession() async throws {
+        _ = try await perform(makeRequest(path: "/auth/logout", method: "POST"))
     }
 
     /// `GET /api/sessions` — session list ordered by most recent activity.
@@ -435,7 +475,7 @@ struct RestClient: Sendable {
     // MARK: - Request plumbing
     //
     // `internal` (not `private`) so the `RestClient+*` extension files reuse this
-    // single implementation rather than cloning the loopback Host override, auth
+    // single implementation rather than cloning Host derivation, authentication,
     // header, timeout, status check, and error mapping.
 
     /// JSON key-decoding strategy a caller needs for a given response shape.
@@ -479,9 +519,12 @@ struct RestClient: Sendable {
             timeoutInterval: Self.timeout
         )
         request.httpMethod = method
-        // Loopback Host override — the gateway validates Host against its bind.
-        request.setValue("127.0.0.1", forHTTPHeaderField: "Host")
-        request.setValue(token, forHTTPHeaderField: "X-Hermes-Session-Token")
+        if let host = WSURLBuilder.effectiveHost(for: baseURL, mode: connectionMode) {
+            request.setValue(host, forHTTPHeaderField: "Host")
+        }
+        if !token.isEmpty {
+            request.setValue(token, forHTTPHeaderField: "X-Hermes-Session-Token")
+        }
         request.setValue("application/json", forHTTPHeaderField: "Accept")
         return request
     }
