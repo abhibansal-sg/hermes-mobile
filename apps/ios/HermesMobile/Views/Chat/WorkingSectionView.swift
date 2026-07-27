@@ -188,8 +188,7 @@ enum WorkingSectionModel {
     ///    affordance bug (IMG_2578/2587/2591).
     ///  • answer text present: `false` — the caret rides the prose tail.
     /// Settled turns: always `false`. Pure + `nonisolated static` so the render
-    /// gate pins the rule directly (the same seam pattern as
-    /// `ChatView.shouldShowInlineTurnActivity`).
+    /// gate pins the rule directly.
     nonisolated static func preItemWorkingLineVisible(
         parts: [ChatMessagePart],
         streamingLive: Bool

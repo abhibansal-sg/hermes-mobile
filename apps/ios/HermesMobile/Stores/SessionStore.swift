@@ -2891,6 +2891,7 @@ final class SessionStore {
         // requires the pill to never flash the previous model — far cheaper than the
         // LazyVStack teardown, so it is NOT the switch-hitch cost FIX 4 targets.
         connection?.clearSessionState()
+        connection?.applySessionModel(summary.model, provider: summary.billingProvider)
 
         // S1 (Opus review): a SESSION SWITCH must not inherit a pending scroll
         // target left over from the PREVIOUS session. Clear when the incoming id
@@ -3096,6 +3097,11 @@ final class SessionStore {
                           self.activeStoredId == summary.id,
                           self.activeRuntimeId == live.id else { return }
                     self.ensureRuntimeAttempts = 0
+                    await self.chat?.reconcileLiveTurnStatus(
+                        runtimeId: live.id,
+                        snapshotRunning: live.status.isRunning,
+                        watchOnly: true
+                    )
                     self.onActiveRuntimeBound?()
                     self.lastError = nil
                     self.sessionActionError = nil
@@ -4187,7 +4193,9 @@ final class SessionStore {
                 source: current.source,
                 lastActive: current.lastActive,
                 cwd: current.cwd,
-                profile: current.profile
+                profile: current.profile,
+                model: current.model,
+                billingProvider: current.billingProvider
             )
             lastError = nil
             sessionActionError = nil

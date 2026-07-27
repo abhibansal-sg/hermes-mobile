@@ -131,10 +131,10 @@ struct SessionModelPickerContent: View {
                 localReasoningEffort = connection.sessionReasoningEffort ?? ""
                 localFast = connection.sessionFast ?? false
             } else {
-                // A passively-opened stored session has no live agent yet.
-                // Never paint the preceding session's model state into it.
-                localModel = ""
-                localProvider = ""
+                // Stock session rows carry their durable model identity even
+                // before a runtime exists.
+                localModel = connection.sessionModelRaw ?? ""
+                localProvider = connection.sessionProvider ?? ""
                 localReasoningEffort = ""
                 localFast = false
             }
@@ -416,7 +416,7 @@ struct SessionModelPickerContent: View {
     private func providerHeader(_ provider: ModelProvider) -> some View {
         HStack {
             Text(provider.name)
-            if provider.isCurrent {
+            if provider.slug == localProvider {
                 Text("CURRENT")
                     .font(.caption2.weight(.bold))
                     .foregroundStyle(theme.midground)
@@ -435,9 +435,8 @@ struct SessionModelPickerContent: View {
     private func loadOptions() async {
         // Session-scoped WS load first: its `model`/`provider` reflect the
         // LIVE session agent (post hot-swap), which is what "current" means
-        // here. Without a runtime we load only the inventory; for a real draft
-        // its "current" value is the global default. A passive stored session
-        // intentionally shows no current row until a user selection activates it.
+        // here. Without a runtime the stored session row remains authoritative
+        // while the global call supplies only the available inventory.
         var options: ModelOptions?
         if let sessionId = sessions.activeRuntimeId, !sessionId.isEmpty {
             options = try? await connection.sessionModelOptions(sessionId: sessionId)

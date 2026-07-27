@@ -215,6 +215,9 @@ final class ProtocolParityTests: XCTestCase {
         XCTAssertEqual(sessions.sessionBinding?.runtimeID, "runtime-desktop")
         XCTAssertEqual(sessions.sessionBinding?.mode, .watch)
         XCTAssertEqual(connection.sessionModelRaw, "watch-model")
+        XCTAssertTrue(chat.isStreaming, "a stock active-list working status must restore the live Stop state immediately")
+        XCTAssertFalse(chat.localTurnInFlight)
+        XCTAssertEqual(chat.interruptTarget, "runtime-desktop")
 
         chat.handle(event: GatewayEvent(params: .object([
             "type": .string("message.start"),
@@ -222,8 +225,29 @@ final class ProtocolParityTests: XCTestCase {
             "stored_session_id": .string("stored-desktop"),
             "payload": .object([:]),
         ]))!)
-        XCTAssertEqual(chat.foreignMirrorTelemetry.foreignAdopted, 1)
+        XCTAssertTrue(chat.isStreaming, "a repeated live start must preserve the adopted watch")
+        XCTAssertEqual(chat.interruptTarget, "runtime-desktop")
         XCTAssertFalse(chat.localTurnInFlight)
+    }
+
+    func testStoredSessionListPreservesItsActualModelIdentity() throws {
+        let json = JSONValue.object([
+            "id": .string("stored-model"),
+            "title": .string("Model truth"),
+            "model": .string("qwen3.8-max"),
+            "billing_provider": .string("openrouter"),
+        ])
+
+        let summary = try XCTUnwrap(json.decoded(as: SessionSummary.self))
+        XCTAssertEqual(summary.model, "qwen3.8-max")
+        XCTAssertEqual(summary.billingProvider, "openrouter")
+    }
+
+    func testStockActiveStatusesMapToRunningWithoutNewVocabulary() {
+        XCTAssertFalse(SessionActiveItem.Status.idle.isRunning)
+        XCTAssertTrue(SessionActiveItem.Status.starting.isRunning)
+        XCTAssertTrue(SessionActiveItem.Status.waiting.isRunning)
+        XCTAssertTrue(SessionActiveItem.Status.working.isRunning)
     }
 
     func testPassiveOpenOfIdleSessionDoesNotResume() async {
@@ -247,7 +271,8 @@ final class ProtocolParityTests: XCTestCase {
         sessions.open(SessionSummary(
             id: "stored-idle", title: "Idle", preview: nil,
             startedAt: 1, messageCount: 1, source: nil,
-            lastActive: 1, cwd: nil
+            lastActive: 1, cwd: nil,
+            model: "stored-model", billingProvider: "openrouter"
         ))
         await sessions.waitForPendingOpenForTesting()
 
@@ -256,6 +281,9 @@ final class ProtocolParityTests: XCTestCase {
         XCTAssertNil(sessions.sessionBinding?.runtimeID)
         XCTAssertEqual(sessions.sessionBinding?.mode, .watch)
         XCTAssertNil(sessions.sessionBinding?.generation)
+        XCTAssertEqual(connection.sessionModelRaw, "stored-model")
+        XCTAssertEqual(connection.sessionProvider, "openrouter")
+        XCTAssertFalse(chat.isStreaming)
 
         let runtime = await sessions.ensureActiveRuntime()
         XCTAssertEqual(resumeCalls, 1, "the first drive action owns the resume edge")

@@ -232,11 +232,8 @@ final class ProfilesTests: XCTestCase {
         XCTAssertEqual(s.messageCount, 2)
     }
 
-    func testMemberwisePositionalCallersCompileWithProfileLast() {
-        // `profile` is the LAST stored property with a default, so the synthesized
-        // memberwise init keeps it a trailing optional param: the positional
-        // callers compile without passing it (this build IS the assertion). Mirror
-        // the 3 callers' positional shape here.
+    func testMemberwiseCallersCompileWithOptionalMetadata() {
+        // Optional row metadata keeps existing memberwise callers source-compatible.
         let s = SessionSummary(
             id: "id", title: nil, preview: nil, startedAt: nil,
             messageCount: nil, source: nil, lastActive: nil, cwd: nil

@@ -305,10 +305,13 @@ final class ConnectionStore {
         }
     }
 
-    func applySessionModel(_ model: String?) {
+    func applySessionModel(_ model: String?, provider: String? = nil) {
         guard let model, !model.isEmpty else { return }
         sessionModel = Self.shortModelName(provider: nil, model: model)
         sessionModelRaw = model
+        if let provider, !provider.isEmpty {
+            sessionProvider = provider
+        }
     }
 
     /// Reset active session hot-swap state when a session is torn down or

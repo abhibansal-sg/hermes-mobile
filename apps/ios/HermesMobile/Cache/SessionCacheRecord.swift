@@ -124,6 +124,8 @@ extension SessionSummary: Encodable {
         try container.encodeIfPresent(lastActive, forKey: .lastActive)
         try container.encodeIfPresent(cwd, forKey: .cwd)
         try container.encodeIfPresent(profile, forKey: .profile)
+        try container.encodeIfPresent(model, forKey: .model)
+        try container.encodeIfPresent(billingProvider, forKey: .billingProvider)
     }
 
     /// CodingKeys that match the wire's snake_case -> camelCase decode
@@ -140,6 +142,8 @@ extension SessionSummary: Encodable {
         case lastActive
         case cwd
         case profile
+        case model
+        case billingProvider
     }
 }
 

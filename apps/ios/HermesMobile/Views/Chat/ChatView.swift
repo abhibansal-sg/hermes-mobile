@@ -32,11 +32,6 @@ struct ChatView: View {
     /// Paired with the theme id in each bubble's `Equatable` value (A1): catches an
     /// adaptive theme's light↔dark flip, where the theme name is unchanged.
     @Environment(\.colorScheme) private var colorScheme
-    /// Gates the inline activity row's appear/disappear settle: under Reduce
-    /// Motion the row settles instantly (nil animation); the continuous breathe
-    /// loop is handled separately inside `TurnActivityBar` (static-at-mid).
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
-
     /// Optional hook invoked when the user chooses "Speak" on an assistant
     /// message. Wiring to the speech player happens during integration; nil
     /// (default) hides the Speak action.
@@ -201,27 +196,6 @@ struct ChatView: View {
     /// nav-bar BACKGROUND (system-default on compact so the full-bleed card shows
     /// through; themed-opaque on regular/iPad) and the scroll-to-bottom pill.
     private var isCompact: Bool { horizontalSizeClass == .compact }
-
-    /// The inline working row is honest busy-state chrome: it appears only while a
-    /// turn is actively running, not while the turn is paused on a human approval,
-    /// clarification, sudo, or secret prompt (those have their own user-action UI).
-    ///
-    /// Pure render-gate seam used by the chrome tests.
-    static func shouldShowInlineTurnActivity(
-        isStreaming: Bool,
-        hasPendingGate: Bool
-    ) -> Bool {
-        isStreaming && !hasPendingGate
-    }
-
-    private var shouldShowInlineTurnActivity: Bool {
-        Self.shouldShowInlineTurnActivity(
-            isStreaming: chatStore.isStreaming,
-            hasPendingGate: chatStore.pendingApproval != nil
-                || chatStore.pendingClarification != nil
-                || chatStore.pendingSecurePrompt != nil
-        )
-    }
 
     /// Approximate height reserved at the bottom of the transcript so the last
     /// message is never hidden under the floating composer. The composer card is
@@ -394,33 +368,6 @@ struct ChatView: View {
         return message.role == .system
     }
 
-    /// Whether the in-flight assistant row has already produced visible prose.
-    /// Mirrors desktop's split between the pre-first-token loading indicator and
-    /// the tail "still thinking" indicator once output has begun.
-    static func hasVisibleAssistantOutput(_ message: ChatMessage?) -> Bool {
-        guard let message, message.role == .assistant else { return false }
-        return !message.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-    }
-
-    /// Status label for the inline turn row. Active tools win because they are the
-    /// most truthful current activity; otherwise a turn with visible assistant text
-    /// reads as "Still thinking" (desktop tail indicator) and a pre-token turn reads
-    /// as "Working".
-    static func turnActivityLabel(activeToolName: String?, hasAssistantOutput: Bool) -> String {
-        if let activeToolName, !activeToolName.isEmpty { return activeToolName }
-        return hasAssistantOutput ? "Still thinking" : "Working"
-    }
-
-    /// Desktop ActivityTimerText-compatible elapsed format: `Xs` under a minute,
-    /// `M:SS` after that. Kept pure so tests can pin the visible lifecycle without
-    /// mounting a live SwiftUI timer.
-    static func turnActivityElapsedText(startedAt: Date?, now: Date) -> String {
-        guard let startedAt else { return "0s" }
-        let seconds = max(0, Int(now.timeIntervalSince(startedAt)))
-        if seconds < 60 { return "\(seconds)s" }
-        return TimeInterval(seconds).mmss
-    }
-
     /// Whether a session summary carries enough workspace context to merit a
     /// transcript-edge context line. Pure + static so tests pin the visibility
     /// gate without a live view.
@@ -456,8 +403,7 @@ struct ChatView: View {
     // MARK: - Reading measure (STR-1098)
 
     /// The single regular-width (iPad) reading-measure cap shared by every
-    /// transcript-edge row — the inline status glow (``TurnActivityBar``),
-    /// the context line (``SessionContextLine``), and the user
+    /// transcript-edge row — the context line (``SessionContextLine``) and the user
     /// ``MessageBubble`` column (``MessageBubble/userBubbleMaxWidth(availableWidth:horizontalSizeClass:)``).
     /// Chosen to match the bubble's pre-existing regular-width footprint
     /// (`1024 × 0.78 ≈ 799pt`) rather than the old `720` clamp, so
@@ -465,45 +411,12 @@ struct ChatView: View {
     /// bubble column instead of shrinking the bubble column to meet them.
     static let transcriptReadingMeasure: CGFloat = 800
 
-    /// The max-width a transcript-edge row (status glow, context line) should
-    /// use for its `.frame(maxWidth:)`: unbounded in compact (iPhone), capped
+    /// The max-width a transcript-edge row should use for its
+    /// `.frame(maxWidth:)`: unbounded in compact (iPhone), capped
     /// to ``transcriptReadingMeasure`` in regular (iPad). Pure + static so the
     /// compact/regular split is unit-testable without a live view.
     static func transcriptRowMaxWidth(isCompact: Bool) -> CGFloat {
         isCompact ? .infinity : transcriptReadingMeasure
-    }
-
-    /// The status-glow breathe token values per TRANSCRIPT-CHROME-TOKENS.md §1.2.
-    /// Pure + static so a test can pin the exact alphas/radii without a live
-    /// animation, and compact mode (STR-1009) can reuse the same numbers.
-    enum StatusGlowToken {
-        static let restAlpha: Double = 0.55
-        static let ringAlphaMin: Double = 0.06
-        static let ringAlphaMax: Double = 0.12
-        static let ringAlphaReduceMotion: Double = 0.09
-        static let ringWidth: CGFloat = 1
-        static let liftAlphaMin: Double = 0.05
-        static let liftAlphaMax: Double = 0.10
-        static let liftAlphaReduceMotion: Double = 0.075
-        static let liftRadiusMin: CGFloat = 8
-        static let liftRadiusMax: CGFloat = 32
-        static let liftRadiusReduceMotion: CGFloat = 20
-        static let settleDuration: Double = 0.18
-        static let breatheDuration: Double = 1.8
-        static let cornerRadius: CGFloat = 12
-    }
-
-    /// The inline activity row's appear/disappear settle-in animation
-    /// (TRANSCRIPT-CHROME-TOKENS.md §1.2 `statusGlow.appear` = 180ms `.easeOut`).
-    /// Wired to the row via `.animation(settleAnimation(reduceMotion:),
-    /// value: shouldShowInlineTurnActivity)` so the glow shell settles in and
-    /// out over 180ms rather than snapping. Returns `nil` under Reduce Motion →
-    /// the row appears/disappears instantly; the continuous breathe loop is
-    /// owned separately inside `TurnActivityBar` (static-at-mid under Reduce
-    /// Motion) and is unaffected. Pure + static so the wiring gate is
-    /// unit-testable and the `settleDuration` token is provably live.
-    static func settleAnimation(reduceMotion: Bool) -> Animation? {
-        reduceMotion ? nil : .easeOut(duration: StatusGlowToken.settleDuration)
     }
 
     var body: some View {
@@ -1154,12 +1067,6 @@ struct ChatView: View {
                         .transition(.opacity)
                         .id("session-context-line")
                 }
-                if shouldShowInlineTurnActivity {
-                    TurnActivityBar(chatStore: chatStore)
-                        .padding(.top, Self.intraTurnGap)
-                        .transition(.opacity.combined(with: .move(edge: .bottom)))
-                        .id("inline-working-indicator")
-                }
                 // SCROLL P0 #2 (contract Batch E §3.6) — composer-clearance spacer.
                 //
                 // The full-bleed transcript must reserve space below the last
@@ -1195,13 +1102,6 @@ struct ChatView: View {
             }
             .padding(.horizontal, 16)
             .animation(.easeInOut(duration: 0.2), value: chatStore.isActiveSessionCompacting)
-            // Inline activity row settle-in/out (TRANSCRIPT-CHROME-TOKENS.md
-            // §1.2 `statusGlow.appear` = 180ms easeOut): drives the
-            // TurnActivityBar's .transition on appear/disappear. nil under
-            // Reduce Motion so the row settles instantly; the breathe loop
-            // stays static-at-mid (handled inside TurnActivityBar).
-            .animation(Self.settleAnimation(reduceMotion: reduceMotion),
-                       value: shouldShowInlineTurnActivity)
             // TOP CLEARANCE (FIX 2): the first element must REST below the floating
             // header (not jammed under it) while still sliding UNDER the header when
             // scrolled (the EdgeFadeMask top band handles the under-header look).
@@ -2912,127 +2812,6 @@ private extension View {
                 .toolbarBackground(toolbarBg, for: .navigationBar)
                 .toolbarBackground(.visible, for: .navigationBar)
         }
-    }
-}
-
-// MARK: - Inline glow status shell (T-4 / STR-1005 / STR-1029)
-
-/// Desktop-parity inline glow status shell for the active-turn transcript tail
-/// (TRANSCRIPT-CHROME-TOKENS.md §1.2). Replaces the legacy spinner+capsule
-/// TurnActivityBar.
-///
-/// **No spinner, no capsule, no floating pill.** The row reads "alive" via a
-/// soft midground-blue ring + lift shadow that breathes at the desktop's 1.8s
-/// cadence. The elapsed counter is monospaced tabular text tinted at the
-/// midground rest alpha — not a pill badge.
-///
-/// **STR-1009 adoption seam:** compact mode's distilled two-line status
-/// (STR-1009) slots INTO this same glow shell — it does NOT create a second
-/// status surface. When STR-1009 lands, a compact-mode caller will pass its
-/// two distilled lines as the shell's content; the glow ring, lift, and
-/// breathing animation are owned HERE so there is exactly one status-glow
-/// treatment on iOS. Today the shell renders the full activity label + elapsed.
-///
-/// The stop (interrupt) affordance lives ONLY on the composer's morph button
-/// (H4 / single-stop-affordance principle). The row is pure read-only status
-/// chrome with no interactive controls, living in the transcript layout rather
-/// than as a floating overlay strip (ABH-359).
-///
-/// Internal (not private) so `TranscriptChromeGlowEvidenceTests` can render the
-/// production glow shell to PNG via `ImageRenderer` for STR-1029 visual evidence
-/// — same testability convention as `composerFloatInset` (line ~199).
-struct TurnActivityBar: View {
-    let chatStore: ChatStore
-
-    @Environment(\.hermesTheme) private var theme
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    @Environment(\.horizontalSizeClass) private var horizontalSizeClass
-
-    /// Drives a ~1Hz re-render so the elapsed label ticks. Local timeline state;
-    /// the source of truth for "is a turn running" remains `chatStore`.
-    @State private var now = Date()
-    /// Drives the breathing glow (false → min alphas, true → max). Animated
-    /// with a 1.8s repeatForever on appear; held static at mid when Reduce
-    /// Motion is on.
-    @State private var breathing = false
-    private let tick = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
-
-    private var isCompact: Bool { horizontalSizeClass == .compact }
-
-    // MARK: Status-glow breathing values (TRANSCRIPT-CHROME-TOKENS §1.2)
-
-    private var ringAlpha: Double {
-        if reduceMotion { return ChatView.StatusGlowToken.ringAlphaReduceMotion }
-        return breathing ? ChatView.StatusGlowToken.ringAlphaMax
-                         : ChatView.StatusGlowToken.ringAlphaMin
-    }
-
-    private var liftAlpha: Double {
-        if reduceMotion { return ChatView.StatusGlowToken.liftAlphaReduceMotion }
-        return breathing ? ChatView.StatusGlowToken.liftAlphaMax
-                         : ChatView.StatusGlowToken.liftAlphaMin
-    }
-
-    private var liftRadius: CGFloat {
-        if reduceMotion { return ChatView.StatusGlowToken.liftRadiusReduceMotion }
-        return breathing ? ChatView.StatusGlowToken.liftRadiusMax
-                         : ChatView.StatusGlowToken.liftRadiusMin
-    }
-
-    var body: some View {
-        HStack(spacing: 8) {
-            Text(labelText)
-                .font(.caption.weight(.medium))
-                .foregroundStyle(theme.mutedFg)
-                .lineLimit(1)
-                .truncationMode(.middle)
-            Spacer(minLength: 4)
-            Text(elapsedText)
-                .font(.system(.caption2, design: .monospaced).weight(.medium))
-                .monospacedDigit()
-                .tracking(0.2)
-                .foregroundStyle(theme.midground.opacity(ChatView.StatusGlowToken.restAlpha))
-                .lineLimit(1)
-        }
-        .padding(.horizontal, isCompact ? 12 : 14)
-        .padding(.vertical, isCompact ? 10 : 12)
-        .frame(maxWidth: ChatView.transcriptRowMaxWidth(isCompact: isCompact), alignment: .leading)
-        .background(
-            RoundedRectangle(cornerRadius: ChatView.StatusGlowToken.cornerRadius,
-                             style: .circular)
-                .fill(theme.codeBg.opacity(0.5))
-        )
-        .overlay {
-            RoundedRectangle(cornerRadius: ChatView.StatusGlowToken.cornerRadius,
-                             style: .circular)
-                .stroke(theme.midground.opacity(ringAlpha),
-                        lineWidth: ChatView.StatusGlowToken.ringWidth)
-        }
-        .shadow(color: theme.midground.opacity(liftAlpha), radius: liftRadius, x: 0, y: 2)
-        .accessibilityElement(children: .combine)
-        .accessibilityLabel("\(labelText), \(elapsedText)")
-        .accessibilityIdentifier("inlineWorkingIndicator")
-        .onReceive(tick) { now = $0 }
-        .onAppear {
-            guard !reduceMotion else { return }
-            withAnimation(
-                .easeInOut(duration: ChatView.StatusGlowToken.breatheDuration)
-                    .repeatForever(autoreverses: true)
-            ) {
-                breathing = true
-            }
-        }
-    }
-
-    private var labelText: String {
-        ChatView.turnActivityLabel(
-            activeToolName: chatStore.activeToolName,
-            hasAssistantOutput: ChatView.hasVisibleAssistantOutput(chatStore.messages.last)
-        )
-    }
-
-    private var elapsedText: String {
-        ChatView.turnActivityElapsedText(startedAt: chatStore.turnStartedAt, now: now)
     }
 }
 

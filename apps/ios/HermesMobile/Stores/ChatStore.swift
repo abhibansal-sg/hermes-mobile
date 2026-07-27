@@ -1595,9 +1595,9 @@ final class ChatStore {
     /// before navigating away). The REST transcript only contains persisted rows;
     /// it does NOT prove the current runtime is idle. After the open seed has
     /// landed, consume the stock resume snapshot. If it reports `running`,
-    /// re-create the local in-flight UI state: a streaming assistant placeholder,
-    /// the global `isStreaming` flag, the local-turn ownership token (so mutable
-    /// actions are disabled), and the Stop target (`activeSessionId`).
+    /// re-create the in-flight UI state: a streaming assistant placeholder,
+    /// the global `isStreaming` flag, and the correct Stop target. A passive
+    /// watch keeps foreign ownership; a resumed drive keeps local ownership.
     ///
     /// This is deliberately idempotent: a live websocket `message.start` that wins
     /// the race simply means the streaming row already exists, and a superseded
@@ -1605,21 +1605,32 @@ final class ChatStore {
     func reconcileLiveTurnStatus(
         runtimeId: String,
         snapshotRunning: Bool? = nil,
-        inflight: SessionInflightTurn? = nil
+        inflight: SessionInflightTurn? = nil,
+        watchOnly: Bool = false
     ) async {
         guard runtimeId == activeSessionId else { return }
         guard snapshotRunning == true else { return }
-        restoreInflightTurn(inflight)
+        restoreInflightTurn(inflight, watchRuntimeId: watchOnly ? runtimeId : nil)
     }
 
-    private func restoreInflightTurn(_ inflight: SessionInflightTurn?) {
+    private func restoreInflightTurn(
+        _ inflight: SessionInflightTurn?,
+        watchRuntimeId: String? = nil
+    ) {
         let user = inflight?.user.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         if !user.isEmpty, !inflightUserPromptAlreadyRestored(user) {
             messages.append(ChatMessage(role: .user, text: user))
             rebuildUserOrdinals()
         }
-        beginLocalTurn()
-        beginStreamingMessage()
+        if let watchRuntimeId {
+            localTurnToken = nil
+            mirroringRuntimeId = watchRuntimeId
+            streamingIsForeign = true
+            beginStreamingMessage(foreign: true)
+        } else {
+            beginLocalTurn()
+            beginStreamingMessage()
+        }
         if let assistant = inflight?.assistant, !assistant.isEmpty {
             mutateStreaming { $0.applyFinalText(assistant) }
         }

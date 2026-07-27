@@ -80,14 +80,10 @@ G2 rationale).
 4. Visual deliverables: /tmp/hermes-uiH-glass-light.png + glass-dark.png
    (pills over scrolled content, iOS 26 sim).
 
-## H4 micro-polish — TurnActivityBar (ChatView.swift, owned by whichever
-module the integrator assigns — likely H1 since it's in the chat area)
-Remove the Stop button from the streaming TurnActivityBar — the composer's
-morph button already shows stop while streaming (single affordance
-principle, user request). Keep spinner + elapsed + current tool name.
-Verify the "Stop turn" accessibility label moves to/remains on the
-composer's stop state (ChatFlowUITests references it — update the test if
-it targeted the bar's button).
+## H4 micro-polish — active turn
+The standalone `TurnActivityBar` is retired. The streaming assistant row is
+the transcript progress surface and the composer's morph button is the single
+Stop affordance. No separate wide status row reserves transcript space.
 
 ## Integration
 Standard ritual: reconcile (ProtocolTypes dedupe), xcodegen, build (Swift 6

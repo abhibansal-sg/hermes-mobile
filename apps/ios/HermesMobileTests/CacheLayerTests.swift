@@ -136,13 +136,17 @@ final class CacheMigrationTests: XCTestCase {
 final class CacheRoundTripTests: XCTestCase {
 
     func testSessionSummaryEncodesAndDecodes() throws {
-        let original = makeSession(id: "abc", lastActive: 999.5, messageCount: 42, title: "My Session")
+        var original = makeSession(id: "abc", lastActive: 999.5, messageCount: 42, title: "My Session")
+        original.model = "qwen3.8-max"
+        original.billingProvider = "openrouter"
         let record = try SessionCacheRecord.make(from: original, scope: testScope)
         let decoded = try record.decodeSummary()
         XCTAssertEqual(decoded.id, original.id)
         XCTAssertEqual(decoded.title, original.title)
         XCTAssertEqual(decoded.lastActive, original.lastActive)
         XCTAssertEqual(decoded.messageCount, original.messageCount)
+        XCTAssertEqual(decoded.model, original.model)
+        XCTAssertEqual(decoded.billingProvider, original.billingProvider)
     }
 
     func testStoredMessageMirrorRoundTripWithToolCalls() throws {

@@ -164,7 +164,7 @@ final class LiveTurnReentryTests: XCTestCase {
         XCTAssertEqual(chat.interruptTarget, runtimeId)
     }
 
-    func testOpenWaitsForSeedThenRestoresResumeSnapshot() async {
+    func testDriveWaitsForSeedThenRestoresResumeSnapshot() async {
         let chat = ChatStore()
         let sessions = SessionStore()
         let connection = ConnectionStore(sessionStore: sessions, chatStore: chat)
@@ -198,6 +198,7 @@ final class LiveTurnReentryTests: XCTestCase {
         #if DEBUG
         await sessions.waitForPendingOpenForTesting()
         #endif
+        _ = await sessions.ensureActiveRuntime()
 
         XCTAssertEqual(sessions.activeRuntimeId, runtimeId)
         XCTAssertTrue(chat.isStreaming)

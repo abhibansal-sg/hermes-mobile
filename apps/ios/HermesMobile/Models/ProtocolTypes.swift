@@ -34,11 +34,13 @@ struct SessionSummary: Decodable, Identifiable, Sendable, Equatable {
     /// `profile_name`, which is the distinct ``SessionRuntimeInfo/profileName``
     /// create/resume `info` key). The stock `GET /api/sessions` row and the WS
     /// `session.list` shape both omit it, so it decodes `nil` there — the dormant
-    /// single-profile path stays byte-for-byte unchanged. Declared LAST with a
-    /// default so the synthesized memberwise init keeps it as a trailing optional
-    /// parameter: the three positional callers (`asSessionSummary`, `rename`'s
-    /// rebuild, the test fixture helper) compile without passing it.
+    /// single-profile path stays byte-for-byte unchanged. Declared with a default
+    /// so existing memberwise-init callers compile without passing it.
     var profile: String? = nil
+    /// Durable model identity from stock `GET /api/sessions`.
+    var model: String? = nil
+    /// Provider paired with ``model`` by the stored session row.
+    var billingProvider: String? = nil
 
     /// Drawer/list identity is scoped because stored session ids may collide
     /// across profiles on the same gateway.
@@ -258,6 +260,10 @@ struct SessionActiveItem: Decodable, Sendable, Equatable {
         case starting
         case waiting
         case working
+
+        var isRunning: Bool {
+            self != .idle
+        }
     }
 }
 

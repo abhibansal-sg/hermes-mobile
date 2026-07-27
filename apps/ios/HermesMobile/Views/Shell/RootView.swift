@@ -722,7 +722,7 @@ private struct SplitLayout: View {
                 // F0 / Amendment B: feed the running model so the chip renders on
                 // iPad too (the model picker is reachable from the iPad sidebar's
                 // settings sheet — keep the chip in sync there).
-                modelName: connection.activeModelName
+                modelName: connection.sessionModel ?? connection.activeModelName
             )
                 .toolbar {
                     // F4A-A2: a subagent-tree inspector toggle, shown only when the
@@ -1455,7 +1455,7 @@ private struct CompactLayout: View {
                     // Feed the running-model source so the composer chip can render
                     // (F0 / Amendment B). Resolved by ConnectionStore on connect +
                     // after switches; nil keeps the chip hidden.
-                    modelName: connection.activeModelName,
+                    modelName: connection.sessionModel ?? connection.activeModelName,
                     // STRIKE P0: stack-free compact hosting — chat draws its own
                     // floating glass header instead of a system toolbar. The card
                     // stack now ignores the safe area (so the transcript bleeds to

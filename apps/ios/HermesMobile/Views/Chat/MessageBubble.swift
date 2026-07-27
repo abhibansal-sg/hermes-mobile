@@ -14,8 +14,8 @@ struct MessageBubble: View {
     @Environment(ConnectionStore.self) private var connectionStore
     @Environment(SessionStore.self) private var sessionStore
     /// Drives the regular-width (iPad) user-bubble cap so it shares
-    /// ``ChatView/transcriptReadingMeasure`` with the status glow and context
-    /// line instead of drifting from its own 78%-of-screen formula (STR-1098).
+    /// ``ChatView/transcriptReadingMeasure`` with the context line instead of
+    /// drifting from its own 78%-of-screen formula (STR-1098).
     @Environment(\.horizontalSizeClass) private var horizontalSizeClass
     /// Honors Reduce Motion on the "Select Text" mode crossfade (approved design).
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
