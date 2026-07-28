@@ -7,7 +7,7 @@ import SwiftUI
 ///
 /// Session titles are resolved against `SessionStore` when its list is loaded,
 /// falling back to a shortened id otherwise. Answering an item targets the
-/// item's own session, so a prompt broadcast from another client resolves on
+/// item's own session, so a cross-session pending prompt resolves on
 /// the correct runtime.
 struct InboxView: View {
     @Environment(InboxStore.self) private var inbox

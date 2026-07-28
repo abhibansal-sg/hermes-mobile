@@ -3,9 +3,8 @@ import Foundation
 /// Observable record of which branch-only server features the connected gateway
 /// supports, so one binary degrades gracefully against a STOCK hermes-agent.
 ///
-/// The user's patched gateway adds: `POST /api/upload`, `POST/DELETE
-/// /api/push/register`, and `stored_session_id` enrichment on broadcast event
-/// frames. A stock gateway has none of these. Rather than feature-flag at build
+/// The mobile plugin adds `POST /api/upload` and `POST/DELETE
+/// /api/push/register`. A stock gateway has none of these. Rather than feature-flag at build
 /// time, the app **probes** at connect and gates UI on the result (E1).
 ///
 /// Each feature is one of three states:
@@ -23,9 +22,6 @@ import Foundation
 ///   - **profiles**: one independent stock-route probe.
 ///   - **pushRegistry**: wired off ``PushRegistrar``'s existing 404 soft-fail —
 ///     a soft-fail ⇒ unavailable, a `2xx`/`4xx` validation response ⇒ available.
-///   - **broadcast**: passive — marked available when the connection router sees
-///     the first event carrying `stored_session_id`; otherwise stays unknown
-///     (it is never provably unavailable, which is acceptable).
 ///
 /// `@MainActor`-isolated; stores and views read it on the main actor. The actual
 /// HTTP probe runs on a `Sendable` helper so it stays off the main actor.
@@ -53,8 +49,6 @@ final class ServerCapabilities {
     private(set) var upload: State = .unknown
     /// `POST/DELETE /api/push/register` — remote push. Set from PushRegistrar.
     private(set) var pushRegistry: State = .unknown
-    /// `stored_session_id` enrichment on broadcast frames. Set passively.
-    private(set) var broadcast: State = .unknown
     /// `GET /api/fs/list` + `/api/fs/read` — the F4A file-browser / @-file
     /// endpoints. Ships in the same plugin router as the mount probe. Every
     /// file-browser / working-dir / @-file affordance gates on `fs !=
@@ -121,8 +115,7 @@ final class ServerCapabilities {
     ///
     /// `pushRegistry` is deliberately NOT probed here — it has no zero-side-effect
     /// probe of its own and is instead learned from ``PushRegistrar``'s real
-    /// register call (``notePushRegistry(available:)``). `broadcast` likewise
-    /// stays passive (``noteBroadcastObserved()``). Both are preserved across a
+    /// register call (``notePushRegistry(available:)``). It is preserved across a
     /// cache restore so a known value survives a reconnect.
     func probe(serverURL: String, rest: RestClient, force: Bool = false) async {
         let version = Self.currentAppVersion
@@ -156,7 +149,6 @@ final class ServerCapabilities {
         pluginMount = .unknown
         upload = .unknown
         pushRegistry = .unknown
-        broadcast = .unknown
         fs = .unknown
         subagentEvents = .unknown
         profiles = .unknown
@@ -195,7 +187,6 @@ final class ServerCapabilities {
         pluginMount = .unknown
         upload = .unknown
         pushRegistry = .unknown
-        broadcast = .unknown
         fs = .unknown
         subagentEvents = .unknown
         profiles = .unknown
@@ -234,19 +225,9 @@ final class ServerCapabilities {
         persist()
     }
 
-    /// Mark broadcast enrichment available — called by the connection router the
-    /// first time an event carries `stored_session_id`. Idempotent; only the
-    /// first transition persists.
-    func noteBroadcastObserved() {
-        guard broadcast != .available else { return }
-        broadcast = .available
-        persist()
-    }
-
     /// Mark `subagent.*` emission available — called by the connection router the
     /// first time a `subagent.*` frame routes (F4A-A2). Idempotent; only the
-    /// first transition persists. Passive (never proves unavailable), mirroring
-    /// ``noteBroadcastObserved()``.
+    /// first transition persists. Passive (never proves unavailable).
     func noteSubagentObserved() {
         guard subagentEvents != .available else { return }
         subagentEvents = .available
@@ -308,14 +289,13 @@ final class ServerCapabilities {
         var pluginMount: State
         var upload: State
         var pushRegistry: State
-        var broadcast: State
         var fs: State
         var subagentEvents: State
         var profiles: State
         var devices: State
 
         enum CodingKeys: String, CodingKey {
-            case serverURL, appVersion, pluginMount, upload, pushRegistry, broadcast, fs, subagentEvents, profiles, devices
+            case serverURL, appVersion, pluginMount, upload, pushRegistry, fs, subagentEvents, profiles, devices
         }
 
         init(
@@ -324,7 +304,6 @@ final class ServerCapabilities {
             pluginMount: State,
             upload: State,
             pushRegistry: State,
-            broadcast: State,
             fs: State,
             subagentEvents: State,
             profiles: State,
@@ -335,7 +314,6 @@ final class ServerCapabilities {
             self.pluginMount = pluginMount
             self.upload = upload
             self.pushRegistry = pushRegistry
-            self.broadcast = broadcast
             self.fs = fs
             self.subagentEvents = subagentEvents
             self.profiles = profiles
@@ -352,7 +330,6 @@ final class ServerCapabilities {
             pluginMount = try c.decodeIfPresent(State.self, forKey: .pluginMount) ?? .unknown
             upload = try c.decode(State.self, forKey: .upload)
             pushRegistry = try c.decode(State.self, forKey: .pushRegistry)
-            broadcast = try c.decode(State.self, forKey: .broadcast)
             fs = try c.decodeIfPresent(State.self, forKey: .fs) ?? .unknown
             subagentEvents = try c.decodeIfPresent(State.self, forKey: .subagentEvents) ?? .unknown
             // `decodeIfPresent`-tolerant so a cache written by a pre-F4b build
@@ -372,7 +349,6 @@ final class ServerCapabilities {
         pluginMount = cache.pluginMount
         upload = cache.upload
         pushRegistry = cache.pushRegistry
-        broadcast = cache.broadcast
         fs = cache.fs
         subagentEvents = cache.subagentEvents
         profiles = cache.profiles
@@ -397,7 +373,6 @@ final class ServerCapabilities {
             pluginMount: pluginMount,
             upload: upload,
             pushRegistry: pushRegistry,
-            broadcast: broadcast,
             fs: fs,
             subagentEvents: subagentEvents,
             profiles: profiles,

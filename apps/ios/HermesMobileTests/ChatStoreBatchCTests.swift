@@ -1,15 +1,12 @@
 import XCTest
 @testable import HermesMobile
 
-/// ABH-48 (R1 Batch C) — composer queue, foreign mirror, and offline outbox
-/// correctness.
+/// ABH-48 (R1 Batch C) — composer queue and offline outbox correctness.
 ///
 /// The family these tests pin: the queue was global (no session identity) and
 /// burned prompts on unaccepted sends; the only drain trigger was a LOCAL
-/// `message.complete`; STOP targeted the local runtime even when the visible
-/// stream was an adopted foreign mirror; and edit/retry/checkpoint preemptively
-/// claimed "Agent is busy" off the display-level `isStreaming` instead of
-/// local ownership.
+/// `message.complete`; and edit/retry/checkpoint preemptively claimed "Agent is
+/// busy" off the display-level `isStreaming` instead of local ownership.
 ///
 /// Ledger coverage: #2, #10, #17, #29, #30, #50 (+ #18 lives in ComposerView's
 /// queue-mode derivation, exercised manually — view-only).
@@ -17,7 +14,6 @@ import XCTest
 final class ChatStoreBatchCTests: XCTestCase {
 
     private let activeRuntime = "rt-local"
-    private let foreignRuntime = "rt-foreign"
     private let storedId = "stored-session-1"
 
     private func makeStore(
@@ -110,57 +106,6 @@ final class ChatStoreBatchCTests: XCTestCase {
         XCTAssertTrue(chat.messages.isEmpty, "explicit queued work echoes only when claimed for sending")
     }
 
-    // MARK: - #29: foreign complete is a turn completion (drain trigger)
-
-    func testForeignCompleteFiresTurnCompleteAfterReconcile() async {
-        let (chat, _) = makeStore { _ in
-            [self.storedMessage(role: "assistant", text: "mirror reconciled")]
-        }
-        var transcriptAtTrigger: [String]?
-        chat.onTurnComplete = { transcriptAtTrigger = chat.messages.map(\.text) }
-
-        chat.handle(event: frame(
-            type: "message.start", runtime: foreignRuntime, stored: storedId
-        ))
-        XCTAssertTrue(chat.isStreaming, "foreign turn adopted")
-        chat.handle(event: frame(
-            type: "message.complete", runtime: foreignRuntime, stored: storedId,
-            payload: .object(["text": .string("done")])
-        ))
-        // Deterministic drain: await the foreign-complete backfill Task — onTurnComplete
-        // fires AFTER the reconcile inside that Task.
-        #if DEBUG
-        await chat.waitForPendingForeignBackfillForTesting()
-        #else
-        await settle()
-        #endif
-
-        XCTAssertEqual(
-            transcriptAtTrigger, ["mirror reconciled"],
-            "onTurnComplete must fire for a foreign complete — and only AFTER "
-            + "the backfill reconcile, so a drained prompt can't race the seed"
-        )
-    }
-
-    // MARK: - #2: STOP routes to the runtime that owns the visible stream
-
-    func testInterruptTargetsForeignRuntimeWhileMirroring() async {
-        let (chat, _) = makeStore()
-        XCTAssertEqual(chat.interruptTarget, activeRuntime, "idle: local runtime")
-
-        chat.handle(event: frame(
-            type: "message.start", runtime: foreignRuntime, stored: storedId
-        ))
-        XCTAssertEqual(chat.interruptTarget, foreignRuntime,
-                       "an adopted mirror is stopped at its OWN runtime")
-
-        chat.handleConnectionDrop()
-        XCTAssertEqual(chat.interruptTarget, activeRuntime,
-                       "after teardown, STOP targets the local runtime again")
-    }
-
-    // MARK: - #30: edit/retry/checkpoint gate on ownership, not mirror state
-
     func testEditBlockedDuringLocalTurnOnly() async {
         let (chat, _) = makeStore()
         chat.seed(from: [
@@ -173,29 +118,6 @@ final class ChatStoreBatchCTests: XCTestCase {
         chat.handle(event: frame(type: "message.start", runtime: activeRuntime))
         await chat.editAndResend(messageId: userId, newText: "edited")
         XCTAssertEqual(chat.lastError, "Agent is busy")
-    }
-
-    func testEditNotPreemptivelyBlockedDuringForeignMirror() async {
-        let (chat, _) = makeStore()
-        chat.seed(from: [
-            storedMessage(role: "user", text: "hello"),
-            storedMessage(role: "assistant", text: "world"),
-        ])
-        let userId = chat.messages.first { $0.role == .user }!.id
-
-        // Adopt a foreign mirror: user owns no local turn.
-        chat.handle(event: frame(
-            type: "message.start", runtime: foreignRuntime, stored: storedId
-        ))
-        XCTAssertTrue(chat.isStreaming)
-
-        await chat.editAndResend(messageId: userId, newText: "edited")
-
-        // The ownership gate let the attempt through — whatever the
-        // (disconnected) transport said, it was NOT the client-side
-        // preemptive "Agent is busy" heuristic.
-        XCTAssertNotEqual(chat.lastError, "Agent is busy",
-                          "a foreign mirror must not preemptively block edit")
     }
 
     // MARK: - Judge round (post-fix adversarial re-verification)
@@ -228,44 +150,4 @@ final class ChatStoreBatchCTests: XCTestCase {
         XCTAssertNotNil(chat.lastError)
     }
 
-    /// Same restore, while a foreign mirror is live — the case where a
-    /// backfill-based restore would be discarded by its own `!isStreaming`
-    /// post-await guard. The local undo is seed-free, so it works regardless.
-    func testEditFailureDuringForeignMirrorRestoresTranscript() async {
-        let (chat, _) = makeStore()
-        chat.seed(from: [
-            storedMessage(role: "user", text: "hello"),
-            storedMessage(role: "assistant", text: "world"),
-        ])
-        let userId = chat.messages.first { $0.role == .user }!.id
-        let before = chat.messages.map(\.text)
-
-        chat.handle(event: frame(
-            type: "message.start", runtime: foreignRuntime, stored: storedId
-        ))
-
-        await chat.editAndResend(messageId: userId, newText: "edited")
-
-        XCTAssertEqual(chat.messages.map(\.text).prefix(before.count).map { $0 },
-                       before,
-                       "the truncated tail must be restored in place")
-        XCTAssertFalse(chat.messages.contains { $0.text == "edited" })
-    }
-
-    func testCheckpointNotPreemptivelyBlockedDuringForeignMirror() async {
-        let (chat, _) = makeStore()
-        chat.seed(from: [
-            storedMessage(role: "user", text: "hello"),
-            storedMessage(role: "assistant", text: "world"),
-        ])
-        let userId = chat.messages.first { $0.role == .user }!.id
-
-        chat.handle(event: frame(
-            type: "message.start", runtime: foreignRuntime, stored: storedId
-        ))
-
-        await chat.restoreCheckpoint(toUserMessageId: userId)
-
-        XCTAssertNotEqual(chat.lastError, "Agent is busy")
-    }
 }

@@ -122,6 +122,7 @@ final class OutboxProcessorTests: XCTestCase {
             currentScope: { harness.scope },
             activeStoredSessionID: { "stored-A" },
             isTransportReady: { true },
+            canRetryAmbiguousSubmit: { true },
             createDestination: { _ in XCTFail("existing-session job must not create"); throw Ambiguous() },
             resolveRuntime: { _ in "runtime-A" },
             uploadAsset: { _, _ in XCTFail("no assets"); throw Ambiguous() },
@@ -167,6 +168,7 @@ final class OutboxProcessorTests: XCTestCase {
             currentScope: { harness.scope },
             activeStoredSessionID: { "visible-session" },
             isTransportReady: { true },
+            canRetryAmbiguousSubmit: { true },
             createDestination: { _ in
                 createCount += 1
                 return OutboxDestination(runtimeSessionID: "runtime-created", storedSessionID: "stored-created")
@@ -261,6 +263,7 @@ final class OutboxProcessorTests: XCTestCase {
             currentScope: { harness.scope },
             activeStoredSessionID: { nil },
             isTransportReady: { true },
+            canRetryAmbiguousSubmit: { true },
             createDestination: { _ in
                 createCount += 1
                 return OutboxDestination(runtimeSessionID: "runtime-share", storedSessionID: "stored-share")

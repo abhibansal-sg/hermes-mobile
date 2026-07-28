@@ -152,10 +152,8 @@ struct ComposerView: View {
         }
     }
 
-    /// While a turn is live on this stored session — a local one or an adopted
-    /// foreign mirror — the send button enqueues instead of sends (both mean
-    /// the session is busy; they differ in what STOP targets, which
-    /// `ChatStore.interrupt()` routes to the stream's own runtime, R1 #2).
+    /// While a turn is live on this stored session, the send button enqueues
+    /// instead of sending immediately.
     /// DISCONNECTED with queueable text also enters queue mode: that is the
     /// offline outbox's front door — previously the enqueue affordance only
     /// existed while streaming, so the persisted outbox + reconnect-drain

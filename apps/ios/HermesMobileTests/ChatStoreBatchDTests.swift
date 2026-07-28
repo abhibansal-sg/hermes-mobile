@@ -75,23 +75,6 @@ final class ChatStoreBatchDTests: XCTestCase {
         XCTAssertFalse(chat.isStreaming)
     }
 
-    func testConnectionDropFiresTurnDiscardedForForeignMirror() async {
-        let (chat, _) = makeStore()
-        var discards = 0
-        chat.onTurnDiscarded = { discards += 1 }
-
-        chat.handle(event: frame(
-            type: "message.start", runtime: foreignRuntime, stored: storedId
-        ))
-        XCTAssertTrue(chat.isStreaming, "foreign mirror adopted (it owns an LA too)")
-
-        chat.handleConnectionDrop()
-
-        XCTAssertGreaterThanOrEqual(discards, 1,
-                                    "the foreign-only drop path bypasses cancelStreaming "
-                                    + "and must fire the discard seam itself")
-    }
-
     // MARK: - #73: session switch / draft discards the turn's activity
 
     func testResetFiresTurnDiscarded() async {
@@ -134,35 +117,4 @@ final class ChatStoreBatchDTests: XCTestCase {
 
     // MARK: - Foreign reconcile path: discard AND completion both fire
 
-    func testForeignCompleteReconcileFiresDiscardAndCompletion() async {
-        let (chat, _) = makeStore { _ in
-            [self.storedMessage(role: "assistant", text: "reconciled")]
-        }
-        var discards = 0
-        var completions = 0
-        chat.onTurnDiscarded = { discards += 1 }
-        chat.onTurnComplete = { completions += 1 }
-
-        chat.handle(event: frame(
-            type: "message.start", runtime: foreignRuntime, stored: storedId
-        ))
-        chat.handle(event: frame(
-            type: "message.complete", runtime: foreignRuntime, stored: storedId,
-            payload: .object(["text": .string("done")])
-        ))
-        // Deterministic drain: await the foreign-complete backfill Task so the
-        // reconcile seed fires onTurnDiscarded + onTurnComplete.
-        #if DEBUG
-        await chat.waitForPendingForeignBackfillForTesting()
-        #else
-        await settle()
-        #endif
-
-        // The reconcile seed's cancelStreaming fires the discard, and the
-        // Batch C foreign-complete trigger fires the completion — both routes
-        // to LiveActivityManager.end(), which is idempotent.
-        XCTAssertGreaterThanOrEqual(discards, 1)
-        XCTAssertEqual(completions, 1)
-        XCTAssertEqual(chat.messages.map(\.text), ["reconciled"])
-    }
 }

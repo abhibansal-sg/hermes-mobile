@@ -9,7 +9,7 @@ import XCTest
 /// HERMES_TOKEN inside the app process). Skips gracefully when absent.
 ///
 /// Gateway rig (set up by the caller before running this suite):
-///   - HERMES_GATEWAY_BROADCAST=1, own token, port :9123, bound to 0.0.0.0
+///   - own token, port :9123, bound to 0.0.0.0
 ///   - /health returns 200 before tests run
 ///   - One seeded session row in the DB so the drawer is non-empty
 ///   - NEVER the live :9119 dashboard

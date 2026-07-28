@@ -162,15 +162,17 @@ final class SessionStore {
     func invalidateGatewayScopeWork() {
         openToken = UUID()
         cancelSupersededOpenWork()   // R3 (I4): scope teardown cancels in-flight opens
-        // A scope teardown replaces the drawer content: drop any pending
-        // dismissal intent from a row that no longer exists (QA-1 B3).
-        pendingDrawerReveal = nil
+        // The row may disappear, but the user's intent was a plain drawer
+        // close. Consume it now so a scope rotation inside the reveal window
+        // cannot strand the drawer open.
+        firePendingDrawerReveal()
         cancelEnsureRuntime()
         cancelRuntimeBinding()
         activeRuntimeId = nil
         activeRuntimeEpoch = nil
         activeStoredId = nil
         activeStoredProfile = nil
+        chat?.resetPromptReceiptObservation()
         chat?.reset()
         transcriptPaintedStoredId = nil
     }
@@ -957,11 +959,11 @@ final class SessionStore {
 
     // MARK: - Live-activity registry
 
-    /// Most-recent broadcast-activity timestamp per *stored* session id, stamped
+    /// Most-recent event-activity timestamp per *stored* session id, stamped
     /// by ``noteActivity(storedSessionId:)`` from `ConnectionStore`'s event router
     /// on streaming frames. The drawer reads it via ``isLive(_:)`` to show a
     /// pulsing dot next to a row whose conversation moved in the last few
-    /// seconds (driven by this device or another client over the broadcast).
+    /// seconds for turns observed by this connection.
     private(set) var lastActivityAt: [String: Date] = [:]
     /// FIX 6a — un-observed shadow of the most-recent stamp time per id, used purely
     /// to COALESCE the per-delta `lastActivityAt` write (skip a re-stamp within
@@ -1107,25 +1109,49 @@ final class SessionStore {
         let token = openToken
         let workGeneration = connectionWorkGeneration
         do {
-            guard case .found(let live) = try await inspectLiveSession(storedID: storedID),
-                  activeStoredId == storedID,
+            let inspection = try await inspectLiveSession(storedID: storedID)
+            guard activeStoredId == storedID,
                   openToken == token,
                   connectionWorkGeneration == workGeneration else { return }
-            let mode = sessionBinding?.runtimeID == live.id
-                ? (sessionBinding?.mode ?? .watch)
-                : .watch
-            bindSession(
-                storedID: storedID,
-                runtimeID: live.id,
-                mode: mode,
-                generation: mode == .drive ? connection?.transportEpoch : nil
-            )
-            connection?.applySessionModel(live.model)
-            await chat?.reconcileLiveTurnStatus(
-                runtimeId: live.id,
-                snapshotRunning: live.status.isRunning,
-                watchOnly: mode == .watch
-            )
+            switch inspection {
+            case .found(let live):
+                let mode = sessionBinding?.runtimeID == live.id
+                    ? (sessionBinding?.mode ?? .watch)
+                    : .watch
+                bindSession(
+                    storedID: storedID,
+                    runtimeID: live.id,
+                    mode: mode,
+                    generation: mode == .drive ? connection?.transportEpoch : nil
+                )
+                connection?.applySessionModel(live.model)
+                if live.status.isRunning {
+                    await chat?.reconcileLiveTurnStatus(
+                        runtimeId: live.id,
+                        snapshotRunning: true,
+                        watchOnly: mode == .watch
+                    )
+                    if live.status == .waiting,
+                       chat?.pendingApproval == nil,
+                       chat?.pendingClarification == nil,
+                       chat?.pendingSecurePrompt == nil,
+                       let scope = projectsCacheScope,
+                       let rest = connection?.rest {
+                        await connection?.inboxStore?.refresh(scope: scope, rest: rest)
+                    }
+                } else if mode == .watch,
+                          chat?.settleWatchOnlyTurn(runtimeId: live.id) == true {
+                    markTurnCompleted(storedId: storedID, runtimeId: live.id)
+                    await chat?.reconcileAuthoritativeTranscript(surfaceFailure: false)
+                }
+            case .absent:
+                guard sessionBinding?.mode == .watch,
+                      chat?.settleWatchOnlyTurn(runtimeId: activeRuntimeId) == true else { return }
+                markTurnCompleted(storedId: storedID, runtimeId: activeRuntimeId)
+                await chat?.reconcileAuthoritativeTranscript(surfaceFailure: false)
+            case .unsupported:
+                return
+            }
         } catch {
             // Observation is best-effort. Reconnect and explicit open retain
             // responsibility for surfacing actionable transport/session errors.
@@ -2113,7 +2139,7 @@ final class SessionStore {
     /// **Non-destructive merge (ABH-86 item 3):** after the fetch resolves, rows
     /// missing from the incoming page are dropped UNLESS their id belongs to the
     /// working set: the active session, any live/working ids (sessions with recent
-    /// broadcast activity still within the live window), and pinned sessions.
+    /// event activity still within the live window), and pinned sessions.
     /// Survivors are prepended so they stay visible in the drawer while the
     /// server catches up. Incoming page wins for everything else.
     ///
@@ -2359,7 +2385,7 @@ final class SessionStore {
     /// - Build the incoming id set.
     /// - Find rows in the **current** list that are absent from the incoming page
     ///   but belong to the working set: the active stored session, any session
-    ///   that has live broadcast activity within the liveness window, and pinned
+    ///   that has recent observed activity within the liveness window, and pinned
     ///   sessions. These are the "survivors".
     /// - Prepend survivors to the incoming page (they float to the top briefly,
     ///   then fall into place on the next refresh once the server catches up).
@@ -2438,7 +2464,7 @@ final class SessionStore {
     private func workingSetSessionIds() -> Set<String> {
         var workingIds = pinnedIds
         if let active = activeStoredId { workingIds.insert(active) }
-        // Any session that has had broadcast activity in the live window counts
+        // Any session that has had observed activity in the live window counts
         // as working. Keep this distinct from `turnsInProgress`, which gates only
         // optimistic timestamp carry-forward.
         let now = Date()
@@ -2584,11 +2610,15 @@ final class SessionStore {
 
     // MARK: - Activation
 
-    /// Open (resume) an existing session: `session.resume` then seed the
-    /// transcript into `ChatStore` from the full REST history.
+    /// Open an existing session for observation, then seed its bounded
+    /// transcript window. Driving resumes only at the send edge.
     /// Monotonic token for the most recent `open()`; background work from a
     /// superseded open (the user tapped another session) checks it and bails.
     private var openToken = UUID()
+    /// Read-only navigation generation for collaborators that must fence work
+    /// across an `await`. It rotates for every open, draft, or cleared
+    /// selection; callers may compare it but never advance it themselves.
+    var selectionGeneration: UUID { openToken }
     /// The accepted transport generation that created `activeRuntimeId`.
     /// Runtime ids are ephemeral and cannot be reused after a reconnect.
     private var activeRuntimeEpoch: UInt64? {
@@ -2694,6 +2724,12 @@ final class SessionStore {
         let reveal = pendingDrawerReveal
         pendingDrawerReveal = nil
         reveal?()
+    }
+
+    /// A committed drag-open is a newer user decision than an in-flight row
+    /// tap's close intent.
+    func voidPendingDrawerReveal() {
+        pendingDrawerReveal = nil
     }
 
     /// ABH-372 warm-switch cache: the already-normalized transcript snapshots
@@ -3547,13 +3583,10 @@ final class SessionStore {
             activeStoredId = storedId
             activeStoredProfile = branchProfile
             isDraft = false
-            // Branching is reachable while the OLD session's adopted foreign
-            // mirror is still live ("does not interrupt the current turn"),
-            // and `seed()` rightly refuses to wipe a live mirror (R1 #61) —
-            // but the mirror belongs to the session we just LEFT. Reset first
-            // (mirrors `open()`'s reset-then-seed) so the branch's transcript
-            // actually lands instead of the old mirror squatting under the
-            // new session's ids.
+            // Branching is reachable while the OLD session still has a live
+            // projection ("does not interrupt the current turn"). Reset first
+            // so the branch transcript cannot inherit rows from the session we
+            // just left.
             chat?.reset()
             // Seed the transcript from the server's coerced echo (falls back to an
             // empty seed if the response omitted `messages`).
@@ -4390,8 +4423,8 @@ final class SessionStore {
     /// Stamp "now" against a *stored* session id, marking its row live for the
     /// next ``liveWindow`` seconds. Called by `ConnectionStore`'s event router on
     /// streaming frames (`message.start`/`message.delta`/…). The caller resolves
-    /// the stored id: it's the frame's `stored_session_id` for broadcast/mirror
-    /// frames, or — for our own active runtime turn — `activeStoredId`. A `nil`
+    /// the stored id from the frame when present, or — for our own active
+    /// runtime turn — `activeStoredId`. A `nil`
     /// or empty id is ignored. Starts the prune task on the first entry.
     func noteActivity(storedSessionId: String?) {
         guard let id = storedSessionId, !id.isEmpty,
@@ -4420,7 +4453,7 @@ final class SessionStore {
         startLiveCleanupIfNeeded()
     }
 
-    /// Whether `summary`'s row should pulse: its conversation saw broadcast
+    /// Whether `summary`'s row should pulse: its conversation saw observed
     /// activity within the last ``liveWindow`` seconds.
     func isLive(_ summary: SessionSummary) -> Bool {
         guard let at = lastActivityAt[sessionListIdentity(summary)] else { return false }

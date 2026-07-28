@@ -86,7 +86,6 @@
 		3137D84629147B81E6FB0914 /* WorkRepositoryMigrationTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8A172531C6FF34F26EAC2250 /* WorkRepositoryMigrationTests.swift */; };
 		31A7946CAF15672A77046418 /* ProjectsStoreTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 40BAD0471BC3BDA9F4DADDAD /* ProjectsStoreTests.swift */; };
 		322388C6174076A828D9D6A1 /* NotificationActionTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8B456DE252548BBBD1652B4A /* NotificationActionTests.swift */; };
-		3232D7ACF32443BBD3CF8DC2 /* ChatStoreForeignMirrorTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = B4BB9FEA0A68AA2D6AB23F3B /* ChatStoreForeignMirrorTests.swift */; };
 		32E2FAC4630CBE422F994548 /* RestClientLiveTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7BF067EA75B21634705E7A6E /* RestClientLiveTests.swift */; };
 		33A6D68100E83F3D6348265D /* MarkdownImageEvidenceUITests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 40CBB2E5B17FB2A17077A2E4 /* MarkdownImageEvidenceUITests.swift */; };
 		3500EA43F01E459FED4A244E /* SettingsL07Tests.swift in Sources */ = {isa = PBXBuildFile; fileRef = D0BC2E7064E5AA360C0470FF /* SettingsL07Tests.swift */; };
@@ -698,7 +697,6 @@
 		B36F5A27DCE7096532A22772 /* OutboxProcessor.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OutboxProcessor.swift; sourceTree = "<group>"; };
 		B494FC6E0C430EDF861C9CCC /* NotificationAuthorityTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NotificationAuthorityTests.swift; sourceTree = "<group>"; };
 		B4B4C696ABDF50A91A5BD79E /* InAppSafariView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = InAppSafariView.swift; sourceTree = "<group>"; };
-		B4BB9FEA0A68AA2D6AB23F3B /* ChatStoreForeignMirrorTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ChatStoreForeignMirrorTests.swift; sourceTree = "<group>"; };
 		B53D03C61746CA48FDD7B53D /* GamboardL03Tests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GamboardL03Tests.swift; sourceTree = "<group>"; };
 		B54060142ACAE96B34BD2AB4 /* HermesAppIntents.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HermesAppIntents.swift; sourceTree = "<group>"; };
 		B558AD78A5E22F45999FB942 /* RecordingControls.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RecordingControls.swift; sourceTree = "<group>"; };
@@ -1281,7 +1279,6 @@
 				A7132A90C115AC8C23507209 /* ChatStoreBatchDTests.swift */,
 				2EE77CE417159EB455B8A2F7 /* ChatStoreBatchETests.swift */,
 				6AED0A12B048B9FFDDAEF815 /* ChatStoreF4ATests.swift */,
-				B4BB9FEA0A68AA2D6AB23F3B /* ChatStoreForeignMirrorTests.swift */,
 				0F5215BA6361020AB4BA7DC3 /* ChatStoreLatestAssistantReplyTests.swift */,
 				E213EE372DD824870FF0C849 /* ChatStoreOrdinalWindowingTests.swift */,
 				98F403BB4273ED23955F5A8A /* ChatStoreReconnectReconcileTests.swift */,
@@ -1943,7 +1940,6 @@
 				A599031F3972D4366019AA1F /* ChatStoreBatchDTests.swift in Sources */,
 				69A16C151EE6B9A2124EAEC7 /* ChatStoreBatchETests.swift in Sources */,
 				7B5BF26785CFA4741743C94B /* ChatStoreF4ATests.swift in Sources */,
-				3232D7ACF32443BBD3CF8DC2 /* ChatStoreForeignMirrorTests.swift in Sources */,
 				402F34B41104AE4A48DA8170 /* ChatStoreLatestAssistantReplyTests.swift in Sources */,
 				2BAE72B894FA4537EF6C7607 /* ChatStoreOrdinalWindowingTests.swift in Sources */,
 				48A803D958FB0EC221C1CB28 /* ChatStoreReconnectReconcileTests.swift in Sources */,

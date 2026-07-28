@@ -663,8 +663,8 @@ final class ConnectionStore {
     /// Wired by `AppEnvironment` (ChatStore holds no reference to it).
     weak var queueStore: QueueStore?
 
-    /// The global approval/clarification inbox. The event router fans the
-    /// broadcast prompt events to it (in addition to `ChatStore`) so pending
+    /// The global approval/clarification inbox. The event router forwards prompt
+    /// events to it (in addition to `ChatStore`) so pending
     /// requests from every session collect in one place. Wired by
     /// `AppEnvironment`; `ChatStore` holds no reference to it.
     weak var inboxStore: InboxStore?
@@ -2114,21 +2114,6 @@ final class ConnectionStore {
         // user just left can't re-claim a turn or mutate store state
         // (ABH-52 judge round).
         guard isActiveGeneration(generation) else { return }
-        // ABH-46 item 8: a frame carrying `broadcast_gap` means the gateway's
-        // bounded per-client broadcast queue dropped frames before this one
-        // (F3 overflow policy, ws.py:253). The live stream has a hole, so
-        // reconcile: REST-backfill the active transcript (authoritative) and
-        // refresh the drawer so list state catches up too. Runs alongside
-        // normal routing — the carrying frame itself is still applied below.
-        if let gap = event.broadcastGap, gap > 0 {
-            Task {
-                guard self.isActiveGeneration(generation) else { return }
-                await self.chatStore.reconcileAuthoritativeTranscript()
-                guard self.isActiveGeneration(generation) else { return }
-                await self.sessionStore.refresh()
-                guard self.isActiveGeneration(generation) else { return }
-            }
-        }
         switch event.type {
         case .gatewayReady:
             Task {
@@ -2146,18 +2131,15 @@ final class ConnectionStore {
              .error,
              // F4A-A2: subagent delegation frames were previously dropped to
              // `.unknown` at this whitelist (one of the THREE drop layers). They
-             // carry the parent runtime's `session_id` (+ `stored_session_id` on
-             // broadcast frames), so they stamp activity and route through the
+             // carry the parent runtime's `session_id`, so they stamp activity and route through the
              // same ownership gate as message/tool frames.
              .subagentStart, .subagentThinking, .subagentTool,
              .subagentProgress, .subagentComplete,
-             // F4A-A2: secure prompts. These are session-local (the gateway does
-             // not broadcast-mirror them), carry the requesting runtime's
+             // F4A-A2: secure prompts. These are session-local and carry the requesting runtime's
              // `session_id`, and drive ChatStore's transient secure-prompt state.
              .sudoRequest, .secretRequest:
             // The first observed subagent frame proves the patched gateway emits
-            // delegation events (E1 passive capability signal — mirror
-            // `noteBroadcastObserved`). Done here, at the routing source, before
+            // delegation events (E1 passive capability signal). Done here, at the routing source, before
             // ownership classification, so the inspector affordance can appear.
             switch event.type {
             case .subagentStart, .subagentThinking, .subagentTool,
@@ -2167,9 +2149,8 @@ final class ConnectionStore {
                 break
             }
             // Stamp the live-activity registry so the drawer can pulse a row
-            // whose conversation just moved (this device or a broadcasting
-            // client). Prefer the frame's stored id (present on broadcast /
-            // mirror frames); otherwise, for our own active runtime turn, use
+            // whose conversation just moved. Prefer the frame's stored id;
+            // otherwise, for our own active runtime turn, use
             // the active stored id. Stamping before `handle` is harmless — it
             // only feeds the drawer's dot and never gates transcript routing.
             stampActivity(for: event)
@@ -2186,8 +2167,8 @@ final class ConnectionStore {
                 // top of the drawer the instant a turn starts/finishes — the
                 // server only advances lastActive on completion, so without this
                 // the row sits in its old slot until a refresh round-trips. Use
-                // the broadcast frame's stored id (foreign turns) or, for our own
-                // active turn, the active stored id. Unknown ids no-op here and
+                // the frame's stored id or, for our own active turn, the active
+                // stored id. Unknown ids no-op here and
                 // are picked up by the debounced refresh below (covers a brand-new
                 // remote session's first message).
                 let activityStoredId = event.storedSessionId
@@ -2226,7 +2207,7 @@ final class ConnectionStore {
                 break
             }
             chatStore.handle(event: event)
-            // The inbox accumulates broadcast approval/clarify prompts across
+            // The inbox accumulates approval/clarify prompts across
             // every session and expires them on message.complete. It ignores
             // all other event types, so forwarding here is a no-op for them.
             // Routed AFTER `chatStore.handle` so the active-session chat
@@ -2270,14 +2251,11 @@ final class ConnectionStore {
     }
 
     /// Resolve the *stored* session id a streaming frame belongs to and stamp the
-    /// session store's live-activity registry. Broadcast/mirror frames carry
+    /// session store's live-activity registry. Frames may carry
     /// `stored_session_id` directly; for a frame on our own active runtime turn
     /// (no stored id on the wire) we attribute it to the active stored session.
     private func stampActivity(for event: GatewayEvent) {
         if let stored = event.storedSessionId, !stored.isEmpty {
-            // A frame carrying stored_session_id proves broadcast enrichment is
-            // live on this gateway (E1: the broadcast capability is passive).
-            capabilities.noteBroadcastObserved()
             sessionStore.noteActivity(storedSessionId: stored)
         } else if let sid = event.sessionId,
                   sid == sessionStore.activeRuntimeId,

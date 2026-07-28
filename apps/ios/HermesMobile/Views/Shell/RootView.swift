@@ -1705,6 +1705,9 @@ private struct CompactLayout: View {
                 // `openProgress`-derived corner radius + shadow, which re-evaluate with
                 // it) spring CONTINUOUSLY from the finger's last position to the target.
                 // Covers BOTH commit and snap-back (commitOpen == wasOpen).
+                if commitOpen {
+                    sessions.voidPendingDrawerReveal()
+                }
                 withAnimation(settle) {
                     drawer.setOpenRaw(commitOpen)
                     dragTranslation = nil

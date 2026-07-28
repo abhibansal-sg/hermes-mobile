@@ -209,7 +209,7 @@ final class ChatStoreReconnectReconcileTests: XCTestCase {
 
         await chat.reconcileAuthoritativeTranscript()
 
-        XCTAssertEqual(fetches, 1, "a broadcast-gap checkpoint must not no-op while streaming")
+        XCTAssertEqual(fetches, 1, "an authoritative checkpoint must not no-op while streaming")
         XCTAssertTrue(chat.isStreaming)
         XCTAssertEqual(
             chat.messages.filter { $0.role == .assistant }.count,

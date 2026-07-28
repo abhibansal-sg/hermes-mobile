@@ -259,7 +259,7 @@ future gateway adds the params.
 - **Triggers (all already exist in the store graph):** post-connect
   `startHydration → sessionStore.refresh()`; the 30 s foreground heartbeat;
   `drawerOpenRefresh()`; the debounced 400 ms `scheduleSessionRefresh()` on
-  `message.start`/`message.complete`; the `broadcast_gap` recovery path.
+  `message.start`/`message.complete`.
 - **Fetch:** the same `GET /api/sessions?limit=N&order=recent` the app already
   issues. No new network call is introduced; the cache rides the existing one.
 - **Diff:** compare each returned row's `{last_active, message_count, title,
@@ -302,9 +302,9 @@ used to classify a re-fetch as append-only (new `wireId > maxMessageId`) vs a
 rewind (rows vanished from the middle — handled because the wire's `active=1`
 clause already excludes rewound messages, and the full re-fetch replaces them).
 
-### 3.5 Real-time apply from broadcast frames
+### 3.5 Real-time apply from stock frames
 
-The app already consumes the `HERMES_GATEWAY_BROADCAST=1` JSON-RPC channel. The
+The app consumes the stock gateway JSON-RPC channel. The
 cache reacts to settled frames only (it never persists in-flight deltas):
 
 | Frame | `stored_session_id`? | Cache action |
@@ -429,7 +429,6 @@ coordinator and its existing trigger points already call the seamed methods:
 | `startHydration()` (~351) | `sessionStore.refresh()` | cold-launch read + post-fetch write |
 | `recoverActiveSession()` (~802–831) | `chatStore.backfill()` + `refresh()` | transcript re-persist + list write |
 | `handleScenePhase(_:)` foreground (~842–873) | `backfill()` + `scheduleSessionRefresh()` | same |
-| `route(event:)` `broadcast_gap` (~469–474) | `backfill()` + `refresh()` | same |
 | `scheduleSessionRefresh()` on turn boundary (~522–527) | debounced `refresh()` | list write |
 
 ConnectionStore needs **no** cache reference, **no** protocol change, **no** new

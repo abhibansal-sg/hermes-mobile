@@ -412,8 +412,8 @@ enum HermesURLRouter {
     /// payloads carry the **runtime** `session_id` (see `tui_gateway/server.py`
     /// `_push_hook` → `push_notify.notify(..., {"session_id": sid})`), while
     /// `SessionStore.open(_:)` is keyed by the **stored** id. So we translate
-    /// runtime → stored first via the inbox (which holds both, broadcast for every
-    /// prompt), then fall back to treating the id as a stored id directly (REST
+    /// runtime → stored first via the inbox (whose pending snapshot holds both),
+    /// then fall back to treating the id as a stored id directly (REST
     /// rows and the RPC list both key on the stored id, and the two coincide for
     /// fresh sessions that were never compressed).
     ///

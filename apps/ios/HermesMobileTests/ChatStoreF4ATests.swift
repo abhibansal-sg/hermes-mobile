@@ -6,7 +6,7 @@ import XCTest
 /// checkpoint truncation-ordinal mapping, and event decode round-trips.
 ///
 /// Drives `ChatStore.handle` directly with synthetic frames (no live gateway),
-/// reusing the wiring pattern from `ChatStoreForeignMirrorTests`.
+/// using the normal active-runtime wiring.
 @MainActor
 final class ChatStoreF4ATests: XCTestCase {
 
@@ -38,7 +38,7 @@ final class ChatStoreF4ATests: XCTestCase {
         ]))!
     }
 
-    /// A broadcast frame from a foreign runtime tagged with our open stored id.
+    /// A stale frame from another runtime tagged with our open stored id.
     private func foreignFrame(type: String, payload: JSONValue = .null) -> GatewayEvent {
         GatewayEvent(params: .object([
             "type": .string(type),
@@ -219,32 +219,9 @@ final class ChatStoreF4ATests: XCTestCase {
         ])))
         await settle()
 
-        // The tree assembled, and NO foreign adoption happened.
+        // The tree assembled on the active runtime.
         XCTAssertEqual(chat.subagentRoots.count, 1)
         XCTAssertEqual(chat.subagentRoots[0].activity, "thinking…")
-        #if DEBUG
-        XCTAssertEqual(chat.foreignMirrorTelemetry.foreignAdopted, 0,
-                       "a subagent frame on the local turn must never be adopted as foreign")
-        XCTAssertEqual(chat.foreignMirrorTelemetry.foreignDroppedWhileStreaming, 0)
-        #endif
-    }
-
-    /// A subagent frame broadcast from a FOREIGN runtime (different runtime id,
-    /// our stored id) renders into the tree of the adopted mirror — without ever
-    /// being misrouted to the local path.
-    func testSubagentOnForeignTurnRendersInTree() async {
-        let (chat, sessions) = makeStore()
-        sessions.activeRuntimeId = nil  // resume window: only the mirror is live
-
-        chat.handle(event: foreignFrame(type: "message.start", payload: .object([
-            "role": .string("assistant"),
-        ])))
-        chat.handle(event: foreignFrame(type: "subagent.start", payload: .object([
-            "goal": .string("Foreign delegation"),
-            "subagent_id": .string("fsa-1"),
-        ])))
-        await settle()
-        XCTAssertEqual(chat.subagentRoots.map(\.goal), ["Foreign delegation"])
     }
 
     // MARK: - Secret hygiene (BINDING)
@@ -324,7 +301,7 @@ final class ChatStoreF4ATests: XCTestCase {
         XCTAssertNil(decoded?.metadata["sensitive"], "non-string metadata is dropped")
     }
 
-    /// A foreign-broadcast sudo/secret frame must be inert — we never present
+    /// Another runtime's sudo/secret frame must be inert — we never present
     /// another client's secure prompt.
     func testForeignSecurePromptIsInert() async {
         let (chat, sessions) = makeStore()
@@ -333,7 +310,7 @@ final class ChatStoreF4ATests: XCTestCase {
             "request_id": .string("r"), "prompt": .string("p"), "env_var": .string("E"),
         ])))
         await settle()
-        XCTAssertNil(chat.pendingSecurePrompt, "a mirrored secret prompt must not be presented")
+        XCTAssertNil(chat.pendingSecurePrompt, "another runtime's secret prompt must not be presented")
     }
 
     // MARK: - Branch seed coercion (matches _coerce_seed_history)

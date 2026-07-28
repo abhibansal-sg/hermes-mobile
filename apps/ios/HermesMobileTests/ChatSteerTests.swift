@@ -3,20 +3,12 @@ import XCTest
 
 /// Coverage for `ChatStore.steer(text:)` — the `session.steer` RPC path.
 ///
-/// Key invariant being guarded: `steer()` MUST route to `interruptTarget`
-/// (= `mirroringRuntimeId ?? activeSessionId`), NOT `activeSessionId` alone.
-/// An adopted foreign mirror streams from its OWN runtime; targeting the local
-/// session id would send the steer to the wrong (possibly idle) session — the
-/// same class of bug that R1 #2 fixed for `interrupt()`.
-///
 /// All tests use the injectable `steerRPC` DEBUG seam so no live gateway or
-/// custom transport is required. Pattern mirrors `ConnectionStoreReconnectTests`
-/// (`connectRPC`) and `ChatStoreForeignMirrorTests` (foreign-frame injection).
+/// custom transport is required.
 @MainActor
 final class ChatSteerTests: XCTestCase {
 
     private let localRuntime  = "rt-local"
-    private let foreignRuntime = "rt-foreign"
     private let storedId = "stored-session-1"
 
     /// Build a wired store graph with an active local session.
@@ -33,45 +25,7 @@ final class ChatSteerTests: XCTestCase {
         return (chat, sessions)
     }
 
-    /// A broadcast `message.start` frame from a foreign runtime on the same
-    /// stored session — triggers `handleForeignFrame` adoption of `foreignRuntime`,
-    /// setting `mirroringRuntimeId = foreignRuntime` (and thus
-    /// `interruptTarget = foreignRuntime` per R1 #2).
-    private func adoptForeignMirror(chat: ChatStore) {
-        chat.handle(event: GatewayEvent(params: .object([
-            "type": .string("message.start"),
-            "session_id": .string(foreignRuntime),
-            "stored_session_id": .string(storedId),
-            "payload": .object(["role": .string("assistant")]),
-        ]))!)
-    }
-
-    // MARK: - Routing: interruptTarget (load-bearing R1 #2 mirror)
-
-    /// LOAD-BEARING: when a foreign mirror is adopted, `steer()` MUST target
-    /// the mirror's runtime, NOT the local session id.
-    func testSteerRoutesToInterruptTargetWhenMirrorAdopted() async {
-        let (chat, _) = makeStore()
-
-        // Adopt the foreign mirror — sets mirroringRuntimeId = foreignRuntime,
-        // so interruptTarget == foreignRuntime (not localRuntime).
-        adoptForeignMirror(chat: chat)
-        XCTAssertEqual(chat.interruptTarget, foreignRuntime,
-                       "precondition: mirror adoption sets interruptTarget to foreign runtime")
-
-        var capturedSessionId: String?
-        chat.steerRPC = { sessionId, _ in
-            capturedSessionId = sessionId
-            return ChatStore.SessionSteerResponse(status: "queued", text: nil)
-        }
-
-        _ = await chat.steer(text: "redirect the turn")
-
-        XCTAssertEqual(capturedSessionId, foreignRuntime,
-                       "steer MUST target the mirror's runtime (interruptTarget), not localRuntime")
-    }
-
-    /// Without a mirror, `steer()` targets the local `activeSessionId`.
+    /// Steer targets the selected active runtime.
     func testSteerRoutesToActiveSessionIdWhenNoMirror() async {
         let (chat, _) = makeStore()
 

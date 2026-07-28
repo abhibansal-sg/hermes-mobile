@@ -3,7 +3,7 @@
 #
 # PURPOSE
 # -------
-# CrossClientSyncUITests and RemoteURLModeUITests require a live Hermes
+# Gateway-backed iOS UI tests require a live Hermes
 # gateway running inside the CI VM. Without it they XCTSkip (not fail), so
 # the build stays green — but skip-always means they never actually run.
 #
@@ -45,8 +45,6 @@
 #   - HERMES_HOME is a fresh temp directory created per CI run — no state
 #     leaks between builds.
 #   - Port :9123 is chosen to never collide with :9119 (the live dashboard).
-#   - HERMES_GATEWAY_BROADCAST=1 enables the multi-client mirror path that
-#     CrossClientSyncUITests exercises.
 #   - The gateway is bound to 127.0.0.1:9123 (loopback) — the simulator
 #     and the test runner share the same OS network namespace on CI VMs.
 #   - The gateway PID is recorded and cleaned up by a trap on exit.
@@ -114,7 +112,6 @@ pip install --quiet fastapi uvicorn 2>&1 | tail -3
 # --------------------------------------------------------------------------
 export ANTHROPIC_API_KEY="${HERMES_CI_MODEL_KEY:-}"   # may be empty → gateway won't run LLM calls
 export HERMES_DASHBOARD_SESSION_TOKEN="$HERMES_CI_TOKEN"
-export HERMES_GATEWAY_BROADCAST=1
 
 GATEWAY_PORT=9123
 GATEWAY_HOST="127.0.0.1"

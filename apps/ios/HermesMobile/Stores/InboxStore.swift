@@ -7,14 +7,14 @@ import Foundation
 /// Where `ChatStore` only surfaces the approval / clarification belonging to the
 /// transcript currently on screen, `InboxStore` accumulates **every**
 /// `approval.request` / `clarify.request` the gateway emits — across all
-/// sessions — because the gateway broadcasts these prompts to every connected
-/// client (`HERMES_GATEWAY_BROADCAST=1`) and each carries its own `session_id`
-/// (+ `stored_session_id`). This gives the user one place to clear pending
+/// sessions. The plugin's pending-attention snapshot supplies cross-session
+/// state, while live events update the currently connected client. This gives
+/// the user one place to clear pending
 /// agent prompts no matter which session raised them, including turns driven by
 /// another client (e.g. the desktop) or by a background cron session.
 ///
 /// Each item is answered against **its own** `sessionId`, not the active
-/// session: a broadcast approval from a foreign runtime must be resolved on
+/// session: an approval from another runtime must be resolved on
 /// that runtime or it will hang forever. Answering moves the durable row through
 /// responding to a server-confirmed terminal state; a
 /// `message.complete` for an item's session marks any still-pending items for
@@ -71,8 +71,8 @@ final class InboxStore {
         /// Runtime `session_id` the prompt belongs to — the target of the
         /// response RPC.
         let sessionId: String
-        /// Persistent `stored_session_id`, when the gateway broadcast included
-        /// it. Used for session-title lookup against `SessionStore`.
+        /// Persistent `stored_session_id`, when supplied by the event or pending
+        /// snapshot. Used for session-title lookup against `SessionStore`.
         let storedSessionId: String?
         let kind: Kind
         let payload: Payload
@@ -133,7 +133,7 @@ final class InboxStore {
     /// The stored-session id for a given runtime `session_id`, if any accumulated
     /// item carries that mapping. Push payloads carry the **runtime** session id;
     /// `SessionStore.open(_:)` needs the **stored** id, so this bridges the two
-    /// using the broadcast prompts the inbox already holds.
+    /// using the pending-attention items the inbox already holds.
     func storedSessionId(forRuntime sessionId: String) -> String? {
         items.first { $0.sessionId == sessionId }?.storedSessionId
     }
@@ -227,7 +227,7 @@ final class InboxStore {
             activeScope = scope
             publish(snapshot)
         } catch RestError.badStatus(let code, _) where code == 404 || code == 405 {
-            // Old gateway: live broadcasts remain the best available authority.
+            // Old gateway: live events remain the best available authority.
         } catch {
             // Offline/decoding failures retain the last indivisible disk snapshot.
         }
@@ -254,9 +254,8 @@ final class InboxStore {
     /// session — the turn finished without the prompt being answered here, so
     /// it can no longer be acted on. All other event types are ignored.
     ///
-    /// Unlike `ChatStore`, this is session-agnostic: it accepts prompts from
-    /// every session the gateway broadcasts, which is the whole point of the
-    /// inbox.
+    /// Unlike `ChatStore`, this is session-agnostic: snapshot refresh supplies
+    /// cross-session prompts and live events update the connected runtime.
     func handle(event: GatewayEvent) {
         switch event.type {
         case .approvalRequest:
@@ -366,7 +365,7 @@ final class InboxStore {
         ) {
         case .resolved, .alreadyHandled:
             // The RPC response is authoritative server confirmation. Keep a
-            // terminal row on disk so an older broadcast/snapshot cannot re-arm
+            // terminal row on disk so an older event/snapshot cannot re-arm
             // it; the next delta tombstone advances the durable revision.
             await commitState(id: item.id, state: .resolvedElsewhere)
             await refresh()

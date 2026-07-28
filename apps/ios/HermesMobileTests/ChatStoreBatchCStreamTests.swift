@@ -4,7 +4,7 @@ import XCTest
 /// ABH-87 **Batch C** — stream reducer parity (contract §2.5 + the D3/D4 fixes).
 ///
 /// Distinct from `ChatStoreBatchCTests` (which pins the *ABH-48* R1 "Batch C"
-/// composer-queue/foreign-mirror family — same letter, different epic). This
+/// composer-queue/session-ownership family — same letter, different epic). This
 /// suite is the transcript-parity Batch C:
 ///  - **D3** reasoning lands/settles IN PLACE, including same-flush-window
 ///    ordering (reasoning-then-text when both deltas land in one ~40ms window);

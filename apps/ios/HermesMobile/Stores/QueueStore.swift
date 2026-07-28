@@ -86,9 +86,11 @@ final class QueueStore {
             state = job.state
             errorMessage = job.lastErrorMessage
             isClaimed = job.leaseOwner != nil
-            switch job.lastErrorCode {
-            case "in_progress": displayState = .inProgress
-            case "indeterminate", "transport_ambiguous": displayState = .indeterminate
+            switch (job.lastErrorCode, job.state) {
+            case ("in_progress", _): displayState = .inProgress
+            case ("transport_ambiguous", .failed): displayState = .failed
+            case ("indeterminate", _), ("transport_ambiguous", _):
+                displayState = .indeterminate
             default:
                 switch job.state {
                 case .waitingForScope, .queued, .creatingDestination, .retryWait:

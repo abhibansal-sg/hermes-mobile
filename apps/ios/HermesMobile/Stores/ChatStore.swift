@@ -274,8 +274,7 @@ func fetchTranscriptAround(
 }
 
 /// Subsystem logger for transcript reconciliation. Backfill failures used to be
-/// swallowed by a bare `catch`; they now surface here (and, in DEBUG, on the
-/// bridge-readable counters) so a future REST-error mirror drop is not invisible.
+/// swallowed by a bare `catch`; they now surface here and in DEBUG diagnostics.
 private let chatLog = Logger(subsystem: "ai.hermes.HermesMobile", category: "ChatStore")
 
 private struct GateResponseDeliveryError: LocalizedError {
@@ -283,38 +282,8 @@ private struct GateResponseDeliveryError: LocalizedError {
 }
 
 #if DEBUG
-/// DEBUG-only telemetry for the foreign-mirror adoption gate (F3-H). Counts the
-/// decisions the gate makes so a live DEBUG build can prove, via the UI-G
-/// StateServer bridge, that foreign frames are adopted/applied/reconciled rather
-/// than silently dropped. The whole type is `#if DEBUG`-gated and is never
-/// referenced from a Release build, so it compiles out entirely — preserving
-/// Release purity (no symbols, no counter mutations on the hot path).
-struct ForeignMirrorTelemetry: Sendable, Equatable {
-    /// Foreign `message.start` frames that were adopted (mirroringRuntimeId set).
-    var foreignAdopted = 0
-    /// Foreign stream deltas applied to the transcript for the adopted runtime.
-    var foreignDeltasApplied = 0
-    /// Foreign stream frames dropped by the `:isStreaming` gate (the bug surface).
-    var foreignDroppedWhileStreaming = 0
-    /// Foreign `message.complete` frames that triggered a reconcile (teardown+backfill).
-    var foreignCompletesReconciled = 0
-    /// Times `backfill()` actually ran a REST refetch.
-    var backfillRuns = 0
-    /// Times `backfill()`'s REST refetch threw.
-    var backfillFailures = 0
-}
-
-/// DEBUG-only record of a single `isStreaming` write — who set it, to what, and
-/// in what event context. F3-H2: round-1's relocated drop site was REFUTED at
-/// the gate because `isStreaming` was already true (and `streamingIsForeign`
-/// false) by the time the foreign frames arrived, so the foreign turn was
-/// misclassified as local and dropped. The round-1 counters proved the *drop*
-/// but could not NAME the writer that set `isStreaming=true` first. This record
-/// closes that gap: every write to `isStreaming` stamps `lastStreamingSetter`
-/// and appends to a bounded ring buffer of transitions, so a live DEBUG build
-/// can read — via the StateServer bridge — exactly which code path (and which
-/// inbound event's `session_id`/`stored_session_id` vs. the app's active ids)
-/// flipped streaming on before the mirror gate ever ran. Compiled out of Release.
+/// DEBUG-only record of a single `isStreaming` write. Every write stamps its
+/// caller and event identity into a bounded ring for device diagnostics.
 struct StreamingTransition: Sendable, Equatable {
     /// Monotonic order index (0-based) of this transition within the app run.
     var seq: Int
@@ -323,7 +292,7 @@ struct StreamingTransition: Sendable, Equatable {
     /// New value `isStreaming` was set to.
     var value: Bool
     /// Short setter label: `function · reason · eventType · evSid=… evStored=…
-    /// activeRid=… activeStored=… foreign=<streamingIsForeign>`.
+    /// activeRid=… activeStored=… foreign=<watchOnlyStream>`.
     var setter: String
 
     /// One compact line for JSON/log readers.
@@ -355,10 +324,13 @@ final class ChatStore {
     /// `message.complete` frame is missed or dropped (owner device-QA: the
     /// "Tasks 0/0 + red stop stuck for 3m9s" episode that needed a force-close).
     /// Cancelled on every legitimate settle path (`setStreaming(false)`,
-    /// `cancelStreaming`, `reset`, foreign-teardown). Foreign-mirror silence has
-    /// its OWN watchdog (``foreignMirrorWatchdog``) — this one guards a turn WE
-    /// are driving.
+    /// `cancelStreaming`, `reset`).
     private var localTurnWatchdog: Task<Void, Never>?
+    /// Short grace after a successful interrupt acknowledgement. The stock
+    /// gateway normally emits a terminal frame immediately; if that one frame
+    /// is lost, this bounded fallback clears only the same owned stream.
+    private var interruptSettleTask: Task<Void, Never>?
+    private static let interruptSettleGrace: Duration = .seconds(2)
     /// Stage-2 settle window (fix-round 1): sized MATERIALLY above the worst-case
     /// OPAQUE-TOOL duration — a single long bash/build tool with no incremental
     /// output and no gateway heartbeat emits ZERO frames for its whole run, so
@@ -520,20 +492,10 @@ final class ChatStore {
         return nil
     }
 
-    /// Last `backfill()` REST failure, or `nil` if the most recent backfill
-    /// succeeded or none has run. Observability for the mirror-recovery path:
-    /// a foreign turn whose live stream was dropped relies entirely on backfill,
-    /// so a silent REST error there means a permanently-missing mirror. Surfaced
-    /// here (and logged via `chatLog`) instead of being swallowed by a bare
-    /// `catch`. Not user-facing chrome — it drives diagnostics and the DEBUG
-    /// bridge — so it never clobbers `lastError`.
+    /// Last authoritative transcript refresh failure, or `nil`.
     private(set) var lastBackfillError: String?
 
     #if DEBUG
-    /// DEBUG-only adoption-gate telemetry, bridge-exposed via the UI-G
-    /// StateAccessor pattern. Release builds never reference this.
-    private(set) var foreignMirrorTelemetry = ForeignMirrorTelemetry()
-
     /// DEBUG-only label of the most recent `isStreaming` write (F3-H2). Names the
     /// function + reason + the inbound event's ids vs. the active ids, so the gate
     /// can read which path flipped streaming on. Bridge-exposed as a String.
@@ -551,7 +513,7 @@ final class ChatStore {
     /// JSON encoding of `streamingRing` for the StateServer bridge (the bridge's
     /// JSONSerialization sink can't serialize the struct array directly, so we
     /// hand it a compact JSON string — the same workaround the per-counter Int
-    /// accessors use for `ForeignMirrorTelemetry`).
+    /// accessors use for DEBUG state).
     var streamingRingJSON: String {
         let items = streamingRing.map { t -> [String: Any] in
             ["seq": t.seq, "at": t.at, "value": t.value, "setter": t.setter]
@@ -626,6 +588,7 @@ final class ChatStore {
     /// Coalescing buffers for the in-flight streaming message.
     private var textBuffer: String = ""
     private var thinkingBuffer: String = ""
+    private var bufferOwner: StreamOwner?
     /// The single in-flight flush task (deduped so we mutate at most every 40ms).
     private var flushTask: Task<Void, Never>?
     /// When the current streaming turn began. Used to gate the turn-complete
@@ -694,42 +657,39 @@ final class ChatStore {
 
     // MARK: - Event handling
 
-    /// Runtime id of a *foreign* session we are currently mirroring — another
-    /// client (e.g. the desktop) driving the same stored session, delivered
-    /// via the gateway's multi-client broadcast. Nil when the stream we're
-    /// rendering is our own.
-    private var mirroringRuntimeId: String?
+    /// True when `active_list` says the selected session is running under
+    /// another client. Stock supplies status only; it does not fan out that
+    /// client's transcript frames to this socket.
+    private var watchOnlyStream = false
 
-    /// True while the *current streaming turn was adopted from a foreign
-    /// runtime* (set when a foreign `message.start` is adopted, cleared on that
-    /// runtime's `message.complete` / teardown). This is the single fact that
-    /// distinguishes a foreign-owned `isStreaming==true` from a genuinely-local
-    /// in-flight turn, so the `message.complete` reconcile can tear down the
-    /// adopted foreign stream — and only that — without ever disturbing a local
-    /// turn. A locally-owned turn never sets this, so foreign frames can never
-    /// trip the foreign-teardown path while we own the stream.
-    private var streamingIsForeign = false
+    /// The selection that owns the currently projected stream. SessionStore is
+    /// the identity authority; ChatStore only snapshots that identity so a late
+    /// frame or callback from the previous selection cannot mutate the newly
+    /// opened transcript.
+    private struct StreamOwner: Equatable {
+        let storedID: String?
+        let runtimeID: String?
+        let selectionGeneration: UUID
+    }
 
-    /// Explicit token identifying a genuinely-LOCAL in-flight turn (F3-H2).
-    ///
-    /// Round-1 derived "a local turn is in flight" from an `isStreaming` heuristic
-    /// (`isStreaming && !streamingIsForeign`). That broke because a FOREIGN
-    /// `message.start` arriving while `activeRuntimeId` was still `nil` (the
-    /// `session.resume` window) was routed down the DIRECT, non-mirror path —
-    /// `beginStreamingMessage()` set `isStreaming = true` with
-    /// `streamingIsForeign = false`, i.e. it *looked* exactly like a local turn —
-    /// so every later foreign frame was dropped by that heuristic.
-    ///
-    /// The lesson (and the design principle): local-turn ownership must NEVER be
-    /// inferred from streaming state. It is an explicit fact, set ONLY where the
+    private var streamOwner: StreamOwner?
+
+    private var currentSelectionOwner: StreamOwner? {
+        guard let sessions else { return nil }
+        return StreamOwner(
+            storedID: sessions.activeStoredId,
+            runtimeID: sessions.activeRuntimeId,
+            selectionGeneration: sessions.selectionGeneration
+        )
+    }
+
+    /// Explicit token identifying a genuinely local in-flight turn. Ownership
+    /// is never inferred from the presentation-level `isStreaming` flag. It is
+    /// set only where the
     /// user genuinely begins a local turn — `send()`, edit/retry
     /// (`submitTruncating`), or an attachment upload that precedes one — and
     /// cleared when that turn ends (complete / interrupt / error / reset /
-    /// truncation). The foreign-adoption gate keys on this token (`no local turn`
-    /// in flight) instead of on `isStreaming`, so a foreign `message.start` that
-    /// was *never* started by the user can never masquerade as local and can never
-    /// block adoption of the foreign turn — regardless of what `isStreaming` was
-    /// flipped to by a stray frame.
+    /// truncation).
     ///
     /// A `UUID` (not a `Bool`) so a late callback from a superseded turn can be
     /// distinguished from the current one if that ever matters; today only its
@@ -786,7 +746,7 @@ final class ChatStore {
     }
 
     private var visibleCompactingSessionId: String? {
-        [activeSessionId, mirroringRuntimeId].compactMap { $0 }.first { sessionId in
+        [activeSessionId].compactMap { $0 }.first { sessionId in
             compactingSessionIds.contains(sessionId)
                 && !dismissedCompactionSessionIds.contains(sessionId)
         }
@@ -816,13 +776,13 @@ final class ChatStore {
     }
 
     /// Begin a genuinely-local turn: stamp the explicit ownership token and drop
-    /// any foreign-mirror ownership we were holding (the user is now driving this
+    /// any watch-only presentation we were holding (the user is now driving this
     /// stored session locally, so a stray foreign `message.complete` must never
     /// tear our turn down). Called from every user-initiated send path.
     private func beginLocalTurn() {
         localTurnToken = UUID()
-        mirroringRuntimeId = nil
-        streamingIsForeign = false
+        streamOwner = currentSelectionOwner
+        watchOnlyStream = false
         // A fresh local turn starts with no delegation tree (F4A-A2); the prior
         // turn's subagent branches belong to a finished turn. Subagent frames for
         // THIS turn rebuild it as the agent delegates.
@@ -853,6 +813,20 @@ final class ChatStore {
     /// ``loadTranscriptAround``) inject an override here instead.
     var transcriptPageFetch: ((String, Int, Int?) async -> TranscriptPageFetch?)?
 
+    /// Passive proof that the configured gateway echoed a submit receipt for
+    /// our stable client id. Plugin presence alone is not proof because older
+    /// deployments can lack the core receipt seam.
+    private(set) var promptReceiptsObserved = false
+
+    func resetPromptReceiptObservation() {
+        promptReceiptsObserved = false
+    }
+
+    func observePromptReceipt(clientMessageID: String?, expected: String) {
+        guard clientMessageID == expected else { return }
+        promptReceiptsObserved = true
+    }
+
     /// Context of the event currently being routed through ``handle(event:)``,
     /// used only to enrich the DEBUG streaming-setter telemetry so a write that
     /// happens *inside* event handling can name the inbound frame's ids. `nil`
@@ -865,10 +839,9 @@ final class ChatStore {
     /// `lastStreamingSetter` and appends a `StreamingTransition` to the ring
     /// buffer naming the caller (`reason`), the value, and — when a frame is being
     /// routed — that frame's `session_id`/`stored_session_id` against the active
-    /// runtime/stored ids and the current `streamingIsForeign` flag. This is the
-    /// fact round-1 could not produce: the identity of the writer that set
-    /// streaming true *before* the foreign mirror gate ran. In Release this
-    /// collapses to a plain `isStreaming = value` (the whole telemetry block is
+    /// runtime/stored ids and the current `watchOnlyStream` flag. This is the
+    /// fact round-1 could not produce: the identity of the writer. In Release
+    /// this collapses to a plain `isStreaming = value` (the whole telemetry block is
     /// `#if DEBUG`), so there is zero hot-path cost and no symbols.
     private func setStreaming(_ value: Bool, reason: String) {
         let wasStreaming = isStreaming
@@ -881,6 +854,8 @@ final class ChatStore {
             armLocalTurnWatchdog()
         } else if !value && wasStreaming {
             cancelLocalTurnWatchdog()
+            interruptSettleTask?.cancel()
+            interruptSettleTask = nil
         }
         #if DEBUG
         let ev = routingEvent
@@ -891,7 +866,7 @@ final class ChatStore {
         let activeStored = sessions?.activeStoredId ?? "-"
         let setter = "\(reason) ev=\(evType) evSid=\(evSid) evStored=\(evStored) "
             + "activeRid=\(activeRid) activeStored=\(activeStored) "
-            + "foreign=\(streamingIsForeign) mirroring=\(mirroringRuntimeId ?? "-")"
+            + "watch=\(watchOnlyStream)"
         lastStreamingSetter = setter
         streamingRing.append(StreamingTransition(
             seq: streamingSeq,
@@ -911,63 +886,20 @@ final class ChatStore {
     /// source, before any state is mutated — not inferred downstream from
     /// `isStreaming`.
     ///
-    /// - `.local`  — the frame belongs to our own active runtime turn.
-    /// - `.foreign`— another client is driving the *same stored session* we have
-    ///   open (broadcast/mirror). Crucially this is recognised even while our
-    ///   `activeRuntimeId` is still `nil` (the `session.resume` window): the round-1
-    ///   bug was that a foreign frame arriving in that window fell through to the
-    ///   LOCAL path because the old gate's `let active = activeSessionId` binding
-    ///   failed on nil. A foreign frame is identified by its `storedSessionId`
-    ///   correlating with our open stored id while its runtime id is NOT ours —
-    ///   independent of whether our runtime id is known yet.
-    /// - `.unrelated` — neither ours nor a mirror of our open session; ignored.
-    private enum FrameOwnership { case local, foreign, unrelated }
+    /// - `.local` — the frame belongs to our active runtime.
+    /// - `.unrelated` — every other runtime. Stock has no fan-out contract.
+    private enum FrameOwnership { case local, unrelated }
 
     private func ownership(of event: GatewayEvent) -> FrameOwnership {
-        let active = activeSessionId
-        // A frame on our own active runtime is unambiguously local.
-        if let sid = event.sessionId, let active, sid == active {
-            return sessions?.sessionBinding?.mode == .watch ? .foreign : .local
-        }
-        // Correlate the broadcast stored id with the session we have open (H3:
-        // trim both sides; the wire id is already trimmed in `GatewayEvent`).
-        let activeStored = sessions?.activeStoredId?
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        let correlatesToOpenSession = event.storedSessionId != nil
-            && activeStored?.isEmpty == false
-            && event.storedSessionId == activeStored
-        if correlatesToOpenSession {
-            // It mirrors our open stored session. If its runtime id is ours it's
-            // local (a stored-enriched frame for our own turn); otherwise — INCLUDING
-            // the case where our runtime id is still `nil` during resume — it is a
-            // FOREIGN turn. This is the exact window the round-1 culprit slipped
-            // through: with `active == nil` the runtime ids cannot be equal, so the
-            // frame is correctly classified foreign instead of leaking to local.
-            if let sid = event.sessionId, let active, sid == active {
-                return .local
-            }
-            return .foreign
-        }
-        // A frame carrying no stored id and no runtime id (or one that matches no
-        // open session) is treated as local only when we actually have a local
-        // turn or active runtime to attribute it to; otherwise it's unrelated.
-        // In practice our own runtime frames always carry our `sessionId`, handled
-        // above. A frame with neither id is a malformed/global frame — route it
-        // through the local switch unchanged (legacy behavior) so nothing that
-        // used to render stops rendering.
-        if event.sessionId == nil && event.storedSessionId == nil {
-            return .local
-        }
-        return .unrelated
+        guard let sessionID = event.sessionId,
+              sessionID == activeSessionId else { return .unrelated }
+        return .local
     }
 
     /// Route a gateway event into the transcript.
     ///
-    /// Ownership is decided up front by ``ownership(of:)`` (local / foreign /
-    /// unrelated). A foreign turn is adopted only when no genuinely-local turn is
-    /// in flight (the explicit ``localTurnInFlight`` token — never an `isStreaming`
-    /// heuristic), and once adopted we follow that single foreign runtime until its
-    /// `message.complete` so two sources can't interleave one transcript.
+    /// Ownership is decided up front by ``ownership(of:)``. Only the selected
+    /// runtime can mutate this transcript; every other runtime is unrelated.
     func handle(event: GatewayEvent) {
         #if DEBUG
         routingEvent = event
@@ -987,27 +919,18 @@ final class ChatStore {
                 expirePendingGates(storedSessionID: storedSessionId)
             }
             return
-        case .foreign:
-            handleForeignFrame(event)
-            return
         case .local:
             break  // fall through to the local switch below
         }
 
-        // Any in-flight streaming frame on our OWN active runtime is a
-        // genuinely-local turn (whether the user kicked it off here via `send()`
-        // or another tab of our own runtime did, and regardless of whether the
-        // `message.start` or an early delta/tool lands first). Claim local
-        // ownership explicitly so subsequent local frames are never mistaken for
-        // adoptable foreign ones. This is the SAFE counterpart to the round-1
-        // culprit: ownership is claimed here ONLY for a frame the routing layer
-        // classified `.local` — a foreign frame can never reach this switch (it is
-        // intercepted by `handleForeignFrame`). `message.complete` is excluded: it
-        // ENDS a turn, it does not begin one.
+        discardBuffersOwnedBySupersededSelection()
+
+        // A streaming frame on the selected runtime claims local ownership.
+        // `message.complete` is excluded: it ends a turn.
         switch event.type {
         case .messageStart, .messageDelta, .thinkingDelta, .reasoningDelta,
              .toolStart, .toolProgress, .toolComplete:
-            if !localTurnInFlight, !streamingIsForeign { beginLocalTurn() }
+            if !localTurnInFlight, !watchOnlyStream { beginLocalTurn() }
         case .messageComplete, .approvalRequest, .clarifyRequest,
              .gatewayReady, .statusUpdate, .unknown,
              // F4A-A2: subagent frames are SCAFFOLDING inside a turn that some
@@ -1033,11 +956,13 @@ final class ChatStore {
             beginStreamingMessage()
         case .messageDelta:
             if let text = event.payload["text"]?.stringValue, !text.isEmpty {
+                bufferOwner = currentSelectionOwner
                 textBuffer += text
                 scheduleFlush()
             }
         case .thinkingDelta, .reasoningDelta:
             if let text = event.payload["text"]?.stringValue, !text.isEmpty {
+                bufferOwner = currentSelectionOwner
                 thinkingBuffer += text
                 scheduleFlush()
             }
@@ -1120,178 +1045,12 @@ final class ChatStore {
         }
     }
 
-    /// Handle a frame classified as FOREIGN by ``ownership(of:)`` — another client
-    /// driving the same stored session we have open. The adoption gate keys on the
-    /// explicit ``localTurnInFlight`` token: a foreign turn is adopted only when the
-    /// user is NOT running a local one. A foreign-owned stream never blocks
-    /// adoption (so a prior mirrored turn's residue can't refuse the next mirror),
-    /// and — critically — a foreign frame that arrives while `activeRuntimeId` is
-    /// still `nil` is handled HERE (it can no longer leak to `beginStreamingMessage()`
-    /// and masquerade as local). The runtime id is non-nil for a real broadcast
-    /// frame; `sid` falls back to the empty string only for a malformed frame, which
-    /// the stored-id correlation in `ownership(of:)` already vetted.
-    private func handleForeignFrame(_ event: GatewayEvent) {
-        if event.type == .statusUpdate {
-            handleStatusUpdate(event)
-            return
-        }
-        let sid = event.sessionId ?? ""
-        let isPrompt = event.type == .approvalRequest || event.type == .clarifyRequest
-        if let current = mirroringRuntimeId {
-            // Already adopted this foreign runtime: a *second* concurrent foreign
-            // runtime on the same stored session is dropped, but every frame of the
-            // adopted runtime is followed through — including its live deltas, even
-            // though `isStreaming` is true for the foreign stream we adopted.
-            guard sid == current else { return }
-        } else {
-            // Adopt a foreign turn only when the user is NOT running a local one
-            // (explicit token — never an `isStreaming` heuristic). A residual
-            // foreign-owned `isStreaming` does not block adoption.
-            // Approvals/clarifications are always relevant regardless of streaming.
-            guard isPrompt || !localTurnInFlight else {
-                #if DEBUG
-                foreignMirrorTelemetry.foreignDroppedWhileStreaming += 1
-                #endif
-                return
-            }
-            if !isPrompt {
-                mirroringRuntimeId = sid
-                streamingIsForeign = true
-                #if DEBUG
-                foreignMirrorTelemetry.foreignAdopted += 1
-                #endif
-            }
-        }
-        #if DEBUG
-        if !isPrompt,
-           event.type == .messageDelta || event.type == .thinkingDelta
-            || event.type == .reasoningDelta {
-            foreignMirrorTelemetry.foreignDeltasApplied += 1
-        }
-        #endif
-        if event.type == .messageComplete || event.type == .error {
-            setSessionCompacting(event.sessionId, false)
-            #if DEBUG
-            foreignMirrorTelemetry.foreignCompletesReconciled += 1
-            #endif
-            // Tear down ONLY the adopted foreign stream state — never a
-            // genuinely-local turn (`streamingIsForeign` guards that) — so the
-            // subsequent `backfill()` is not no-op'd by its own `guard
-            // !isStreaming`. The foreign user's prompt bubble never streamed to us,
-            // so we reconcile the full transcript from the server once the mirrored
-            // turn lands. A foreign `error` ends the mirrored turn the same way —
-            // tear down and reconcile rather than leave an adopted stream spinning.
-            //
-            // §3.7 IN-PLACE RECONCILE (D9): preserve the placeholder row across the
-            // teardown so the immediately-following `backfill()`/`seed()` reconciles
-            // the finalized reply ONTO it (no blink-out + restack). The teardown
-            // records the placeholder id in `pendingForeignReconcileID`; the seed's
-            // `reconcileMessages` consumes it.
-            teardownForeignStream(preservePlaceholderForReconcile: true)
-            let backfillTask = Task {
-                await self.backfill()
-                // A foreign-mirrored turn ending is a turn completion too: the
-                // stored session just went idle, so let the queue drain into it
-                // (R1 #29 — previously only a LOCAL complete triggered the
-                // drain, stranding queued prompts whenever the completing turn
-                // was a mirror). Fired AFTER the reconcile so the drained
-                // prompt's send can't race the seed (the post-await guard
-                // would discard the mirror's reconciled text).
-                self.onTurnComplete?()
-            }
-            #if DEBUG
-            lastForeignBackfillTask = backfillTask
-            #endif
-            // The REST backfill is the authoritative reconcile for a mirrored turn;
-            // we do not also run the frame through `handleMessageComplete` (which
-            // would mutate a now torn-down streaming message).
-            return
-        }
-
-        // A live foreign frame just landed — (re)arm the staleness watchdog so a
-        // mirror whose source goes silent is ended instead of spinning forever
-        // (the "can't send after the desktop touched the session" bug).
-        armForeignMirrorWatchdog()
-
-        // Apply the adopted foreign frame through the same transcript switch a
-        // local frame uses — begin/delta/tool — so the mirrored turn renders live.
-        switch event.type {
-        case .messageStart:
-            beginStreamingMessage(foreign: true)
-            // ABH-159 — surface the foreign turn's USER prompt NOW. The gateway
-            // never broadcasts the user message as a frame (only assistant
-            // frames), so a mirror's ONLY delivery of the user bubble is the
-            // message.complete backfill — a single fragile point that's missed
-            // whenever `complete` is dropped/late (the same "mirror goes silent"
-            // failure the watchdog compensates for), leaving the user bubble
-            // absent until a force-quit reseed. Append-only by deterministic id,
-            // so the later backfill reconciles in place — never a duplicate — and
-            // it never tears down or races the live foreign assistant stream.
-            mergeForeignUserRows()
-        case .messageDelta:
-            if let text = event.payload["text"]?.stringValue, !text.isEmpty {
-                textBuffer += text
-                scheduleFlush()
-            }
-        case .thinkingDelta, .reasoningDelta:
-            if let text = event.payload["text"]?.stringValue, !text.isEmpty {
-                thinkingBuffer += text
-                scheduleFlush()
-            }
-        case .toolStart:
-            handleToolStart(event.payload)
-        case .toolProgress:
-            handleToolProgress(ToolProgressPayload(payload: event.payload))
-        case .toolComplete:
-            handleToolComplete(ToolCompletePayload(payload: event.payload))
-        case .approvalRequest:
-            handleApprovalRequest(event)
-        case .clarifyRequest:
-            handleClarifyRequest(event)
-        case .subagentStart, .subagentThinking, .subagentTool,
-             .subagentProgress, .subagentComplete:
-            // A mirrored (foreign) turn that delegates renders its subagent tree
-            // too, so the desktop's delegation is visible on the phone. The
-            // owning runtime is the ADOPTED foreign session (`sid` /
-            // `mirroringRuntimeId`), never our own `activeSessionId` — the
-            // `subagent.interrupt` RPC (STR-145) must target the runtime that
-            // actually owns the branch, not whichever one is locally active.
-            handleSubagentEvent(type: event.type, payload: event.payload, sessionId: sid)
-        case .messageComplete, .gatewayReady, .statusUpdate, .unknown,
-             // Secure prompts are session-local and never broadcast-mirrored
-             // (the gateway emits them only to the requesting runtime), so a
-             // foreign sudo/secret frame is inert — we never present another
-             // client's password/secret prompt.
-             .sudoRequest, .secretRequest,
-             // `.error` returned early above (teardown + reconcile) — listed
-             // here only for exhaustiveness.
-             .error,
-             // ABH-84: session.info is session-local (config hot-swap feedback),
-             // handled in ConnectionStore, never applies to a foreign session.
-             .sessionInfo:
-            break  // messageComplete handled above; the rest are inert here.
-        }
-    }
-
-    /// Begin (or reuse) the streaming assistant message for a turn. `foreign`
-    /// declares the ownership EXPLICITLY at the call site — the routing layer has
-    /// already classified the frame, so this never re-derives ownership. A local
-    /// `message.start` must NOT be reachable for a foreign frame: that was the
-    /// round-1 culprit, where a foreign start ran this with `foreign:false` and
-    /// claimed local ownership.
-    private func beginStreamingMessage(foreign: Bool = false) {
-        // Never crash the client on an out-of-order ownership marker. The router
-        // should set `streamingIsForeign` before this path, but a gateway restart
-        // / buffered-frame edge must degrade to a conservative foreign stream, not
-        // trip a debug assertion while the reconnect recovery is trying to run.
-        if foreign, !streamingIsForeign {
-            chatLog.warning("foreign message.start reached beginStreamingMessage without streamingIsForeign; coercing foreign ownership")
-            streamingIsForeign = true
-        }
+    /// Begin (or reuse) the streaming assistant message for this selection.
+    private func beginStreamingMessage() {
+        if streamOwner == nil { streamOwner = currentSelectionOwner }
         // A tool event may already have created the streaming message; reuse it.
         if streamingMessageID == nil {
-            if !foreign,
-               let reconnectID = pendingReconnectReconcileID,
+            if let reconnectID = pendingReconnectReconcileID,
                let index = messages.firstIndex(where: { $0.id == reconnectID && $0.role == .assistant }) {
                 // ABH-276: after a transport drop, the half-streamed local reply is
                 // left visible with a "Connection lost" warning. If the gateway
@@ -1310,7 +1069,7 @@ final class ChatStore {
             mutateStreaming { $0.isStreaming = true }
         }
         markTurnStartedIfNeeded()
-        setStreaming(true, reason: foreign ? "beginStreamingMessage(foreign)" : "beginStreamingMessage")
+        setStreaming(true, reason: "beginStreamingMessage")
     }
 
     /// Ensure there is a streaming assistant message and return its id. Tools can
@@ -1455,7 +1214,7 @@ final class ChatStore {
             // Authoritative final reasoning (ABH-46 item 5): replaces whatever
             // streamed in via thinking/reasoning deltas — the gateway's
             // `message.complete.reasoning` is the complete, settled text, and a
-            // throttled/broadcast client may have missed deltas.
+            // throttled client may have missed deltas.
             if let reasoning = completion?.reasoning, !reasoning.isEmpty {
                 message.applyFinalReasoning(reasoning)
             }
@@ -1492,10 +1251,7 @@ final class ChatStore {
         }  // withTransaction(animation: nil) — A2
         if streamingMessageID == id { streamingMessageID = nil }
         if pendingReconnectReconcileID == id { pendingReconnectReconcileID = nil }
-        // The local turn finalized. This path is only ever reached for a LOCAL
-        // frame — a foreign `message.complete` is intercepted in
-        // `handleForeignFrame` and returns before here — so releasing the
-        // local-turn token here is exactly the turn's own completion. ownership=LOCAL.
+        // The selected runtime's local turn finalized.
         endLocalTurn()
         setStreaming(false, reason: "handleMessageComplete")
         // Context-window occupancy updates once per completed turn (H1): the
@@ -1549,7 +1305,7 @@ final class ChatStore {
     /// sudo/secret prompt — ONLY on paths that prove its turn is over (the
     /// `error` terminal, a transport drop): unlike approvals it has no inbox
     /// fallback, so a reconcile that proves nothing about its turn (e.g. a
-    /// live-socket `broadcast_gap` backfill) must leave it alone. The
+    /// live-socket reconcile) must leave it alone. The
     /// complete path leaves it to `respondSecurePrompt`'s own lifecycle.
     private func expireTurnScopedPrompts(includeSecure: Bool) {
         if let approval = pendingApproval {
@@ -1632,6 +1388,31 @@ final class ChatStore {
         restoreInflightTurn(inflight, watchRuntimeId: watchOnly ? runtimeId : nil)
     }
 
+    /// Settle a Working row that exists only because this client is observing a
+    /// turn driven elsewhere. Stock does not fan out that driver's terminal
+    /// frame, so `active_list` moving to idle/absent is the authoritative edge.
+    /// Returns true exactly once so the caller performs one transcript refresh.
+    func settleWatchOnlyTurn(runtimeId: String?) -> Bool {
+        guard watchOnlyStream,
+              isStreaming,
+              streamOwner == currentSelectionOwner,
+              runtimeId == nil || runtimeId == activeSessionId else { return false }
+        flushBuffersImmediately()
+        let settledMessageID = streamingMessageID
+        mutateStreaming { $0.isStreaming = false }
+        streamingMessageID = nil
+        pendingReconnectReconcileID = settledMessageID
+        setStreaming(false, reason: "activeList.watchSettled")
+        watchOnlyStream = false
+        streamOwner = nil
+        turnStartedAt = nil
+        activeToolName = nil
+        activeToolCallId = nil
+        resetTurnLivenessState()
+        expireTurnScopedPrompts(includeSecure: false)
+        return true
+    }
+
     private func restoreInflightTurn(
         _ inflight: SessionInflightTurn?,
         watchRuntimeId: String? = nil
@@ -1643,9 +1424,8 @@ final class ChatStore {
         }
         if let watchRuntimeId {
             localTurnToken = nil
-            mirroringRuntimeId = watchRuntimeId
-            streamingIsForeign = true
-            beginStreamingMessage(foreign: true)
+            watchOnlyStream = true
+            beginStreamingMessage()
         } else {
             beginLocalTurn()
             beginStreamingMessage()
@@ -2437,7 +2217,7 @@ final class ChatStore {
     /// USER message itself. Both truncate to BEFORE the user message at that
     /// ordinal, so the chosen turn is regenerated and later turns are dropped.
     func restoreCheckpoint(toUserMessageId messageId: UUID) async {
-        // Gate on LOCAL ownership, not display state: an adopted foreign mirror
+        // Gate on LOCAL ownership, not display state: watch-only presentation
         // sets `isStreaming` while the user owns no turn, and preemptively
         // claiming "busy" off that heuristic blocked these actions whenever
         // another client was active (R1 #30). If the session IS genuinely busy,
@@ -2493,12 +2273,34 @@ final class ChatStore {
     /// calls while a flush is pending are no-ops (one mutation per frame).
     private func scheduleFlush() {
         guard flushTask == nil else { return }
+        let owner = bufferOwner
         flushTask = Task { [weak self] in
             try? await Task.sleep(for: ChatStore.flushInterval)
             guard let self, !Task.isCancelled else { return }
             self.flushTask = nil
+            guard self.currentSelectionOwner == owner,
+                  self.bufferOwner == owner else {
+                if self.bufferOwner == owner {
+                    self.textBuffer = ""
+                    self.thinkingBuffer = ""
+                    self.bufferOwner = nil
+                }
+                return
+            }
             self.flushBuffers()
         }
+    }
+
+    /// A selected-session event is newer than any buffered delta owned by the
+    /// previous selection. Drop that batch and free the one flush latch so the
+    /// new session can schedule its own frame immediately.
+    private func discardBuffersOwnedBySupersededSelection() {
+        guard let bufferOwner, bufferOwner != currentSelectionOwner else { return }
+        flushTask?.cancel()
+        flushTask = nil
+        textBuffer = ""
+        thinkingBuffer = ""
+        self.bufferOwner = nil
     }
 
     /// Apply the buffered text/thinking to the streaming message and clear buffers.
@@ -2509,6 +2311,7 @@ final class ChatStore {
         let pendingThinking = thinkingBuffer
         textBuffer = ""
         thinkingBuffer = ""
+        bufferOwner = nil
         mutateStreaming { message in
             // Wire-order rule (contract §2.5 / D3): reasoning streams as its own
             // block BEFORE the answer text it precedes, so when BOTH land in one
@@ -2532,36 +2335,6 @@ final class ChatStore {
     }
 
     #if DEBUG
-    /// DEBUG-only crash-guard probe for ABH-355.
-    ///
-    /// Drives the exact out-of-order ownership-marker condition that used to be a
-    /// DEBUG assertion: `beginStreamingMessage(foreign: true)` reached while the
-    /// caller had not yet marked `streamingIsForeign`. The production fix must
-    /// degrade to a conservative foreign stream instead of crashing.
-    func simulateOutOfOrderForeignOwnershipMarkerForTesting() {
-        beginStreamingMessage(foreign: true)
-    }
-
-    /// DEBUG-only crash-guard probe for ABH-355.
-    ///
-    /// Synthesizes the inconsistent edge that used to assert in
-    /// `teardownForeignStream`: a foreign teardown arrives while a local turn token
-    /// is still held. The guarded behavior is to preserve local ownership, clear
-    /// the stale foreign marker, and let the normal connection-drop path finalize
-    /// the local turn.
-    func simulateForeignTeardownWithLocalTurnTokenForTesting() {
-        beginLocalTurn()
-        streamingIsForeign = true
-        if streamingMessageID == nil {
-            let message = ChatMessage(role: .assistant, isStreaming: true)
-            streamingMessageID = message.id
-            messages.append(message)
-            markTurnStartedIfNeeded()
-        }
-        setStreaming(true, reason: "simulateForeignTeardownWithLocalTurnTokenForTesting")
-        teardownForeignStream()
-    }
-
     /// DEBUG-only deterministic drain hook for unit tests.
     ///
     /// Cancels the pending 40ms coalescing Task and calls the SAME `flushBuffers()`
@@ -2577,33 +2350,6 @@ final class ChatStore {
         flushBuffers()
     }
 
-    /// DEBUG-only handle to the most recent foreign-complete backfill Task.
-    /// Stored by `handleForeignFrame` when a foreign `message.complete` (or
-    /// `error`) fires the `Task { await backfill() }`. Tests await this to
-    /// deterministically wait for the REST reconcile without wall-clock settle().
-    /// Never compiled into Release.
-    private(set) var lastForeignBackfillTask: Task<Void, Never>?
-
-    /// DEBUG-only: await the most recently spawned foreign-backfill Task, then
-    /// yield once so any main-actor mutations have propagated before assertions.
-    func waitForPendingForeignBackfillForTesting() async {
-        await lastForeignBackfillTask?.value
-        await Task.yield()
-    }
-
-    /// DEBUG-only handle to the most recent `mergeForeignUserRows` Task.
-    /// Stored by `mergeForeignUserRows()` when a foreign `message.start` fires
-    /// the start-time user-bubble fetch. Tests await this to deterministically
-    /// wait for the user row to land without wall-clock settle().
-    /// Never compiled into Release.
-    private(set) var lastForeignUserRowMergeTask: Task<Void, Never>?
-
-    /// DEBUG-only: await the most recently spawned foreign user-row merge Task,
-    /// then yield once so any main-actor mutations have propagated before assertions.
-    func waitForPendingForeignUserRowMergeForTesting() async {
-        await lastForeignUserRowMergeTask?.value
-        await Task.yield()
-    }
     #endif
 
     // MARK: - Streaming-message mutation helpers
@@ -2843,6 +2589,7 @@ final class ChatStore {
         guard let client else { throw GatewayError.notConnected }
         let presentsInActiveChat =
             (job.destinationSessionID ?? job.storedSessionID) == sessions?.activeStoredId
+        let submissionSelection = sessions?.selectionGeneration
         let priorBindingMode: SessionBindingMode?
         if presentsInActiveChat {
             prepareOutboxSubmission(job: job, remotePaths: remotePaths)
@@ -2864,7 +2611,14 @@ final class ChatStore {
                 ])
             )
             let receipt = OutboxSubmitResult(json: result)
-            guard presentsInActiveChat else { return receipt }
+            observePromptReceipt(
+                clientMessageID: receipt.clientMessageID,
+                expected: job.clientMessageID
+            )
+            let stillPresentsInActiveChat = presentsInActiveChat
+                && sessions?.selectionGeneration == submissionSelection
+                && (job.destinationSessionID ?? job.storedSessionID) == sessions?.activeStoredId
+            guard stillPresentsInActiveChat else { return receipt }
             if !(receipt.accepted && OutboxProcessor.acceptedDispositions.contains(receipt.status)) {
                 sessions?.restoreWatchAfterRejectedSubmission(
                     runtimeID: runtimeSessionID,
@@ -2875,7 +2629,10 @@ final class ChatStore {
             }
             return receipt
         } catch {
-            guard presentsInActiveChat else { throw error }
+            let stillPresentsInActiveChat = presentsInActiveChat
+                && sessions?.selectionGeneration == submissionSelection
+                && (job.destinationSessionID ?? job.storedSessionID) == sessions?.activeStoredId
+            guard stillPresentsInActiveChat else { throw error }
             sessions?.restoreWatchAfterRejectedSubmission(
                 runtimeID: runtimeSessionID,
                 priorMode: priorBindingMode
@@ -3105,10 +2862,7 @@ final class ChatStore {
         rebuildUserOrdinals()
 
         /// Undo the optimistic rewrite: drop the appended user message and
-        /// re-insert the removed tail where it was. Deterministic and seed-free,
-        /// so it works even while a foreign mirror is streaming (rows a mirror
-        /// appended meanwhile end up after the restored tail; the mirror's own
-        /// complete-reconcile reorders authoritatively).
+        /// re-insert the removed tail where it was. Deterministic and seed-free.
         func restoreTruncation() {
             messages.removeAll { $0.id == newUserMessage.id }
             messages.insert(contentsOf: removedTail, at: min(index, messages.count))
@@ -3135,9 +2889,7 @@ final class ChatStore {
             setStreaming(false, reason: "submitTruncating.busy")
             lastError = "Agent is busy"
             // The server refused the turn — undo the optimistic amputation
-            // locally (reachable now that edit/retry gate on ownership: a 4009
-            // usually means a concurrent foreign turn, whose re-adoption would
-            // make a backfill restore no-op on its `!isStreaming` guard).
+            // locally; a 4009 means the stock runtime remained busy.
             restoreTruncation()
         } catch let GatewayError.rpc(code, _) where code == GatewayErrorCode.staleTruncation {
             // The target user message is no longer in the server's history.
@@ -3158,28 +2910,35 @@ final class ChatStore {
         }
     }
 
-    /// Interrupt the turn that owns the VISIBLE stream (`session.interrupt`).
-    ///
-    /// An adopted foreign mirror streams from its OWN runtime — the docked STOP
-    /// must target that runtime, not our local `activeSessionId` (which isn't
-    /// the one streaming, and is `nil` outright during the resume window), or
-    /// the visible stream can never be stopped from this device (R1 #2).
+    /// Interrupt the selected runtime's visible turn (`session.interrupt`).
     func interrupt() async {
         guard let client, let sessionId = interruptTarget else { return }
+        let interruptedOwner = streamOwner
         do {
             _ = try await client.requestRaw(
                 "session.interrupt",
                 params: .object(["session_id": .string(sessionId)])
             )
+            armInterruptSettlement(sessionID: sessionId, owner: interruptedOwner)
         } catch {
             lastError = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
         }
     }
 
-    /// The runtime ``interrupt()`` targets: the adopted foreign mirror's own
-    /// runtime when one is live, else the local active session. Factored out
-    /// so the routing fact (R1 #2) is directly assertable in tests.
-    var interruptTarget: String? { mirroringRuntimeId ?? activeSessionId }
+    /// The runtime ``interrupt()`` targets. Factored out for direct tests.
+    var interruptTarget: String? { activeSessionId }
+
+    private func armInterruptSettlement(sessionID: String, owner: StreamOwner?) {
+        interruptSettleTask?.cancel()
+        interruptSettleTask = Task { [weak self] in
+            try? await Task.sleep(for: ChatStore.interruptSettleGrace)
+            guard let self, !Task.isCancelled,
+                  self.isStreaming,
+                  self.streamOwner == owner,
+                  self.interruptTarget == sessionID else { return }
+            self.fireTurnLivenessSettle()
+        }
+    }
 
     // MARK: - Manual context compression
 
@@ -3274,10 +3033,7 @@ final class ChatStore {
     /// Inject steering text into the turn that owns the VISIBLE stream
     /// (`session.steer`).
     ///
-    /// Routing follows ``interrupt()`` exactly: an adopted foreign mirror streams
-    /// from its OWN runtime, so `interruptTarget` (= `mirroringRuntimeId ??
-    /// activeSessionId`) is the correct target — NOT `activeSessionId` alone,
-    /// which would miss a foreign turn or be `nil` during the resume window.
+    /// Routing follows ``interrupt()`` exactly via the selected runtime.
     ///
     /// This is fire-and-forget from the iOS client's perspective: the gateway
     /// owns the running turn and decides whether to accept the steer text. iOS
@@ -3344,9 +3100,8 @@ final class ChatStore {
 
     /// Answer a pending approval (`approval.respond`) and clear it after ACK.
     func respondApproval(approve: Bool, all: Bool) async {
-        // Answer against the session the approval came from — for mirrored
-        // approvals (broadcast from another client's turn) that is a foreign
-        // runtime id, not our own.
+        // Answer against the runtime named by the approval, not whichever
+        // session happens to be selected now.
         guard let pending = pendingApproval else { return }
         let owner = pendingGateOwnerSessionID
         let sessionId = pending.sessionId.isEmpty ? activeSessionId : pending.sessionId
@@ -3494,15 +3249,18 @@ final class ChatStore {
 
     /// DEBUG-ONLY: drive the REAL streaming path with a synthesized gateway
     /// delta, exactly as a WS `message.delta` frame would. The event carries
-    /// neither a `session_id` nor a `stored_session_id`, so `ownership(of:)`
-    /// classifies it `.local` (the malformed/global-frame branch) and it flows
+    /// the selected runtime/stored identity required by production routing and flows
     /// through `handle(event:)` → `beginLocalTurn` → `scheduleFlush` →
     /// `flushBuffers` → `mutateStreaming` — the same coalesced 40ms render path
     /// the device exercises. Used by the `stream` UITestSeed stress mode to make
     /// the streaming jitter measurable on the sim without a live gateway.
     func debugInjectDelta(_ text: String) {
+        guard let runtimeID = activeSessionId,
+              let storedID = sessions?.activeStoredId else { return }
         guard let event = GatewayEvent(params: .object([
             "type": .string("message.delta"),
+            "session_id": .string(runtimeID),
+            "stored_session_id": .string(storedID),
             "payload": .object(["text": .string(text)]),
         ])) else { return }
         handle(event: event)
@@ -3510,15 +3268,19 @@ final class ChatStore {
 
     /// DEBUG-ONLY: drive the REAL streaming reasoning path with a synthesized
     /// `reasoning.delta` frame, exactly as a WS reasoning delta would. It carries
-    /// no `session_id`, so `ownership(of:)` classifies it `.local` and it flows
+    /// the selected runtime/stored identity and flows
     /// through `handle(event:)` → `thinkingBuffer` → `scheduleFlush` →
     /// `flushBuffers` → `appendReasoningDelta` — the same coalesced render path a
     /// live reasoning stream exercises. Used by the `thinking` UITestSeed mode to
     /// render the live thinking block (pulsing label + inline timer + tail-scrolled
     /// faded body) for sim-scoped evidence without a live gateway.
     func debugInjectReasoningDelta(_ text: String) {
+        guard let runtimeID = activeSessionId,
+              let storedID = sessions?.activeStoredId else { return }
         guard let event = GatewayEvent(params: .object([
             "type": .string("reasoning.delta"),
+            "session_id": .string(runtimeID),
+            "stored_session_id": .string(storedID),
             "payload": .object(["text": .string(text)]),
         ])) else { return }
         handle(event: event)
@@ -3527,8 +3289,12 @@ final class ChatStore {
     /// DEBUG-ONLY: end the synthesized stream (a `message.complete`), so the
     /// streaming row settles (cursor stops, action row appears) like a real turn.
     func debugCompleteStream() {
+        guard let runtimeID = activeSessionId,
+              let storedID = sessions?.activeStoredId else { return }
         guard let event = GatewayEvent(params: .object([
             "type": .string("message.complete"),
+            "session_id": .string(runtimeID),
+            "stored_session_id": .string(storedID),
             "payload": .object([:]),
         ])) else { return }
         handle(event: event)
@@ -3561,11 +3327,11 @@ final class ChatStore {
     }
 
     func seed(from stored: [StoredMessage], policy: ReseedPolicy = .replace) {
-        // ARCH37 STEP 2 — normalize on the CURRENT actor (main here, for the
-        // synchronous/foreign-mirror callers) then apply. The off-main open/backfill
+        // ARCH37 STEP 2 — normalize on the CURRENT actor (main here, for synchronous
+        // callers) then apply. The off-main open/backfill
         // path instead pre-normalizes on its fetch Task and calls `seed(normalized:)`
         // directly (one main-actor hop for the assignment only). Both routes funnel
-        // through `seed(normalized:)` so the foreign-mirror bail + in-place reconcile
+        // through `seed(normalized:)` so the in-place reconcile
         // semantics are identical regardless of where the normalize ran.
         seed(normalized: Self.toChatMessages(stored), policy: policy)
     }
@@ -3573,17 +3339,13 @@ final class ChatStore {
     /// Apply an ALREADY-NORMALIZED seed (`toChatMessages` output) onto the
     /// transcript. The pure `toChatMessages` transform may have run OFF the main
     /// actor (ARCH37 Step 2 — the off-main open/backfill path), so this method is the
-    /// single MAIN-ACTOR hop that mutates `messages`: the foreign-mirror bail, the
+    /// single MAIN-ACTOR hop that mutates `messages`: the live-watch guard, the
     /// in-place reconcile, the ordinal rebuild, and the `transcriptGeneration` bump.
     func seed(normalized: [ChatMessage], policy: ReseedPolicy = .replace) {
-        // A slow REST seed must never wipe a LIVE adopted foreign mirror
-        // (R1 #61): open() the session another client is driving, the foreign
-        // `message.start` adopts mid-fetch, then the stale seed lands here and
-        // `cancelStreaming()` would tear the mirror down mid-turn (truncated
-        // reply, corrupted re-adoption). Bail instead — the mirror is already
-        // rendering live, and its `message.complete` runs the authoritative
-        // teardown + backfill reconcile (which clears the flag before seeding).
-        guard !streamingIsForeign else { return }
+        // Preserve a live watch only when it belongs to THIS selection. A
+        // superseded selection's stream must never swallow the new session's
+        // authoritative cache/network paint.
+        if watchOnlyStream, streamOwner == currentSelectionOwner { return }
         cancelStreaming()
         // QA-1 B4: an authoritative seed is the confirmation of what the open
         // session actually contains — zero rows IS the (honest) transcript.
@@ -3593,15 +3355,10 @@ final class ChatStore {
         if policy == .replace {
             transcriptConfirmedEmpty = normalized.isEmpty
         }
-        // IN-PLACE RECONCILE (contract Batch E §3.7, fixes D9): merge the new
+        // IN-PLACE RECONCILE: merge the new
         // seed onto the existing transcript by identity instead of a wholesale
-        // `messages = …` replace. A wholesale replace remounts every row (new
-        // SwiftUI identity) and — for a foreign-mirror reconcile — first removes
-        // the placeholder (`teardownForeignStream`) then re-adds the finalized
-        // reply from REST, so the mirrored reply BLINKS OUT and pops back
-        // restacked. The merge keeps identity for rows whose deterministic ids
-        // match across reseeds (no restack), and adopts the foreign placeholder's
-        // slot for the reconciled trailing reply (no blink, no count churn).
+        // `messages = …` replace. The merge keeps identity for rows whose
+        // deterministic ids match across reseeds, avoiding a visual restack.
         reconcileMessages(with: normalized, policy: policy)
         rebuildUserOrdinals()
         transcriptGeneration += 1
@@ -3654,18 +3411,28 @@ final class ChatStore {
               let storedId = sessions?.activeStoredId,
               let cursor,
               let fetch = resolvedTranscriptPageFetch else { return }
+        let selectionGeneration = sessions?.selectionGeneration
         let limit = usesStockPaging
             ? min(Self.transcriptOpenWindowLimit, cursor)
             : Self.transcriptOpenWindowLimit
         let pageCursor = usesStockPaging ? max(0, cursor - limit) : cursor
         guard limit > 0 else { return }
         isLoadingEarlierTranscript = true
-        defer { isLoadingEarlierTranscript = false }
+        defer {
+            if sessions?.activeStoredId == storedId,
+               sessions?.selectionGeneration == selectionGeneration {
+                isLoadingEarlierTranscript = false
+            }
+        }
         lastError = nil
         guard let page = await fetch(storedId, limit, pageCursor) else {
+            guard sessions?.activeStoredId == storedId,
+                  sessions?.selectionGeneration == selectionGeneration else { return }
             lastError = "Couldn’t load earlier messages."
             return
         }
+        guard sessions?.activeStoredId == storedId,
+              sessions?.selectionGeneration == selectionGeneration else { return }
         if !page.messages.isEmpty {
             let older = Self.toChatMessages(page.messages)
             let existing = Set(messages.map(\.id))
@@ -3700,15 +3467,25 @@ final class ChatStore {
         guard !isStreaming, !isLoadingJumpTarget, !isLoadingEarlierTranscript,
               let storedId = sessions?.activeStoredId,
               let fetch = resolvedTranscriptAroundFetch else { return false }
+        let selectionGeneration = sessions?.selectionGeneration
         jumpWindowFetchAttemptedMessageIds.insert(messageId)
         isLoadingJumpTarget = true
         jumpTargetLoadError = nil
-        defer { isLoadingJumpTarget = false }
+        defer {
+            if sessions?.activeStoredId == storedId,
+               sessions?.selectionGeneration == selectionGeneration {
+                isLoadingJumpTarget = false
+            }
+        }
 
         guard let page = await fetch(storedId, messageId, radius) else {
+            guard sessions?.activeStoredId == storedId,
+                  sessions?.selectionGeneration == selectionGeneration else { return false }
             jumpTargetLoadError = "Couldn’t load earlier messages."
             return false
         }
+        guard sessions?.activeStoredId == storedId,
+              sessions?.selectionGeneration == selectionGeneration else { return false }
         guard page.containsTarget, !page.messages.isEmpty else {
             jumpTargetLoadError = "That earlier message is no longer available."
             return false
@@ -3721,14 +3498,6 @@ final class ChatStore {
         jumpTargetLoadError = nil
         return true
     }
-
-    /// The id of a foreign-mirror placeholder assistant row that
-    /// `teardownForeignStream` left in place (contract Batch E §3.7) for the
-    /// recovery `backfill()`/`seed()` to reconcile ONTO — rather than removing it
-    /// first (which made the mirrored reply blink out). The next `seed()` adopts
-    /// this id's slot for the reconciled trailing assistant reply so identity and
-    /// row count are preserved (no blink, no restack). Cleared once consumed.
-    private var pendingForeignReconcileID: UUID?
 
     /// The id of a genuinely-local assistant row awaiting an authoritative REST
     /// reconcile, either after a transport drop or a normal terminal frame.
@@ -3753,14 +3522,7 @@ final class ChatStore {
     ///     same wire row maps to the same id across every reseed, so a backfill /
     ///     foreground refresh of an unchanged transcript mutates NOTHING that the
     ///     diff can see and the reader's scroll position is undisturbed.
-    ///  2. The foreign-mirror placeholder (a streaming row with a runtime UUID id,
-    ///     recorded in `pendingForeignReconcileID`) has no deterministic-id match,
-    ///     so it would normally be dropped and the finalized reply added — the
-    ///     blink. Instead, the FIRST unmatched trailing assistant row in `incoming`
-    ///     ADOPTS the placeholder's id + slot: its content is written onto the
-    ///     existing row in place. The reply transitions placeholder → finalized
-    ///     with zero count churn and a stable identity.
-    ///  3. Anything else in `incoming` with no match is a genuinely-new row,
+    ///  2. Anything else in `incoming` with no match is a genuinely-new row,
     ///     inserted in wire order.
     ///
     /// POLICY (QA-2 R15 — the stuck-episode segment drop):
@@ -3777,11 +3539,6 @@ final class ChatStore {
     ///    runtime id never matches ADOPTS the echo's slot (mirror of
     ///    `adoptRelayEcho`) so the two converge into one bubble.
     private func reconcileMessages(with incoming: [ChatMessage], policy: ReseedPolicy = .replace) {
-        let placeholderID = pendingForeignReconcileID
-        // A replace consumes the marker (unmatched rows are evicted anyway); a
-        // union RETAINS it when unconsumed — the retained placeholder row keeps
-        // its adoption slot for a later seed, parity with ABH-278 below.
-        if policy == .replace { pendingForeignReconcileID = nil }
         let reconnectID = pendingReconnectReconcileID
 
         // Fast path: nothing to preserve identity against.
@@ -3793,10 +3550,6 @@ final class ChatStore {
         var existingByID: [UUID: ChatMessage] = [:]
         for message in messages { existingByID[message.id] = message }
 
-        // The placeholder is adopted by at most ONE incoming row (the first
-        // unmatched trailing assistant), so track whether it has been consumed.
-        var placeholderConsumed = false
-        let placeholderRow: ChatMessage? = placeholderID.flatMap { existingByID[$0] }
         var reconnectConsumed = false
         let reconnectRow: ChatMessage? = reconnectID.flatMap { existingByID[$0] }
         let reconnectAdoptTargetID: UUID? = reconnectRow == nil
@@ -3820,26 +3573,6 @@ final class ChatStore {
                 existing.presentation = newMessage.presentation
                 updatedByID[existing.id] = existing
                 incomingOrder.append(existing.id)
-            } else if !placeholderConsumed,
-                      let placeholder = placeholderRow,
-                      newMessage.role == .assistant,
-                      placeholder.role == .assistant {
-                // The reconciled foreign reply adopts the in-flight placeholder's
-                // identity + slot (no blink, no restack). Build a new value with
-                // the placeholder's id so the row updates in place.
-                placeholderConsumed = true
-                pendingForeignReconcileID = nil
-                consumedIDs.insert(placeholder.id)
-                let adopted = ChatMessage(
-                    id: placeholder.id,
-                    role: newMessage.role,
-                    parts: newMessage.parts,
-                    isStreaming: newMessage.isStreaming,
-                    timestamp: newMessage.timestamp,
-                    presentation: newMessage.presentation
-                )
-                updatedByID[placeholder.id] = adopted
-                incomingOrder.append(placeholder.id)
             } else if !reconnectConsumed,
                       let reconnect = reconnectRow,
                       let reconnectAdoptTargetID,
@@ -4521,11 +4254,7 @@ final class ChatStore {
     }
 
     /// Cheap REST refetch to re-sync the transcript after a reconnect or
-    /// foregrounding, and the authoritative reconcile for a mirrored foreign
-    /// turn. No-op while a *local* turn is streaming (so we never stomp our own
-    /// live turn); an adopted foreign stream is torn down by the caller before
-    /// this runs (see `teardownForeignStream`), so by the time we get here
-    /// `isStreaming` reflects only a local turn.
+    /// foregrounding. No-op while a turn is streaming.
     func backfill() async {
         guard !isStreaming else { return }
         await reconcileAuthoritativeTranscript()
@@ -4534,22 +4263,19 @@ final class ChatStore {
     /// Fetch and persist the authoritative bounded transcript even while a live
     /// turn is streaming. A live projection is never replaced mid-turn; once
     /// settled, the same snapshot is unioned into the existing rows in place.
-    /// This is used by broadcast-gap and terminal checkpoints so a missed live
-    /// frame cannot also leave the durable cache stale.
+    /// Used by terminal checkpoints so a missed live frame cannot also leave
+    /// the durable cache stale.
     func reconcileAuthoritativeTranscript(surfaceFailure: Bool = true) async {
         guard let storedId = sessions?.activeStoredId else { return }
+        let selectionGeneration = sessions?.selectionGeneration
         let turnTokenAtStart = localTurnToken
-        let mirroredRuntimeAtStart = mirroringRuntimeId
         let fetch = resolvedBackfillFetch
         guard let fetch else { return }
-        #if DEBUG
-        foreignMirrorTelemetry.backfillRuns += 1
-        #endif
         do {
             let stored = try await fetch(storedId)
             guard storedId == sessions?.activeStoredId,
-                  turnTokenAtStart == localTurnToken,
-                  mirroredRuntimeAtStart == mirroringRuntimeId else { return }
+                  selectionGeneration == sessions?.selectionGeneration,
+                  turnTokenAtStart == localTurnToken else { return }
 
             if let cacheStore,
                let identity = sessions?.cacheIdentity(storedId) {
@@ -4567,7 +4293,9 @@ final class ChatStore {
             // A new/local live turn may have started while the REST request was
             // in flight. Its UI remains untouched; the completed snapshot above
             // is still safely persisted for restart recovery.
-            guard !isStreaming, storedId == sessions?.activeStoredId else {
+            guard !isStreaming,
+                  storedId == sessions?.activeStoredId,
+                  selectionGeneration == sessions?.selectionGeneration else {
                 lastBackfillError = nil
                 return
             }
@@ -4580,17 +4308,14 @@ final class ChatStore {
             lastBackfillError = nil
         } catch {
             // Backfill is best-effort for the transcript (we keep what we have),
-            // but the failure must NOT be invisible: a mirrored foreign turn
-            // whose live stream was dropped relies entirely on this path, so a
-            // silent REST error here is a permanently-missing mirror. Surface it.
-            #if DEBUG
-            foreignMirrorTelemetry.backfillFailures += 1
-            #endif
+            // but the failure must NOT be invisible: authoritative settlement
+            // and reconnect recovery rely on this path. Surface it.
             // A failure from a superseded fetch (the session switched while it
             // was in flight) belongs to a session that is no longer on screen —
             // never surface it on the NEW session (R1 #21's catch-side twin).
             guard surfaceFailure,
-                  storedId == sessions?.activeStoredId else { return }
+                  storedId == sessions?.activeStoredId,
+                  selectionGeneration == sessions?.selectionGeneration else { return }
             let description = (error as? LocalizedError)?.errorDescription
                 ?? error.localizedDescription
             lastBackfillError = description
@@ -4650,56 +4375,6 @@ final class ChatStore {
         }
     }
 
-    /// ABH-159 — surface a foreign-mirrored turn's USER prompt at message.start,
-    /// instead of waiting for the (fragile) complete-time `backfill()`.
-    ///
-    /// The gateway broadcasts ONLY assistant frames (message.start has no payload,
-    /// then deltas/tool/complete); the user's prompt text is written to the
-    /// session DB but never `_emit`'d, so the S1 fan-out can never deliver it to a
-    /// mirror. Today the foreign user bubble's only delivery is the complete-time
-    /// `backfill()` reconcile — a single point that's missed whenever
-    /// `message.complete` is dropped/late, leaving the user bubble absent until a
-    /// force-quit reseed.
-    ///
-    /// This is APPEND-ONLY and uses the SAME `toChatMessages` transform the
-    /// authoritative backfill uses, so the surfaced user row carries the exact
-    /// DETERMINISTIC id (`deterministicID(seedKey:)`, never `UUID()`) the later
-    /// `reconcileMessages` keys on — it matches by id and updates in place, NEVER
-    /// a duplicate. It never calls `cancelStreaming()`/`seed()` (which bail on a
-    /// live foreign mirror anyway), and the streaming row is located by id on
-    /// every flush (`mutateStreaming`), so inserting a row ahead of it cannot
-    /// corrupt the live assistant stream.
-    private func mergeForeignUserRows() {
-        guard streamingIsForeign, let storedId = sessions?.activeStoredId else { return }
-        let mergeTask = Task { [weak self] in
-            guard let self else { return }
-            guard let fetch = self.resolvedBackfillFetch else { return }
-            guard let stored = try? await fetch(storedId) else { return }
-            // The world may have moved during the fetch: only apply if THIS
-            // foreign mirror for THIS session is still live (otherwise the
-            // authoritative seed owns the transcript). Same guard shape as
-            // `backfill()`'s post-await check.
-            guard self.streamingIsForeign,
-                  storedId == self.sessions?.activeStoredId else { return }
-            let normalized = Self.toChatMessages(stored)
-            // The current foreign turn's prompt is the TRAILING user row. Surface
-            // only that one if it isn't already present — appending an older row
-            // here could mis-position it, and the complete-time reconcile remains
-            // the authoritative full rebuild for everything else.
-            guard let userRow = normalized.last(where: { $0.role == .user }),
-                  !self.messages.contains(where: { $0.id == userRow.id }) else { return }
-            if let placeholderIdx = self.messages.firstIndex(where: { $0.isStreaming }) {
-                self.messages.insert(userRow, at: placeholderIdx)
-            } else {
-                self.messages.append(userRow)
-            }
-            self.rebuildUserOrdinals()
-        }
-        #if DEBUG
-        lastForeignUserRowMergeTask = mergeTask
-        #endif
-    }
-
     // MARK: - Reset
 
     /// Clear all transcript state for a fresh session. `transcriptGeneration`
@@ -4739,9 +4414,6 @@ final class ChatStore {
         oldestLoadedTranscriptWireId = nil
         oldestLoadedTranscriptOffset = nil
         jumpWindowFetchAttemptedMessageIds = []
-        // A pending foreign-reconcile adoption belongs to the session being torn
-        // down (§3.7); never let it bleed into the next session's first seed.
-        pendingForeignReconcileID = nil
         pendingReconnectReconcileID = nil
         // QA-2 R12: a session teardown kills any in-flight local turn — cancel
         // its watchdog so it can never fire-settle into the fresh session.
@@ -4766,6 +4438,7 @@ final class ChatStore {
         streamingMessageID = nil
         textBuffer = ""
         thinkingBuffer = ""
+        bufferOwner = nil
         turnStartedAt = nil
         activeToolName = nil
         activeToolCallId = nil
@@ -4779,8 +4452,8 @@ final class ChatStore {
         // would gate the NEXT turn's frames).
         resetTurnLivenessState()   // QA-3 S8/A4: the torn-down turn's liveness state dies with it
         setStreaming(false, reason: "cancelStreaming")
-        mirroringRuntimeId = nil
-        streamingIsForeign = false
+        watchOnlyStream = false
+        streamOwner = nil
         // A wholesale reset (reset / open-seed / draft / pre-truncation) ends any
         // local turn too. ownership=NONE after this.
         endLocalTurn()
@@ -4790,58 +4463,6 @@ final class ChatStore {
         // connection drop, and the pre-truncation rewrite. Idempotent when no
         // activity is live; an edit/retry's fresh turn re-starts one.
         onTurnDiscarded?()
-    }
-
-    /// Tear down the streaming state of the *adopted foreign* turn so the
-    /// recovery `backfill()` can run (its `guard !isStreaming` would otherwise
-    /// no-op the very reconcile it exists to perform). This clears the foreign
-    /// stream's bookkeeping and never touches a genuinely-local in-flight turn: if
-    /// `isStreaming` is true but the stream is NOT foreign-owned
-    /// (`streamingIsForeign == false`), this is a no-op on the streaming flags and
-    /// leaves the local turn intact.
-    ///
-    /// `preservePlaceholderForReconcile` (contract Batch E §3.7, fixes D9):
-    ///  - `true` (the mirror-COMPLETE path, where `backfill()` runs IMMEDIATELY
-    ///    after): the half-rendered placeholder assistant row is LEFT in place and
-    ///    its id is recorded in `pendingForeignReconcileID`, so the following
-    ///    `seed()` reconciles the finalized reply ONTO it in place — the reply
-    ///    transitions placeholder → final without blinking out and popping back
-    ///    restacked (the old remove-then-async-backfill window).
-    ///  - `false` (the connection-DROP path, where a successful backfill is NOT
-    ///    guaranteed): the placeholder is REMOVED as before, so a drop that never
-    ///    reconciles does not strand a blank streaming bubble.
-    /// Watchdog that ends an adopted FOREIGN mirror whose source went silent. A
-    /// foreign stream (mirroring e.g. the desktop's turn) is normally torn down by
-    /// its `message.complete`; if the source disconnects mid-turn that frame never
-    /// arrives and the mirror spins forever — `isStreaming` stays true, the composer
-    /// is stuck in queue-mode, and the outbox can never drain ("can't send after the
-    /// desktop touched the session"). Re-armed on every adopted foreign frame; after
-    /// `foreignMirrorStaleTimeout` of silence it runs the SAME teardown + backfill +
-    /// drain a real completion would. Foreign-only — a local turn is never touched.
-    private var foreignMirrorWatchdog: Task<Void, Never>?
-    private static let foreignMirrorStaleTimeout: Duration = .seconds(30)
-
-    /// (Re)arm the foreign-mirror staleness watchdog.
-    private func armForeignMirrorWatchdog() {
-        foreignMirrorWatchdog?.cancel()
-        foreignMirrorWatchdog = Task { [weak self] in
-            try? await Task.sleep(for: ChatStore.foreignMirrorStaleTimeout)
-            guard let self, !Task.isCancelled, self.streamingIsForeign else { return }
-            self.fireForeignMirrorWatchdog()
-        }
-    }
-
-    /// The adopted foreign mirror went silent past the staleness window: end the
-    /// mirrored turn exactly as a `message.complete` would — teardown, authoritative
-    /// REST reconcile, then drain the outbox into the now-idle session.
-    private func fireForeignMirrorWatchdog() {
-        guard streamingIsForeign else { return }
-        chatLog.warning("foreign-mirror watchdog fired: mirrored turn went silent past the staleness window — ending it so queued sends unblock")
-        teardownForeignStream(preservePlaceholderForReconcile: true)
-        Task { [weak self] in
-            await self?.backfill()
-            self?.onTurnComplete?()
-        }
     }
 
     // MARK: - QA-2 R12 local-turn watchdog (stop-state wedge kill)
@@ -5008,6 +4629,7 @@ final class ChatStore {
         turnStartedAt = nil
         activeToolName = nil
         activeToolCallId = nil
+        endLocalTurn()
         resetTurnLivenessState()
         // R5 (contract I10/B4 — Matrix B §4 gap): a PROVISIONAL watchdog
         // settle ends the Live Activity + gates ONLY — it never drains the
@@ -5051,57 +4673,11 @@ final class ChatStore {
     }
     #endif
 
-    private func teardownForeignStream(preservePlaceholderForReconcile: Bool = false) {
-        foreignMirrorWatchdog?.cancel()
-        foreignMirrorWatchdog = nil
-        mirroringRuntimeId = nil
-        guard streamingIsForeign else { return }
-        if localTurnToken != nil {
-            chatLog.warning("foreign stream teardown saw a local turn token; preserving local ownership and clearing foreign marker")
-            streamingIsForeign = false
-            return
-        }
-        flushTask?.cancel()
-        flushTask = nil
-        if let id = streamingMessageID {
-            if preservePlaceholderForReconcile,
-               let index = messages.firstIndex(where: { $0.id == id }) {
-                // In-place reconcile (§3.7): keep the placeholder row; the next
-                // seed adopts its slot for the finalized reply (no blink). Clear
-                // its own `isStreaming` so that if the recovery backfill FAILS
-                // (no seed lands) the row does not render a spinner forever — the
-                // backfill error surfaces its own retry affordance instead.
-                messages[index].isStreaming = false
-                pendingForeignReconcileID = id
-            } else if let index = messages.firstIndex(where: { $0.id == id }) {
-                // Drop the placeholder assistant row this foreign stream was
-                // streaming into; the reconnect seed (if any) re-creates the
-                // finalized message from server history.
-                messages.remove(at: index)
-            }
-        }
-        streamingMessageID = nil
-        textBuffer = ""
-        thinkingBuffer = ""
-        turnStartedAt = nil
-        activeToolName = nil
-        activeToolCallId = nil
-        streamingIsForeign = false
-        setStreaming(false, reason: "teardownForeignStream")
-        if preservePlaceholderForReconcile {
-            // The adopted live projection ended before the authoritative row
-            // replaces it. Preserve the existing Live Activity discard seam;
-            // the completion callback fires after the reconcile.
-            onTurnDiscarded?()
-        }
-    }
-
     /// Tear down whatever stream the just-dropped transport was feeding. A dead
     /// socket can never deliver the in-flight turn's `message.complete`, so
     /// leaving `isStreaming` set wedges the transcript in a fake "streaming"
     /// state forever: the post-reconnect `backfill()` no-ops on its own
-    /// `guard !isStreaming` (R1 #9 for a local turn, R1 #42 for an adopted
-    /// foreign mirror). Called from every connection-loss path
+    /// `guard !isStreaming` (R1 #9). Called from every connection-loss path
     /// (`ConnectionStore.handle(state:)`, `disconnect()`, the dead-socket
     /// scene-phase probe). Idempotent — a no-op when nothing is streaming.
     ///
@@ -5112,15 +4688,6 @@ final class ChatStore {
     /// a reconnect banner, so no warning should land in the transcript either.
     func handleConnectionDrop(stampWarning: Bool = true) {
         clearAllCompactionIndicators()
-        // An adopted foreign mirror dies with its transport: clear the mirror
-        // bookkeeping (and its placeholder row) so the reconnect backfill can
-        // reconcile from server history (#42). No-op for a local turn.
-        teardownForeignStream()
-        // A mirrored turn's Live Activity dies with the transport too — the
-        // local-turn path below reaches this via cancelStreaming, but the
-        // foreign-only drop returns at the guard and would orphan it (R1 #26).
-        // Idempotent when nothing is live.
-        onTurnDiscarded?()
         guard isStreaming || localTurnInFlight else { return }
         // A genuinely-local in-flight turn: finalize the half-streamed bubble
         // in place — the server keeps producing without us, and the reconnect

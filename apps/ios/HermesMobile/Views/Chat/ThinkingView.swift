@@ -43,8 +43,8 @@ struct ThinkingView: View {
     /// `.animation(value: streaming)` below eases the height change when a turn
     /// settles (`streaming` true -> false). On a SEED OPEN the row is built already-
     /// settled (`streaming == false` from the first render), so a pure seed never
-    /// animates — but a row that is seeded WHILE a foreign mirror is mid-settle, or
-    /// re-created on the per-session remount (Step 1), could animate a height delta
+    /// animates — but a row seeded while a turn is mid-settle, or re-created on
+    /// the per-session remount (Step 1), could animate a height delta
     /// AFTER first paint (a post-paint contentSize change the open must not see).
     /// This latch suppresses the animation until the view has appeared once: the
     /// FIRST render (the seed paint) is never animated, so the collapsed height is

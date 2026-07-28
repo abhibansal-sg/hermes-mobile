@@ -423,10 +423,7 @@ actor HermesGatewayClient {
     }
 
     private func handleEvent(_ frame: JSONRPCInboundFrame) {
-        guard let event = GatewayEvent(
-            params: frame.params ?? .null,
-            broadcastGap: frame.broadcastGap
-        ) else { return }
+        guard let event = GatewayEvent(params: frame.params ?? .null) else { return }
 
         // The first `gateway.ready` event marks the connection open and
         // unblocks `connect`.

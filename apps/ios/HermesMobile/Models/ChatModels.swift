@@ -352,7 +352,7 @@ extension ChatMessage {
 
     /// Settle the authoritative final reasoning IN PLACE at the position it
     /// streamed (contract §2.5 / D3). The gateway's `message.complete.reasoning`
-    /// is the complete settled text; a throttled/broadcast client may have missed
+    /// is the complete settled text; a throttled client may have missed
     /// deltas. The desktop dedupe rule (use-message-stream.ts:453-468): drop a
     /// streamed reasoning run whose normalized text is a prefix of (or is
     /// prefixed by) the final, and keep wire order — never yank reasoning to the
@@ -562,7 +562,7 @@ extension ChatMessage {
         // Coalesce all text into the LAST text part's position (keeping its id for
         // ForEach/scroll identity), not the first — collapsing to the first index
         // would float the merged settled text ABOVE any interleaved tools on a
-        // mirrored turn that received text→tool→text, lying about the order
+        // reconciled turn that received text→tool→text, lying about the order
         // (review fix #4). The last text part already sits after those tools.
         let textID = parts[lastTextIndex].id
         // Count text parts before the anchor so the insertion index stays valid

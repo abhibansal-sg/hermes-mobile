@@ -5,15 +5,12 @@ import XCTest
 ///
 /// The contract: a durable outbox row gets ONE stable id (UUID) when it is
 /// created; that id is PERSISTED in `work_jobs.client_message_id` (NOT NULL) so
-/// it survives a process restart; and the SAME id is replayed on every retry of
-/// the row. The relay SUBMIT handler keys its bounded LRU by this id so an
-/// ambiguous-flap retry drives exactly one turn (see
-/// `test_downstream.test_submit_dedupes_repeat_client_message_id_across_reconnect`).
+/// it survives a process restart; and the SAME id is replayed only when the
+/// configured gateway has proved its receipt-dedup seam.
 ///
 /// This file pins the iOS half of that contract — the persistence half (the id
 /// survives a process restart) and the replay half (the row's submit closure
-/// receives the SAME id on retry). The retry-driven dedup is the relay's
-/// responsibility and is covered by the relay pytest cited above.
+/// receives the SAME id on a safe retry).
 @MainActor
 final class SubmitIdempotencyTests: XCTestCase {
     private struct Harness {
@@ -37,12 +34,24 @@ final class SubmitIdempotencyTests: XCTestCase {
         )
     }
 
+    func testReceiptProofRequiresMatchingClientMessageIDAndCanReset() {
+        let chat = ChatStore()
+        chat.observePromptReceipt(clientMessageID: "other", expected: "expected")
+        XCTAssertFalse(chat.promptReceiptsObserved)
+
+        chat.observePromptReceipt(clientMessageID: "expected", expected: "expected")
+        XCTAssertTrue(chat.promptReceiptsObserved)
+
+        chat.resetPromptReceiptObservation()
+        XCTAssertFalse(chat.promptReceiptsObserved)
+    }
+
     private struct AmbiguousFlap: Error {}
 
     /// The cmid is durable: enqueue a row, drop the repository (process death),
     /// reopen against the SAME database, fetch the row — the cmid is byte-identical.
     /// This is what makes a retry after an app force-close recognizable to the
-    /// relay's dedup LRU (A3: "survives app force-close").
+    /// gateway receipt provider (A3: "survives app force-close").
     func testClientMessageIDSurvivesProcessRestart() async throws {
         let config = try makeHarness()
         defer { try? FileManager.default.removeItem(at: config.directory) }
@@ -67,10 +76,8 @@ final class SubmitIdempotencyTests: XCTestCase {
                        "the row itself survives the restart in its pre-submit state")
     }
 
-    /// The cmid is replayed: an ambiguous-flap retry (the submit threw after the
-    /// relay already ran `prompt_submit`) retains the row in `submitting` and the
-    /// next wake resubmits with the SAME id. This is the iOS half the relay LRU
-    /// matches against (A3: "no duplicate turn on retry after ambiguous failure").
+    /// After receipt support is proven, an ambiguous flap retains the row in
+    /// `submitting` and retries with the SAME id.
     func testAmbiguousFlapRetriesWithSameClientMessageID() async throws {
         let harness = try makeHarness()
         defer { try? FileManager.default.removeItem(at: harness.directory) }
@@ -84,6 +91,7 @@ final class SubmitIdempotencyTests: XCTestCase {
             currentScope: { harness.scope },
             activeStoredSessionID: { "stored-A" },
             isTransportReady: { true },
+            canRetryAmbiguousSubmit: { true },
             createDestination: { _ in XCTFail("existing-session job must not create"); throw AmbiguousFlap() },
             resolveRuntime: { _ in "runtime-A" },
             uploadAsset: { _, _ in XCTFail("no assets on a plain prompt"); throw AmbiguousFlap() },
@@ -105,9 +113,8 @@ final class SubmitIdempotencyTests: XCTestCase {
         ))
 
         // Attempt 1: submit throws → the row is retained in `submitting` with the
-        // `transport_ambiguous` status, cmid unchanged. (The relay may or may not
-        // have run prompt_submit — the phone can't tell — so the row must drain
-        // again with the SAME id so the relay can dedupe if it did.)
+        // `transport_ambiguous` status, cmid unchanged. The gateway may or may
+        // not have accepted it; proven receipt support makes replay safe.
         processor.wake()
         await processor.waitUntilIdleForTesting()
         let retained = try await harness.repository.job(id: job.jobID)
@@ -117,9 +124,9 @@ final class SubmitIdempotencyTests: XCTestCase {
         XCTAssertEqual(retained?.clientMessageID, job.clientMessageID,
                        "the cmid is unchanged after the failed attempt")
 
-        // Attempt 2: the SAME id is replayed. The relay's LRU (keyed by cmid)
-        // recognizes this and suppresses the second turn — covered by the relay
-        // pytest; here we only prove the iOS replay.
+        // Attempt 2: the SAME id is replayed. The proven gateway receipt seam
+        // recognizes it and suppresses the second turn; here we prove iOS never
+        // regenerates the id.
         try? await Task.sleep(for: .milliseconds(30))
         await processor.waitUntilIdleForTesting()
         let completed = try await harness.repository.job(id: job.jobID)
@@ -129,5 +136,48 @@ final class SubmitIdempotencyTests: XCTestCase {
 
         let all = try await harness.repository.jobs()
         XCTAssertEqual(all.count, 1, "no duplicate row was created on retry")
+    }
+
+    func testAmbiguousFlapWithoutReceiptProofDoesNotBlindlyRetry() async throws {
+        let harness = try makeHarness()
+        defer { try? FileManager.default.removeItem(at: harness.directory) }
+        let job = try await harness.repository.enqueue(WorkJobInput(
+            kind: .prompt, scope: harness.scope, text: "uncertain delivery",
+            storedSessionID: "stored-A"
+        ))
+
+        var submittedIDs: [String] = []
+        let processor = OutboxProcessor(repository: harness.repository, dependencies: .init(
+            currentScope: { harness.scope },
+            activeStoredSessionID: { "stored-A" },
+            isTransportReady: { true },
+            createDestination: { _ in throw AmbiguousFlap() },
+            resolveRuntime: { _ in "runtime-A" },
+            uploadAsset: { _, _ in throw AmbiguousFlap() },
+            willSubmit: { _, _ in },
+            submit: { submitted, _, _ in
+                submittedIDs.append(submitted.clientMessageID)
+                throw AmbiguousFlap()
+            },
+            retryDelay: { _ in 0.01 }
+        ))
+
+        processor.wake()
+        await processor.waitUntilIdleForTesting()
+        try? await Task.sleep(for: .milliseconds(40))
+        await processor.waitUntilIdleForTesting()
+        processor.wake() // A reconnect-style wake must not replay uncertainty.
+        await processor.waitUntilIdleForTesting()
+
+        let retained = try await harness.repository.job(id: job.jobID)
+        XCTAssertEqual(submittedIDs, [job.clientMessageID],
+                       "without proven receipt dedup, an ambiguous transport loss must not resubmit")
+        XCTAssertEqual(retained?.state, .failed)
+        XCTAssertEqual(retained?.lastErrorCode, "transport_ambiguous")
+        XCTAssertNil(retained?.nextAttemptAt)
+
+        let manualRetry = try await harness.repository.retryFailedJob(id: job.jobID)
+        XCTAssertEqual(manualRetry.clientMessageID, job.clientMessageID)
+        XCTAssertEqual(manualRetry.state, .queued)
     }
 }

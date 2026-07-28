@@ -118,6 +118,9 @@ final class AppEnvironment {
                     // after the live socket completed `gateway.ready`.
                     return connectionStore.isTransportReady
                 },
+                canRetryAmbiguousSubmit: { [weak chatStore] in
+                    chatStore?.promptReceiptsObserved == true
+                },
                 busySessionID: { [weak chatStore] in
                     // Per-session serialization (Lane C fix 1): a turn streaming —
                     // or a local turn in flight — belongs to the ACTIVE session.
@@ -236,8 +239,8 @@ final class AppEnvironment {
                 sessionStore?.projectsCacheScope
             })
         }
-        // The inbox accumulates broadcast approval/clarify prompts and answers
-        // them against each prompt's own runtime via the gateway client.
+        // The inbox combines the pending-attention snapshot with live prompt
+        // events and answers each item against its own runtime.
         inboxStore.attach(connection: connectionStore)
         inboxStore.onCommittedSnapshot = { [weak chatStore, weak inboxStore] snapshot in
             if let items = inboxStore?.pendingItems {

@@ -13,10 +13,7 @@ final class StockGatewayRenderConformanceTests: XCTestCase {
             from: Data(json.utf8)
         )
         XCTAssertTrue(frame.isEvent)
-        return try XCTUnwrap(GatewayEvent(
-            params: frame.params ?? .null,
-            broadcastGap: frame.broadcastGap
-        ))
+        return try XCTUnwrap(GatewayEvent(params: frame.params ?? .null))
     }
 
     func testStockFramesRenderOneStandaloneAssistantBubble() throws {

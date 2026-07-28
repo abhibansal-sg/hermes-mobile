@@ -277,38 +277,6 @@ final class ConnectionStoreReconnectTests: XCTestCase {
         )
     }
 
-    func testOutOfOrderForeignOwnershipMarkerDegradesWithoutCrashing() async {
-        let (_, sessions, chat) = makeStore()
-        sessions.activeStoredId = "stored-foreign-guard"
-        sessions.activeRuntimeId = "rt-local"
-
-        chat.simulateOutOfOrderForeignOwnershipMarkerForTesting()
-
-        XCTAssertTrue(chat.isStreaming, "the out-of-order foreign marker should still render as a conservative stream")
-        XCTAssertFalse(chat.localTurnInFlight, "coercing a foreign marker must not claim local ownership")
-
-        chat.handleConnectionDrop()
-
-        XCTAssertFalse(chat.isStreaming, "the coerced foreign stream must be tear-downable after a transport drop")
-        XCTAssertFalse(chat.localTurnInFlight, "the foreign guard path must not leak a local ownership token")
-    }
-
-    func testForeignTeardownWithLocalTokenDegradesThenConnectionDropFinalizesLocalTurn() async {
-        let (_, sessions, chat) = makeStore()
-        sessions.activeStoredId = "stored-foreign-teardown"
-        sessions.activeRuntimeId = "rt-local"
-
-        chat.simulateForeignTeardownWithLocalTurnTokenForTesting()
-
-        XCTAssertTrue(chat.isStreaming, "the local turn must survive the refused foreign teardown")
-        XCTAssertTrue(chat.localTurnInFlight, "foreign teardown must preserve local ownership instead of crashing")
-
-        chat.handleConnectionDrop()
-
-        XCTAssertFalse(chat.isStreaming, "a later real transport drop should finalize the still-local turn")
-        XCTAssertFalse(chat.localTurnInFlight, "the transport-drop finalizer releases local ownership")
-        XCTAssertEqual(chat.messages.last?.warning, "Connection lost")
-    }
     #endif
 
     func testGatewayDiesMidTurnFinalizesReconnectingThenReattachesAndBackfills() async {

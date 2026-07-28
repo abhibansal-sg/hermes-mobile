@@ -6,12 +6,12 @@ import XCTest
 /// Two surfaces:
 ///  1. SCROLL P0 — the seed-scroll policy gate (`ChatView.seedScrollDecision`):
 ///     a FRESH session OPEN always lands on the newest message; a SAME-session
-///     reseed (backfill / mirror reconcile / foreground refresh) only auto-scrolls
+///     reseed (backfill / authoritative reconcile / foreground refresh) only auto-scrolls
 ///     if the reader was already at the bottom (§3.6 / D13 — never yank a reader
 ///     scrolled up reading history).
-///  2. §3.7 FOREIGN-MIRROR IN-PLACE RECONCILE (D9) — a desktop-driven (foreign)
-///     turn must reconcile IN PLACE: the placeholder is NOT removed-then-async-
-///     backfilled (which made the mirrored reply blink out and pop back restacked).
+///  2. §3.7 IN-PLACE RECONCILE (D9) — a settled turn must reconcile IN PLACE:
+///     the placeholder is NOT removed-then-async-backfilled (which made the
+///     reply blink out and pop back restacked).
 ///     The finalized reply adopts the placeholder's identity + slot, so the row
 ///     count does not churn and the bubble keeps its SwiftUI identity.
 ///  3. SAME-session reseed identity preservation — a backfill of an unchanged
@@ -36,17 +36,6 @@ final class ChatStoreBatchETests: XCTestCase {
         sessions.activeStoredId = storedId
         chat.backfillFetch = backfill
         return (chat, sessions)
-    }
-
-    private func foreignFrame(
-        type: String, runtime: String, stored: String, payload: JSONValue = .null
-    ) -> GatewayEvent {
-        GatewayEvent(params: .object([
-            "type": .string(type),
-            "session_id": .string(runtime),
-            "stored_session_id": .string(stored),
-            "payload": payload,
-        ]))!
     }
 
     private func storedMessage(role: String, text: String) -> StoredMessage {
@@ -83,110 +72,6 @@ final class ChatStoreBatchETests: XCTestCase {
     //
     // The behavioural contract (open-on-newest, reader-not-yanked) is verified by
     // the harness matrix (long/asynclong/netlong/switchlong/iddrift/stream cases).
-
-    // MARK: - 2. §3.7 foreign-mirror in-place reconcile (D9)
-
-    /// The headline §3.7 gate: a foreign turn completes and reconciles via the
-    /// REST seed. The placeholder is NOT removed first — the finalized reply adopts
-    /// its identity, so the assistant ROW COUNT does not churn and the bubble keeps
-    /// its SwiftUI id (no blink-out, no restack).
-    func testForeignMirrorReconcilesInPlaceWithoutCountChurn() async {
-        let (chat, _) = makeStore { _ in
-            [
-                self.storedMessage(role: "user", text: "ping from desktop"),
-                self.storedMessage(role: "assistant", text: "MIRRORTEST reply"),
-            ]
-        }
-
-        // Adopt the foreign turn + stream a delta so the placeholder assistant row
-        // exists and renders live.
-        chat.handle(event: foreignFrame(
-            type: "message.start", runtime: foreignRuntime, stored: storedId,
-            payload: ["role": "assistant"]))
-        chat.handle(event: foreignFrame(
-            type: "message.delta", runtime: foreignRuntime, stored: storedId,
-            payload: ["text": "MIRR"]))
-        // Deterministic drain: flush the 40ms coalescing buffer so the delta's
-        // text lands and the placeholder row exists before we capture its id.
-        #if DEBUG
-        chat.drainFlushForTesting()
-        #else
-        await settle()
-        #endif
-
-        // The live placeholder is the trailing assistant row; capture its identity.
-        guard let placeholder = chat.messages.last(where: { $0.role == .assistant }) else {
-            return XCTFail("a foreign placeholder assistant row must exist while streaming")
-        }
-        let placeholderID = placeholder.id
-
-        // The foreign turn completes → in-place reconcile (teardown preserves the
-        // placeholder; the seed adopts its slot).
-        chat.handle(event: foreignFrame(
-            type: "message.complete", runtime: foreignRuntime, stored: storedId,
-            payload: ["text": "MIRRORTEST reply", "status": "completed"]))
-        // Deterministic drain: await the foreign-complete backfill Task.
-        #if DEBUG
-        await chat.waitForPendingForeignBackfillForTesting()
-        #else
-        await settle()
-        #endif
-
-        XCTAssertFalse(chat.isStreaming, "streaming clears after the mirror reconciles")
-        // The reconciled assistant reply kept the placeholder's identity (in-place
-        // reconcile — no remove + re-add). This is what kills the blink/restack.
-        guard let reconciled = chat.messages.last(where: { $0.role == .assistant }) else {
-            return XCTFail("the reconciled assistant reply must be present")
-        }
-        XCTAssertEqual(reconciled.id, placeholderID,
-                       "the finalized reply must adopt the placeholder's identity (no restack)")
-        XCTAssertTrue(reconciled.text.contains("MIRRORTEST reply"),
-                      "the reconciled reply carries the authoritative final text")
-        XCTAssertFalse(reconciled.isStreaming, "the reconciled reply is settled")
-        // Exactly one user + one assistant — the user prompt reconciled from REST,
-        // the reply adopted the placeholder. No duplicate/blank rows.
-        XCTAssertEqual(chat.messages.filter { $0.role == .assistant }.count, 1)
-        XCTAssertEqual(chat.messages.filter { $0.role == .user }.count, 1)
-    }
-
-    /// A foreign complete whose reconcile FAILS (REST error) must not strand a
-    /// spinning placeholder: the preserved row's own `isStreaming` is cleared, and
-    /// the failure surfaces on `lastBackfillError`.
-    func testForeignMirrorReconcileFailureClearsPlaceholderSpinner() async {
-        struct ProbeError: LocalizedError { var errorDescription: String? { "REST 503" } }
-        let (chat, _) = makeStore { _ in throw ProbeError() }
-
-        chat.handle(event: foreignFrame(
-            type: "message.start", runtime: foreignRuntime, stored: storedId,
-            payload: ["role": "assistant"]))
-        chat.handle(event: foreignFrame(
-            type: "message.delta", runtime: foreignRuntime, stored: storedId,
-            payload: ["text": "partial"]))
-        // Deterministic drain: flush the delta buffer so the placeholder exists.
-        #if DEBUG
-        chat.drainFlushForTesting()
-        #else
-        await settle()
-        #endif
-        chat.handle(event: foreignFrame(
-            type: "message.complete", runtime: foreignRuntime, stored: storedId,
-            payload: ["text": "final", "status": "completed"]))
-        // Deterministic drain: await the foreign-complete backfill Task (which
-        // throws and surfaces the error, then clears the placeholder spinner).
-        #if DEBUG
-        await chat.waitForPendingForeignBackfillForTesting()
-        #else
-        await settle()
-        #endif
-
-        XCTAssertFalse(chat.isStreaming, "store streaming flag clears on teardown")
-        XCTAssertEqual(chat.lastBackfillError, "REST 503", "the reconcile failure surfaces")
-        // The preserved placeholder must not render a spinner forever.
-        for message in chat.messages where message.role == .assistant {
-            XCTAssertFalse(message.isStreaming,
-                           "a preserved placeholder must not spin forever after a failed reconcile")
-        }
-    }
 
     // MARK: - 3. Same-session reseed identity preservation
 

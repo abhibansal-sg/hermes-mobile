@@ -749,7 +749,7 @@ actor CacheStore {
     // MARK: - Upsert page (individual session update)
 
     /// Upsert a single SessionSummary under `scope` (e.g. from a session.info
-    /// broadcast frame or a list-diff dirty/added row). Preserves isPinned,
+    /// settled event or a list-diff dirty/added row). Preserves isPinned,
     /// lastAccessedAt, transcriptCachedAt, maxMessageId; re-stamps the scope so
     /// the row always carries a valid (serverId, profileId). If the row already
     /// exists under a DIFFERENT scope, its scope is updated to the active one

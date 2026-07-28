@@ -24,18 +24,9 @@ struct JSONRPCInboundFrame: Decodable, Sendable {
     let result: JSONValue?
     let error: JSONRPCErrorPayload?
     let params: JSONValue?
-    /// Coalesced dropped-frame count from the gateway's broadcast overflow policy
-    /// (`tui_gateway/ws.py` `obj = {**obj, "broadcast_gap": dropped}`), written at
-    /// the FRAME TOP LEVEL — a sibling of `method`/`params`, NOT inside `params`.
-    /// Decoded here at the top level and threaded into `GatewayEvent` so the REST
-    /// gap-recovery backfill (`ConnectionStore`) actually fires. The prior code
-    /// read it from `params`, where it never appears, so it was structurally
-    /// always nil and the backfill never ran.
-    let broadcastGap: Int?
 
     enum CodingKeys: String, CodingKey {
         case id, method, result, error, params
-        case broadcastGap = "broadcast_gap"
     }
 
     var isEvent: Bool { method == "event" }

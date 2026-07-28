@@ -54,6 +54,11 @@ final class OutboxProcessor {
         /// in-flight turn is handled separately by ``busySessionID`` so a turn
         /// streaming in ONE session cannot stall drains for every other session.
         var isTransportReady: () -> Bool
+        /// Whether this configured gateway has proved durable receipt support by
+        /// echoing a matching client-message id on an earlier submit response.
+        /// Without that proof, an ambiguous transport loss is held for the user
+        /// instead of risking a duplicate turn.
+        var canRetryAmbiguousSubmit: () -> Bool = { false }
         /// The stored-session id of a session that currently has a turn streaming
         /// or a local turn in flight, or `nil` when none is busy. A claimed
         /// transport job whose destination equals this id waits for that turn;
@@ -336,20 +341,33 @@ final class OutboxProcessor {
         do {
             result = try await dependencies.submit(job, runtimeID, remotePaths)
         } catch {
-            // The request may have reached the gateway. Keep `submitting` and
-            // retry the same client id after a bounded delay.
+            // The request may have reached the gateway. Automatic replay is safe
+            // only after this gateway has proved receipt deduplication. Otherwise
+            // preserve the stable id in a manual-retry row: a later reconnect
+            // must not silently turn transport ambiguity into a duplicate turn.
             ReliabilityDiagnostics.shared.outboxAmbiguous(identifier: job.jobID)
-            let retryAt = job.attemptCount < 3
-                ? Date().addingTimeInterval(dependencies.retryDelay(job.attemptCount))
-                : nil
-            try await repository.retainPendingJob(
-                id: job.jobID,
-                owner: owner,
-                status: "transport_ambiguous",
-                message: error.localizedDescription,
-                nextAttemptAt: retryAt
-            )
-            if let retryAt { scheduleRetry(at: retryAt) }
+            if dependencies.canRetryAmbiguousSubmit(), job.attemptCount < 3 {
+                let retryAt = Date().addingTimeInterval(
+                    dependencies.retryDelay(job.attemptCount)
+                )
+                try await repository.retainPendingJob(
+                    id: job.jobID,
+                    owner: owner,
+                    status: "transport_ambiguous",
+                    message: error.localizedDescription,
+                    nextAttemptAt: retryAt
+                )
+                scheduleRetry(at: retryAt)
+            } else {
+                _ = try await repository.transitionJob(
+                    id: job.jobID,
+                    from: .submitting,
+                    to: .failed,
+                    owner: owner,
+                    errorCode: "transport_ambiguous",
+                    errorMessage: "Delivery uncertain — Hermes may have received this. Check the chat before retrying."
+                )
+            }
             return false
         }
 

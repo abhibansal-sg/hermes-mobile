@@ -142,7 +142,6 @@ final class DevicesTests: XCTestCase {
             var appVersion = "1 (1)"
             var upload = ServerCapabilities.State.available
             var pushRegistry = ServerCapabilities.State.unknown
-            var broadcast = ServerCapabilities.State.unknown
             var fs = ServerCapabilities.State.available
             var subagentEvents = ServerCapabilities.State.unknown
             var profiles = ServerCapabilities.State.unknown

@@ -54,7 +54,7 @@ enum DrawerSourceGlyph {
 /// time (11, `mutedFg`) and a source GLYPH (no message count, no capsule).
 ///
 /// A live-pulse dot (theme `midground`) appears when ``isLive`` is `true` —
-/// fed by `SessionStore.isLive(_:)` (a broadcast event for this stored session
+/// fed by `SessionStore.isLive(_:)` (an observed event for this stored session
 /// arrived <10s ago; B3 owns the registry, B1 consumes it).
 struct DrawerSessionRow: View {
     @Environment(\.hermesTheme) private var theme
@@ -62,7 +62,7 @@ struct DrawerSessionRow: View {
     let summary: SessionSummary
     var isPinned: Bool = false
     var isSelected: Bool = false
-    /// Whether a broadcast event for this session landed in the last ~10s.
+    /// Whether an observed event for this session landed in the last ~10s.
     var isLive: Bool = false
 
     var body: some View {

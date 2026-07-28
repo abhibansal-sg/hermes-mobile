@@ -5,12 +5,12 @@ import GRDB
 /// ABH-47 (R1 Batch B) — ChatStore streaming-ownership and backfill races.
 ///
 /// The family these tests pin: `backfill()`/`seed()` lacked post-await
-/// re-checks (active stored id, local-turn ownership, foreign-mirror
-/// adoption), nothing cleared a wedged `isStreaming` on a transport drop, and
+/// re-checks (active stored id, selection generation, local-turn ownership),
+/// nothing cleared a wedged `isStreaming` on a transport drop, and
 /// pending prompt cards outlived the turns they belonged to. Each test drives
 /// `ChatStore.handle` with synthetic frames and injects `backfillFetch` /
 /// `transcriptFetch` so no live gateway is required (mirrors
-/// `ChatStoreForeignMirrorTests`).
+/// direct stock gateway frames).
 ///
 /// Ledger coverage: #9, #12, #21, #28, #42, #43, #51, #52, #61, #79.
 @MainActor
@@ -32,6 +32,10 @@ final class ChatStoreBatchBTests: XCTestCase {
         let attachments = AttachmentStore()
         chat.attach(connection: connection, sessions: sessions, attachments: attachments)
         sessions.attach(connection: connection, chat: chat)
+        // This helper models no live gateway. Install the existing test seam so
+        // open() takes the immediate version-guarded path instead of waiting the
+        // production transport's 120-second readiness budget.
+        sessions.resumeRPC = { _, _ in throw GatewayError.notConnected }
         if let cache {
             connection.serverURLString = "unit-test-gateway"
             chat.attachCache(cache)
@@ -230,6 +234,277 @@ final class ChatStoreBatchBTests: XCTestCase {
         XCTAssertNil(chat.lastBackfillError)
     }
 
+    func testBackfillDiscardsStaleResultAfterAtoBtoASelectionCycle() async throws {
+        let cache = try makeInMemoryCache()
+        let gate = Gate()
+        let (chat, sessions) = makeStore(cache: cache) { _ in
+            await gate.wait()
+            return [self.storedMessage(role: "assistant", text: "STALE A HISTORY")]
+        }
+        sessions.sessions = [summary(storedId), summary("stored-B")]
+        sessions.transcriptFetch = { _ in [] }
+
+        let backfillTask = Task { await chat.backfill() }
+        await Task.yield()
+
+        sessions.open(summary("stored-B"), bindRuntime: false)
+        #if DEBUG
+        await sessions.waitForPendingOpenForTesting()
+        #endif
+        sessions.open(summary(storedId), bindRuntime: false)
+        #if DEBUG
+        await sessions.waitForPendingOpenForTesting()
+        #endif
+        chat.seed(normalized: [ChatMessage(role: .assistant, text: "CURRENT A")])
+
+        gate.release()
+        await backfillTask.value
+
+        XCTAssertEqual(
+            chat.messages.map(\.text), ["CURRENT A"],
+            "returning to the same stored id must not validate an older selection generation")
+        let identity = try XCTUnwrap(sessions.cacheIdentity(storedId))
+        let cached = try await cache.loadTranscript(identity)
+        XCTAssertFalse(
+            cached?.contains {
+                $0.content.stringValue == "STALE A HISTORY"
+            } ?? false,
+            "a stale generation must not poison the reopened session's cache row")
+    }
+
+    func testLoadEarlierDiscardsPageAfterSessionSwitch() async {
+        let gate = Gate()
+        let (chat, sessions) = makeStore()
+        sessions.sessions = [summary(storedId), summary("stored-B")]
+        sessions.transcriptFetch = { _ in [] }
+        chat.seed(normalized: [ChatMessage(role: .assistant, text: "CURRENT A")])
+        chat.noteTranscriptPaging(oldestId: 50, hasMoreBefore: true)
+        chat.transcriptPageFetch = { _, _, _ in
+            await gate.wait()
+            return TranscriptPageFetch(
+                messages: [self.storedMessage(role: "assistant", text: "OLDER A")],
+                oldestId: 1,
+                hasMoreBefore: false
+            )
+        }
+
+        let pageTask = Task { await chat.loadEarlierTranscript() }
+        await Task.yield()
+        sessions.open(summary("stored-B"), bindRuntime: false)
+        #if DEBUG
+        await sessions.waitForPendingOpenForTesting()
+        #endif
+        gate.release()
+        await pageTask.value
+
+        XCTAssertFalse(
+            chat.messages.contains { $0.text == "OLDER A" },
+            "A's delayed page must not prepend into B")
+        XCTAssertFalse(chat.isLoadingEarlierTranscript)
+    }
+
+    func testJumpFetchDiscardsWindowAfterSessionSwitch() async {
+        let gate = Gate()
+        let (chat, sessions) = makeStore()
+        sessions.sessions = [summary(storedId), summary("stored-B")]
+        sessions.transcriptFetch = { _ in [] }
+        chat.seed(normalized: [ChatMessage(role: .assistant, text: "CURRENT A")])
+        chat.transcriptAroundFetch = { _, _, _ in
+            await gate.wait()
+            return TranscriptAroundFetch(
+                messages: [self.storedMessage(role: "assistant", text: "JUMP A")],
+                oldestId: 1,
+                hasMoreBefore: false,
+                containsTarget: true
+            )
+        }
+
+        let jumpTask = Task { await chat.loadTranscriptAround(messageId: 42) }
+        await Task.yield()
+        sessions.open(summary("stored-B"), bindRuntime: false)
+        #if DEBUG
+        await sessions.waitForPendingOpenForTesting()
+        #endif
+        gate.release()
+        let found = await jumpTask.value
+
+        XCTAssertFalse(found)
+        XCTAssertFalse(
+            chat.messages.contains { $0.text == "JUMP A" },
+            "A's delayed target window must not seed into B")
+        XCTAssertFalse(chat.isLoadingJumpTarget)
+        XCTAssertNil(chat.jumpTargetLoadError)
+    }
+
+    func testBufferedDeltaCannotFlushDuringDelayedNextSessionPaint() async throws {
+        let cache = try makeInMemoryCache()
+        let gate = Gate()
+        let (chat, sessions) = makeStore(cache: cache)
+        sessions.sessions = [summary(storedId), summary("stored-B")]
+        sessions.transcriptFetch = { _ in [] }
+        try await cache.saveSessionList(
+            sessions.sessions,
+            scope: CacheScope(
+                serverId: "unit-test-gateway",
+                profileId: DefaultsKeys.allProfilesScope
+            )
+        )
+        let identityB = try XCTUnwrap(sessions.cacheIdentity("stored-B"))
+        try await cache.saveTranscript(
+            identity: identityB,
+            messages: [storedMessage(role: "assistant", text: "B CACHE")]
+        )
+        #if DEBUG
+        sessions.beforeOpenSeedForTesting = { await gate.wait() }
+        #endif
+
+        chat.handle(event: frame(type: "message.start", runtime: activeRuntime, stored: storedId))
+        chat.handle(event: frame(
+            type: "message.delta",
+            runtime: activeRuntime,
+            stored: storedId,
+            payload: .object(["text": .string("LATE A DELTA")])
+        ))
+        sessions.open(summary("stored-B"), bindRuntime: false)
+        sessions.activeRuntimeId = "rt-B"
+        chat.handle(event: frame(type: "message.start", runtime: "rt-B", stored: "stored-B"))
+        chat.handle(event: frame(
+            type: "message.delta",
+            runtime: "rt-B",
+            stored: "stored-B",
+            payload: .object(["text": .string("B DELTA")])
+        ))
+
+        try? await Task.sleep(for: .milliseconds(80))
+        XCTAssertFalse(
+            chat.messages.contains { $0.text.contains("LATE A DELTA") },
+            "A's buffered delta must become a no-op as soon as B owns selection")
+        XCTAssertTrue(
+            chat.messages.contains { $0.text == "B DELTA" },
+            "A's stale flush latch must not block B's first render")
+
+        gate.release()
+        #if DEBUG
+        await sessions.waitForPendingOpenForTesting()
+        #else
+        await settle()
+        #endif
+        XCTAssertEqual(chat.messages.map(\.text), ["B CACHE"])
+    }
+
+    func testNewChatCompositeKeepsAAndBStreamsAndCachesIsolated() async throws {
+        let cache = try makeInMemoryCache()
+        let (chat, sessions) = makeStore(cache: cache) { storedID in
+            if storedID == "stored-B" {
+                return [
+                    self.storedMessage(role: "user", text: "B prompt"),
+                    self.storedMessage(role: "assistant", text: "B final"),
+                ]
+            }
+            return [self.storedMessage(role: "assistant", text: "A CACHE")]
+        }
+        let sessionA = summary(storedId)
+        let sessionB = summary("stored-B")
+        sessions.sessions = [sessionA, sessionB]
+        sessions.transcriptFetch = { _ in [] }
+        try await cache.saveSessionList(
+            sessions.sessions,
+            scope: CacheScope(
+                serverId: "unit-test-gateway",
+                profileId: DefaultsKeys.allProfilesScope
+            )
+        )
+        let identityA = try XCTUnwrap(sessions.cacheIdentity(storedId))
+        let identityB = try XCTUnwrap(sessions.cacheIdentity("stored-B"))
+        try await cache.saveTranscript(
+            identity: identityA,
+            messages: [storedMessage(role: "assistant", text: "A CACHE")]
+        )
+        try await cache.saveTranscript(
+            identity: identityB,
+            messages: [storedMessage(role: "assistant", text: "B CACHE")]
+        )
+
+        chat.handle(event: frame(type: "message.start", runtime: activeRuntime, stored: storedId))
+        chat.handle(event: frame(
+            type: "message.delta",
+            runtime: activeRuntime,
+            stored: storedId,
+            payload: .object(["text": .string("A live")])
+        ))
+        #if DEBUG
+        chat.drainFlushForTesting()
+        #endif
+
+        // The created B session becomes the selected drive target.
+        sessions.open(sessionB, bindRuntime: false)
+        #if DEBUG
+        await sessions.waitForPendingOpenForTesting()
+        #else
+        await settle()
+        #endif
+        XCTAssertEqual(chat.messages.map(\.text), ["B CACHE"])
+        sessions.activeRuntimeId = "rt-B"
+
+        // Frames from A that arrive after the selection change are unrelated.
+        chat.handle(event: frame(
+            type: "message.delta",
+            runtime: activeRuntime,
+            stored: storedId,
+            payload: .object(["text": .string("LATE A")])
+        ))
+        chat.handle(event: frame(type: "message.complete", runtime: activeRuntime, stored: storedId))
+
+        // B's submitted turn is the only stream allowed to mutate B.
+        chat.handle(event: frame(type: "message.start", runtime: "rt-B", stored: "stored-B"))
+        chat.handle(event: frame(
+            type: "message.delta",
+            runtime: "rt-B",
+            stored: "stored-B",
+            payload: .object(["text": .string("B live")])
+        ))
+        chat.handle(event: frame(type: "message.complete", runtime: "rt-B", stored: "stored-B"))
+        await settle()
+
+        XCTAssertFalse(chat.isStreaming)
+        XCTAssertFalse(chat.messages.contains { $0.text.contains("LATE A") })
+        XCTAssertTrue(chat.messages.contains { $0.text == "B final" })
+
+        // Warm A→B→A paints each cache key only into its own selection.
+        sessions.open(sessionA, bindRuntime: false)
+        #if DEBUG
+        await sessions.waitForPendingOpenForTesting()
+        #else
+        await settle()
+        #endif
+        XCTAssertEqual(chat.messages.map(\.text), ["A CACHE"])
+        sessions.open(sessionB, bindRuntime: false)
+        #if DEBUG
+        await sessions.waitForPendingOpenForTesting()
+        #else
+        await settle()
+        #endif
+        XCTAssertTrue(
+            chat.messages.contains { $0.text.hasPrefix("B ") },
+            "reopening B must paint only B's cached or reconciled transcript")
+        sessions.open(sessionA, bindRuntime: false)
+        #if DEBUG
+        await sessions.waitForPendingOpenForTesting()
+        #else
+        await settle()
+        #endif
+        XCTAssertEqual(chat.messages.map(\.text), ["A CACHE"])
+
+        let cachedA = try await cache.loadTranscript(identityA)
+        let cachedB = try await cache.loadTranscript(identityB)
+        XCTAssertFalse(cachedA?.contains {
+            ($0.content.stringValue ?? "").contains("B ")
+        } ?? false)
+        XCTAssertFalse(cachedB?.contains {
+            ($0.content.stringValue ?? "").contains("LATE A")
+        } ?? false)
+    }
+
     /// The catch-side twin: a FAILED fetch from a superseded session must not
     /// surface its error on the new session.
     func testBackfillFailureFromSupersededSessionIsNotSurfaced() async {
@@ -247,6 +522,30 @@ final class ChatStoreBatchBTests: XCTestCase {
         await backfillTask.value
 
         XCTAssertNil(chat.lastBackfillError, "a superseded fetch's failure is not ours")
+    }
+
+    func testBackfillErrorSurfaces() async {
+        let (chat, _) = makeStore { _ in throw URLError(.timedOut) }
+
+        await chat.backfill()
+
+        XCTAssertNotNil(chat.lastBackfillError)
+    }
+
+    func testBackfillSuccessClearsError() async {
+        var shouldFail = true
+        let (chat, _) = makeStore { _ in
+            if shouldFail { throw URLError(.timedOut) }
+            return [self.storedMessage(role: "assistant", text: "recovered")]
+        }
+
+        await chat.backfill()
+        XCTAssertNotNil(chat.lastBackfillError)
+        shouldFail = false
+        await chat.backfill()
+
+        XCTAssertNil(chat.lastBackfillError)
+        XCTAssertEqual(chat.messages.map(\.text), ["recovered"])
     }
 
     // MARK: - I12: transcript backfill does not own prompt lifetime
@@ -420,56 +719,82 @@ final class ChatStoreBatchBTests: XCTestCase {
         XCTAssertTrue(chat.messages.isEmpty)
     }
 
-    // MARK: - #42: connection drop clears an adopted foreign mirror
-
-    func testConnectionDropClearsAdoptedForeignMirror() async {
-        let (chat, _) = makeStore { _ in
-            [self.storedMessage(role: "assistant", text: "mirror reconciled")]
-        }
-
+    func testSessionSwitchCannotLeaveOldStreamBlockingNewSeed() {
+        let (chat, sessions) = makeStore()
         chat.handle(event: frame(
-            type: "message.start", runtime: foreignRuntime, stored: storedId
-        ))
-        XCTAssertTrue(chat.isStreaming, "foreign turn adopted")
-
-        chat.handleConnectionDrop()
-        XCTAssertFalse(chat.isStreaming, "the mirror died with its transport")
-
-        // The reconnect backfill reconciles instead of no-op'ing (#42).
-        await chat.backfill()
-        XCTAssertEqual(chat.messages.map(\.text), ["mirror reconciled"])
-    }
-
-    // MARK: - #61: a stale seed must not wipe a live foreign mirror
-
-    func testSeedBailsWhileForeignMirrorIsLive() async {
-        let (chat, _) = makeStore()
-
-        chat.handle(event: frame(
-            type: "message.start", runtime: foreignRuntime, stored: storedId
+            type: "message.start", runtime: activeRuntime
         ))
         chat.handle(event: frame(
-            type: "message.delta", runtime: foreignRuntime, stored: storedId,
-            payload: .object(["text": .string("live mirror text")])
+            type: "message.delta", runtime: activeRuntime,
+            payload: .object(["text": .string("OLD SESSION STREAM")])
         ))
-        // Deterministic drain: flush the 40ms coalescing buffer so the foreign
-        // delta's text lands before sampling the state.
         #if DEBUG
         chat.drainFlushForTesting()
-        #else
-        await settle()
         #endif
-        XCTAssertTrue(chat.isStreaming)
-        let generationBefore = chat.transcriptGeneration
-        let messagesBefore = chat.messages.map(\.text)
 
-        // A slow open()-path REST seed lands while the mirror is live.
-        chat.seed(from: [storedMessage(role: "assistant", text: "STALE SEED")])
+        sessions.activeStoredId = "stored-B"
+        sessions.activeRuntimeId = "rt-B"
+        chat.seed(from: [
+            storedMessage(role: "user", text: "B USER"),
+            storedMessage(role: "assistant", text: "B ANSWER"),
+        ])
 
-        XCTAssertTrue(chat.isStreaming, "the live mirror must keep streaming")
-        XCTAssertEqual(chat.transcriptGeneration, generationBefore)
-        XCTAssertEqual(chat.messages.map(\.text), messagesBefore,
-                       "the stale seed must not replace the live mirror's transcript")
+        XCTAssertEqual(
+            chat.messages.map(\.text),
+            ["B USER", "B ANSWER"],
+            "an old session's stream ownership must not swallow the new session seed"
+        )
+        XCTAssertFalse(chat.isStreaming)
+    }
+
+    func testOwnerlessStockFrameCannotMutateVisibleTranscript() {
+        let (chat, _) = makeStore()
+        chat.seed(from: [storedMessage(role: "user", text: "VISIBLE")])
+        let ownerless = GatewayEvent(params: .object([
+            "type": .string("message.delta"),
+            "payload": .object(["text": .string("WRONG SESSION")]),
+        ]))!
+
+        chat.handle(event: ownerless)
+        #if DEBUG
+        chat.drainFlushForTesting()
+        #endif
+
+        XCTAssertEqual(chat.messages.map(\.text), ["VISIBLE"])
+        XCTAssertFalse(chat.isStreaming)
+    }
+
+    func testDifferentRuntimeFrameCannotMutateVisibleTranscript() {
+        let (chat, _) = makeStore()
+        chat.seed(from: [storedMessage(role: "user", text: "VISIBLE")])
+
+        chat.handle(event: frame(
+            type: "message.start",
+            runtime: foreignRuntime,
+            stored: storedId
+        ))
+        chat.handle(event: frame(
+            type: "message.delta",
+            runtime: foreignRuntime,
+            stored: storedId,
+            payload: .object(["text": .string("WRONG SESSION")])
+        ))
+
+        XCTAssertEqual(chat.messages.map(\.text), ["VISIBLE"])
+        XCTAssertFalse(chat.isStreaming)
+    }
+
+    func testBoundedSettleReleasesLocalTurnOwnership() {
+        let (chat, _) = makeStore()
+        chat.handle(event: frame(type: "message.start", runtime: activeRuntime))
+        XCTAssertTrue(chat.localTurnInFlight)
+
+        #if DEBUG
+        XCTAssertTrue(chat._debugFireLocalTurnWatchdog())
+        #endif
+
+        XCTAssertFalse(chat.isStreaming)
+        XCTAssertFalse(chat.localTurnInFlight)
     }
 
     // MARK: - #28/#43: superseded open() seeds are dropped (token re-check)
@@ -579,6 +904,45 @@ final class ChatStoreBatchBTests: XCTestCase {
         await settle()
         #endif
         XCTAssertEqual(reveals, ["B"], "stale first paint must not close after supersession")
+    }
+
+    func testGatewayScopeInvalidationConsumesPendingDrawerClose() async {
+        let (_, sessions) = makeStore()
+        let gate = Gate()
+        #if DEBUG
+        sessions.beforeOpenSeedForTesting = { await gate.wait() }
+        #endif
+        var revealCount = 0
+
+        sessions.open(summary("stored-scope")) {
+            revealCount += 1
+        }
+        sessions.invalidateGatewayScopeWork()
+
+        XCTAssertEqual(
+            revealCount, 1,
+            "scope rotation during the reveal window must honor the user's plain close intent")
+        gate.release()
+    }
+
+    func testCommittedDrawerReopenVoidsPendingClose() async {
+        let (_, sessions) = makeStore()
+        let gate = Gate()
+        #if DEBUG
+        sessions.beforeOpenSeedForTesting = { await gate.wait() }
+        #endif
+        var revealCount = 0
+
+        sessions.open(summary("stored-drag")) {
+            revealCount += 1
+        }
+        sessions.voidPendingDrawerReveal()
+        try? await Task.sleep(for: .milliseconds(350))
+
+        XCTAssertEqual(
+            revealCount, 0,
+            "a committed drag-reopen owns the drawer and cancels the older close intent")
+        gate.release()
     }
 
     /// ABH-372: a session that was already opened once in this app process must
@@ -735,7 +1099,7 @@ final class ChatStoreBatchBTests: XCTestCase {
         )
     }
 
-    /// A live-socket reconcile (e.g. `broadcast_gap`) proves nothing about the
+    /// A live-socket reconcile proves nothing about the
     /// secure prompt's turn — and the secure prompt has NO inbox fallback, so
     /// expiring it there would orphan an agent genuinely blocked on it.
     func testBackfillSeedPreservesPendingSecurePrompt() async {
@@ -791,30 +1155,6 @@ final class ChatStoreBatchBTests: XCTestCase {
         XCTAssertNil(chat.pendingApproval, "approvals re-surface via the inbox when still pending")
     }
 
-    /// Branching away from a session whose foreign mirror is live must land
-    /// the NEW session's transcript: reset-then-seed (the branchSession fix)
-    /// clears the mirror that belonged to the session being left.
-    func testResetThenSeedLandsNewTranscriptDuringForeignMirror() async {
-        let (chat, sessions) = makeStore()
-        chat.handle(event: frame(
-            type: "message.start", runtime: foreignRuntime, stored: storedId
-        ))
-        XCTAssertTrue(chat.isStreaming, "foreign mirror adopted")
-
-        // branchSession's activate sequence: new ids, reset, seed.
-        sessions.activeRuntimeId = "rt-branch"
-        sessions.activeStoredId = "stored-branch"
-        chat.reset()
-        chat.seed(from: [storedMessage(role: "assistant", text: "BRANCH HISTORY")])
-
-        XCTAssertFalse(chat.isStreaming, "the old session's mirror must not survive the switch")
-        XCTAssertEqual(chat.messages.map(\.text), ["BRANCH HISTORY"])
-        XCTAssertEqual(chat.transcriptGeneration, 1)
-    }
-
-    /// I12 on the stock gateway path: the UI owner is the durable stored id,
-    /// while the runtime id remains the response target. Cache-miss resets may
-    /// clear transcript rows, but never the owning session's prompt card.
     func testStockPromptGatesMoveByStoredIdentityAcrossSessionOpens() async throws {
         let (chat, sessions) = makeStore()
         let approvalID = "approval-\(UUID().uuidString)"

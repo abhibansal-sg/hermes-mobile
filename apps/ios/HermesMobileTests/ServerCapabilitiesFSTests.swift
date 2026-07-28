@@ -25,11 +25,9 @@ final class ServerCapabilitiesFSTests: XCTestCase {
     func testResetClearsNewFields() {
         let caps = ServerCapabilities()
         caps.noteSubagentObserved()
-        caps.noteBroadcastObserved()
         caps.reset()
         XCTAssertEqual(caps.fs, .unknown)
         XCTAssertEqual(caps.subagentEvents, .unknown)
-        XCTAssertEqual(caps.broadcast, .unknown)
     }
 
     func testPluginMountControlsBundledCapabilitiesWithOneProbe() async {
