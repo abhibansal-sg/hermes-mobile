@@ -282,13 +282,100 @@ final class ProtocolParityTests: XCTestCase {
         XCTAssertEqual(sessions.sessionBinding?.mode, .watch)
         XCTAssertNil(sessions.sessionBinding?.generation)
         XCTAssertEqual(connection.sessionModelRaw, "stored-model")
-        XCTAssertEqual(connection.sessionProvider, "openrouter")
+        XCTAssertNil(
+            connection.sessionProvider,
+            "billing_provider is accounting metadata, not runtime provider truth"
+        )
         XCTAssertFalse(chat.isStreaming)
 
         let runtime = await sessions.ensureActiveRuntime()
         XCTAssertEqual(resumeCalls, 1, "the first drive action owns the resume edge")
         XCTAssertEqual(runtime, "runtime-phone")
         XCTAssertEqual(sessions.sessionBinding?.mode, .drive)
+    }
+
+    func testReconnectToWorkingStockSessionRestoresWatchState() async {
+        let chat = ChatStore()
+        let sessions = SessionStore()
+        let connection = ConnectionStore(sessionStore: sessions, chatStore: chat)
+        chat.attach(connection: connection, sessions: sessions, attachments: AttachmentStore())
+        sessions.attach(connection: connection, chat: chat)
+        sessions.transcriptFetch = { _ in [] }
+        sessions.resumeRPC = { _, _ in
+            XCTFail("an already-live session must stay on the read-only watch path")
+            throw GatewayError.notConnected
+        }
+        sessions.activeListRPC = {
+            SessionActiveListResult(sessions: [
+                SessionActiveItem(
+                    id: "runtime-working",
+                    sessionKey: "stored-working",
+                    status: .working,
+                    model: "gpt-5.6-sol"
+                ),
+            ])
+        }
+
+        sessions.open(SessionSummary(
+            id: "stored-working", title: "Working", preview: nil,
+            startedAt: 1, messageCount: 1, source: nil,
+            lastActive: 1, cwd: nil,
+            model: "gpt-5.6-sol", billingProvider: "openai-codex"
+        ))
+        await sessions.waitForPendingOpenForTesting()
+        XCTAssertTrue(chat.isStreaming)
+        XCTAssertEqual(sessions.sessionBinding?.mode, .watch)
+
+        chat.handleConnectionDrop()
+        sessions.transportDidBecomeUnavailable()
+        XCTAssertFalse(chat.isStreaming)
+        XCTAssertNil(sessions.activeRuntimeId)
+
+        let runtime = await sessions.resumeActiveAfterReconnect()
+
+        XCTAssertEqual(runtime, "runtime-working")
+        XCTAssertEqual(sessions.sessionBinding?.mode, .watch)
+        XCTAssertTrue(chat.isStreaming)
+        XCTAssertEqual(chat.interruptTarget, "runtime-working")
+    }
+
+    func testVisibleIdleSessionAdoptsMissedForeignStartFromActiveList() async {
+        let chat = ChatStore()
+        let sessions = SessionStore()
+        let connection = ConnectionStore(sessionStore: sessions, chatStore: chat)
+        chat.attach(connection: connection, sessions: sessions, attachments: AttachmentStore())
+        sessions.attach(connection: connection, chat: chat)
+        sessions.transcriptFetch = { _ in [] }
+        var isWorking = false
+        sessions.activeListRPC = {
+            SessionActiveListResult(sessions: isWorking ? [
+                SessionActiveItem(
+                    id: "runtime-foreign",
+                    sessionKey: "stored-visible",
+                    status: .working,
+                    model: "gpt-5.6-sol"
+                ),
+            ] : [])
+        }
+        sessions.resumeRPC = { _, _ in
+            XCTFail("foreground observation must never resume or steal an idle session")
+            throw GatewayError.notConnected
+        }
+        sessions.open(SessionSummary(
+            id: "stored-visible", title: "Visible", preview: nil,
+            startedAt: 1, messageCount: 1, source: nil,
+            lastActive: 1, cwd: nil,
+            model: "gpt-5.6-sol", billingProvider: nil
+        ))
+        await sessions.waitForPendingOpenForTesting()
+        XCTAssertFalse(chat.isStreaming)
+
+        isWorking = true
+        await sessions.reconcileVisibleLiveStatus()
+
+        XCTAssertTrue(chat.isStreaming)
+        XCTAssertEqual(sessions.sessionBinding?.mode, .watch)
+        XCTAssertEqual(chat.interruptTarget, "runtime-foreign")
     }
 
     func testSilentLocalTurnPreservesWorkingStockSessionWithoutHistoryFetch() async {

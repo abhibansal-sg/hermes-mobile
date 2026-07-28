@@ -39,7 +39,8 @@ struct SessionSummary: Decodable, Identifiable, Sendable, Equatable {
     var profile: String? = nil
     /// Durable model identity from stock `GET /api/sessions`.
     var model: String? = nil
-    /// Provider paired with ``model`` by the stored session row.
+    /// Accounting bucket from the stored row. This is not runtime routing
+    /// authority; the active provider comes from ``SessionRuntimeInfo/provider``.
     var billingProvider: String? = nil
 
     /// Drawer/list identity is scoped because stored session ids may collide

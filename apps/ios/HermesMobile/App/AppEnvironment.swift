@@ -135,7 +135,8 @@ final class AppEnvironment {
                     return try await sessionStore.createOutboxDestination(job: job)
                 },
                 resolveRuntime: { [weak sessionStore] storedID in
-                    return await sessionStore?.runtimeForOutboxDestination(storedID)
+                    guard let sessionStore else { throw GatewayError.notConnected }
+                    return try await sessionStore.runtimeForOutboxDestination(storedID)
                 },
                 uploadAsset: { [weak connectionStore, weak workRepository] job, snapshot in
                     guard let connectionStore,
@@ -151,7 +152,7 @@ final class AppEnvironment {
                         mimeType: snapshot.asset.mimeType,
                         ownerJobID: job.jobID
                     )
-                    guard let runtimeID = await sessionStore.runtimeForOutboxDestination(
+                    guard let runtimeID = try await sessionStore.runtimeForOutboxDestination(
                         job.destinationSessionID ?? job.storedSessionID ?? ""
                     ) else { throw OutboxProcessorError.destinationUnavailable }
                     _ = try await client.requestRaw(

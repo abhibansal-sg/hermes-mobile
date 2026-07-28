@@ -32,6 +32,7 @@ struct ChatView: View {
     /// Paired with the theme id in each bubble's `Equatable` value (A1): catches an
     /// adaptive theme's light↔dark flip, where the theme name is unchanged.
     @Environment(\.colorScheme) private var colorScheme
+    @Environment(\.scenePhase) private var scenePhase
     /// Optional hook invoked when the user chooses "Speak" on an assistant
     /// message. Wiring to the speech player happens during integration; nil
     /// (default) hides the Speak action.
@@ -502,6 +503,17 @@ struct ChatView: View {
                     presentToast(newError)
                 }
                 .onAppear { presentToast(chatStore.lastError) }
+                .task(id: sessionStore.activeStoredId.map {
+                    "\($0)|active=\(scenePhase == .active)"
+                }) {
+                    guard sessionStore.activeStoredId != nil else { return }
+                    while !Task.isCancelled {
+                        if scenePhase == .active, connectionStore.isTransportReady {
+                            await sessionStore.reconcileVisibleLiveStatus()
+                        }
+                        try? await Task.sleep(for: .milliseconds(1_500))
+                    }
+                }
                 .sheet(item: $editingMessage) { message in
                     EditMessageSheet(
                         original: message,

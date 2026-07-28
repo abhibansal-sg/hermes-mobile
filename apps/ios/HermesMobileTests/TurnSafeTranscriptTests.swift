@@ -58,6 +58,95 @@ final class TurnSafeTranscriptTests: XCTestCase {
         let normalized = ChatStore.toChatMessages(stored)
         XCTAssertEqual(normalized.map(\.role), [.user, .assistant])
     }
+
+    func testBoundedFetchUsesContinuationIdentityForCountAndOffset() async throws {
+        CompressionContinuationStub.requestedMessagePaths = []
+        CompressionContinuationStub.requestedOffsets = []
+        let config = URLSessionConfiguration.ephemeral
+        config.protocolClasses = [CompressionContinuationStub.self]
+        let rest = RestClient(
+            baseURL: URL(string: "http://127.0.0.1:9119")!,
+            token: "test-token",
+            session: URLSession(configuration: config)
+        )
+
+        let stored = try await fetchBoundedStockTranscript(
+            rest: rest,
+            sessionId: "parent",
+            profile: nil,
+            messageCount: 333,
+            limit: 50
+        )
+
+        XCTAssertEqual(
+            CompressionContinuationStub.requestedMessagePaths,
+            ["/api/sessions/parent/messages", "/api/sessions/child/messages"]
+        )
+        XCTAssertEqual(
+            CompressionContinuationStub.requestedOffsets,
+            [0, 131],
+            "the tail offset must use the 181-row continuation, not the 333-row parent"
+        )
+        XCTAssertEqual(stored.first?.role, "user")
+    }
+}
+
+private final class CompressionContinuationStub: URLProtocol, @unchecked Sendable {
+    nonisolated(unsafe) static var requestedMessagePaths: [String] = []
+    nonisolated(unsafe) static var requestedOffsets: [Int] = []
+
+    override class func canInit(with request: URLRequest) -> Bool { true }
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+
+    override func startLoading() {
+        let components = request.url.flatMap {
+            URLComponents(url: $0, resolvingAgainstBaseURL: false)
+        }
+        let path = components?.path ?? ""
+        if path == "/api/sessions/child" {
+            sendJSON(["id": "child", "message_count": 181])
+            return
+        }
+        if path == "/api/sessions/parent" {
+            sendJSON(["id": "parent", "message_count": 333])
+            return
+        }
+
+        let offset = (components?.queryItems ?? [])
+            .first(where: { $0.name == "offset" })
+            .flatMap { Int($0.value ?? "") } ?? 0
+        Self.requestedMessagePaths.append(path)
+        Self.requestedOffsets.append(offset)
+        sendJSON([
+            "session_id": "child",
+            "messages": [[
+                "id": offset + 1,
+                "role": "user",
+                "content": "tail",
+                "timestamp": 1_700_000_000 + offset,
+            ]],
+            "pagination": [
+                "limit": 50,
+                "offset": offset,
+                "returned": 1,
+            ],
+        ])
+    }
+
+    private func sendJSON(_ body: [String: Any]) {
+        let data = try! JSONSerialization.data(withJSONObject: body)
+        let response = HTTPURLResponse(
+            url: request.url!,
+            statusCode: 200,
+            httpVersion: nil,
+            headerFields: ["Content-Type": "application/json"]
+        )!
+        client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+        client?.urlProtocol(self, didLoad: data)
+        client?.urlProtocolDidFinishLoading(self)
+    }
+
+    override func stopLoading() {}
 }
 
 private final class TurnSafeTranscriptStub: URLProtocol, @unchecked Sendable {

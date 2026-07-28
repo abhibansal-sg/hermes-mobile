@@ -1099,6 +1099,39 @@ final class SessionStore {
         return .found(live)
     }
 
+    /// Mirror the stock client's foreground active-list observation without
+    /// taking ownership. This only restores a missed live start for the session
+    /// already on screen; idle/absent rows never trigger session.resume.
+    func reconcileVisibleLiveStatus() async {
+        guard let storedID = activeStoredId else { return }
+        let token = openToken
+        let workGeneration = connectionWorkGeneration
+        do {
+            guard case .found(let live) = try await inspectLiveSession(storedID: storedID),
+                  activeStoredId == storedID,
+                  openToken == token,
+                  connectionWorkGeneration == workGeneration else { return }
+            let mode = sessionBinding?.runtimeID == live.id
+                ? (sessionBinding?.mode ?? .watch)
+                : .watch
+            bindSession(
+                storedID: storedID,
+                runtimeID: live.id,
+                mode: mode,
+                generation: mode == .drive ? connection?.transportEpoch : nil
+            )
+            connection?.applySessionModel(live.model)
+            await chat?.reconcileLiveTurnStatus(
+                runtimeId: live.id,
+                snapshotRunning: live.status.isRunning,
+                watchOnly: mode == .watch
+            )
+        } catch {
+            // Observation is best-effort. Reconnect and explicit open retain
+            // responsibility for surfacing actionable transport/session errors.
+        }
+    }
+
     /// Identity of the one raw `session.resume` permitted for a selected session
     /// on a particular accepted transport. Both `open()` and reconnect recovery
     /// reach this same RPC, so keeping the key here prevents readiness from
@@ -2891,7 +2924,10 @@ final class SessionStore {
         // requires the pill to never flash the previous model — far cheaper than the
         // LazyVStack teardown, so it is NOT the switch-hitch cost FIX 4 targets.
         connection?.clearSessionState()
-        connection?.applySessionModel(summary.model, provider: summary.billingProvider)
+        // The list's `billing_provider` is an accounting bucket, not the
+        // session's runtime provider. Prepaint only the model; the authoritative
+        // provider arrives atomically from session.info / resume `info`.
+        connection?.applySessionModel(summary.model)
 
         // S1 (Opus review): a SESSION SWITCH must not inherit a pending scroll
         // target left over from the PREVIOUS session. Clear when the incoming id
@@ -3405,26 +3441,26 @@ final class SessionStore {
     }
 
     /// Resolve the job's own destination without moving the visible selection.
-    func runtimeForOutboxDestination(_ storedSessionID: String) async -> String? {
+    func runtimeForOutboxDestination(_ storedSessionID: String) async throws -> String? {
         if activeStoredId == storedSessionID {
-            return await ensureActiveRuntime()
-        }
-        guard let client else { return nil }
-        do {
-            if case .found(let live) = try await inspectLiveSession(storedID: storedSessionID) {
-                return live.id
+            if let runtimeID = await ensureActiveRuntime() { return runtimeID }
+            if let message = sessionActionError?.message ?? lastError {
+                throw OutboxProcessorError.destinationActivationFailed(message)
             }
-            var params: [String: JSONValue] = ["session_id": .string(storedSessionID)]
-            applyProfileScope(to: &params)
-            let result: SessionOpenResult = try await client.request(
-                "session.resume",
-                params: .object(params),
-                timeout: .seconds(120)
-            )
-            return result.sessionId
-        } catch {
             return nil
         }
+        guard let client else { throw GatewayError.notConnected }
+        if case .found(let live) = try await inspectLiveSession(storedID: storedSessionID) {
+            return live.id
+        }
+        var params: [String: JSONValue] = ["session_id": .string(storedSessionID)]
+        applyProfileScope(to: &params)
+        let result: SessionOpenResult = try await client.request(
+            "session.resume",
+            params: .object(params),
+            timeout: .seconds(120)
+        )
+        return result.sessionId
     }
 
     /// `prompt.submit` is the deliberate watch -> drive ownership edge. Claim
@@ -3694,6 +3730,11 @@ final class SessionStore {
                     mode: recoveryMode,
                     generation: recoveryMode == .drive ? bindingEpoch : nil
                 )
+                await chat?.reconcileLiveTurnStatus(
+                    runtimeId: live.id,
+                    snapshotRunning: live.status.isRunning,
+                    watchOnly: recoveryMode == .watch
+                )
                 lastError = nil
                 sessionActionError = nil
                 return live.id
@@ -3757,6 +3798,20 @@ final class SessionStore {
             let newStored = result.storedSessionId ?? storedId
             if newStored != storedId { onStoredIdMigrated?(storedId, newStored) }
             activeStoredId = newStored
+            if newStored != storedId {
+                let networkProfile = Self.profileParam(
+                    scope: bindingProfile ?? Self.defaultProfileName,
+                    multiAvailable: profileThreadingAvailable
+                )
+                await seedTranscript(
+                    storedId: newStored,
+                    networkProfile: networkProfile,
+                    cacheProfile: bindingProfile ?? Self.defaultProfileName,
+                    token: token,
+                    workGeneration: myConnectionWorkGeneration,
+                    transportEpoch: bindingEpoch
+                )
+            }
             if let echoedProfile = result.info?.profileName {
                 activeStoredProfile = Self.normalizedProfileID(echoedProfile)
             }

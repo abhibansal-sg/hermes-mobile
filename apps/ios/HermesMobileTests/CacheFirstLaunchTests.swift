@@ -526,14 +526,18 @@ final class CacheFirstLaunchTests: XCTestCase {
         }
 
         sessions.open(makeSummary(id: "A"))
+        await sessions.waitForPendingOpenForTesting()
+        let lateA = Task { await sessions.ensureActiveRuntime() }
         await gate.waitUntilEntered()
         sessions.open(makeSummary(id: "B"))
         await sessions.waitForPendingOpenForTesting()
+        let runtimeB = await sessions.ensureActiveRuntime()
         XCTAssertEqual(sessions.activeStoredId, "B")
+        XCTAssertEqual(runtimeB, "runtime-B")
         XCTAssertEqual(sessions.activeRuntimeId, "runtime-B")
 
         await gate.release()
-        for _ in 0..<4 { await Task.yield() }
+        _ = await lateA.value
         XCTAssertEqual(sessions.activeStoredId, "B")
         XCTAssertEqual(sessions.activeRuntimeId, "runtime-B",
                        "a late A resume must be fenced by B's selection token")

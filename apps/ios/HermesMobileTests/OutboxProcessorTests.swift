@@ -29,6 +29,9 @@ final class OutboxProcessorTests: XCTestCase {
     }
 
     private struct Ambiguous: Error {}
+    private struct ActivationFailure: LocalizedError {
+        var errorDescription: String? { "Session provider could not be restored." }
+    }
 
     func testUnavailableTransportLeavesPromptUnclaimedButProcessesNavigationIntent() async throws {
         let harness = try makeHarness(); defer { try? FileManager.default.removeItem(at: harness.directory) }
@@ -130,7 +133,8 @@ final class OutboxProcessorTests: XCTestCase {
                     status: "streaming", accepted: true,
                     clientMessageID: submitted.clientMessageID
                 )
-            }
+            },
+            retryDelay: { _ in 0.01 }
         ))
 
         processor.wake(); await processor.waitUntilIdleForTesting()
@@ -138,7 +142,8 @@ final class OutboxProcessorTests: XCTestCase {
         XCTAssertEqual(retained?.state, .submitting)
         XCTAssertEqual(retained?.lastErrorCode, "transport_ambiguous")
 
-        processor.wake(); await processor.waitUntilIdleForTesting()
+        try? await Task.sleep(for: .milliseconds(30))
+        await processor.waitUntilIdleForTesting()
         retained = try await harness.repository.job(id: job.jobID)
         XCTAssertEqual(retained?.state, .completed)
         XCTAssertEqual(submittedIDs, [job.clientMessageID, job.clientMessageID])
@@ -177,7 +182,8 @@ final class OutboxProcessorTests: XCTestCase {
                 if failOnce { failOnce = false; throw Ambiguous() }
                 return OutboxSubmitResult(status: "streaming", accepted: true,
                                           clientMessageID: submitted.clientMessageID)
-            }
+            },
+            retryDelay: { _ in 0.01 }
         ))
 
         processor.wake(); await processor.waitUntilIdleForTesting()
@@ -185,7 +191,8 @@ final class OutboxProcessorTests: XCTestCase {
         XCTAssertEqual(persisted?.destinationSessionID, "stored-created")
         XCTAssertEqual(submittedRuntimes, ["runtime-created"])
         XCTAssertEqual(resolveCount, 0, "fresh create must use its returned runtime")
-        processor.wake(); await processor.waitUntilIdleForTesting()
+        try? await Task.sleep(for: .milliseconds(30))
+        await processor.waitUntilIdleForTesting()
 
         XCTAssertEqual(createCount, 1)
         XCTAssertEqual(submittedRuntimes, ["runtime-created", "runtime-resumed"])
@@ -272,7 +279,8 @@ final class OutboxProcessorTests: XCTestCase {
                     accepted: true,
                     clientMessageID: submitted.clientMessageID
                 )
-            }
+            },
+            retryDelay: { _ in 0.01 }
         ))
 
         processor.wake(); await processor.waitUntilIdleForTesting()
@@ -280,7 +288,8 @@ final class OutboxProcessorTests: XCTestCase {
         XCTAssertEqual(persisted?.destinationSessionID, "stored-share")
         XCTAssertEqual(persisted?.state, .submitting)
 
-        processor.wake(); await processor.waitUntilIdleForTesting()
+        try? await Task.sleep(for: .milliseconds(30))
+        await processor.waitUntilIdleForTesting()
         persisted = try await harness.repository.job(id: job.jobID)
         XCTAssertEqual(persisted?.state, .completed)
         XCTAssertEqual(createCount, 1)
@@ -393,18 +402,57 @@ final class OutboxProcessorTests: XCTestCase {
             submit: { submitted, _, _ in
                 OutboxSubmitResult(status: "streaming", accepted: true,
                                    clientMessageID: submitted.clientMessageID)
-            }
+            },
+            retryDelay: { _ in 0.01 }
         ))
 
         processor.wake(); await processor.waitUntilIdleForTesting()
-        var persisted = try await harness.repository.job(id: job.jobID)
-        XCTAssertEqual(persisted?.state, .retryWait)
-        processor.wake(); await processor.waitUntilIdleForTesting()
+        try? await Task.sleep(for: .milliseconds(30))
+        await processor.waitUntilIdleForTesting()
 
         XCTAssertEqual(uploadCounts[0], 1)
         XCTAssertEqual(uploadCounts[1], 2)
-        persisted = try await harness.repository.job(id: job.jobID)
+        let persisted = try await harness.repository.job(id: job.jobID)
         XCTAssertEqual(persisted?.state, .completed)
+    }
+
+    func testRuntimeResolutionPreservesErrorAndRetriesWithoutExternalWake() async throws {
+        let harness = try makeHarness(); defer { try? FileManager.default.removeItem(at: harness.directory) }
+        let job = try await harness.repository.enqueue(WorkJobInput(
+            kind: .prompt,
+            scope: harness.scope,
+            text: "resume this chat",
+            storedSessionID: "stored-A"
+        ))
+        var resolutionAttempts = 0
+        let processor = OutboxProcessor(repository: harness.repository, dependencies: .init(
+            currentScope: { harness.scope },
+            activeStoredSessionID: { "stored-A" },
+            isTransportReady: { true },
+            createDestination: { _ in throw Ambiguous() },
+            resolveRuntime: { _ in
+                resolutionAttempts += 1
+                throw ActivationFailure()
+            },
+            uploadAsset: { _, _ in throw Ambiguous() },
+            willSubmit: { _, _ in },
+            submit: { _, _, _ in throw Ambiguous() },
+            retryDelay: { _ in 0.01 }
+        ))
+
+        processor.wake()
+        let deadline = ContinuousClock.now + .seconds(1)
+        var persisted = try await harness.repository.job(id: job.jobID)
+        while persisted?.state != .failed, ContinuousClock.now < deadline {
+            try? await Task.sleep(for: .milliseconds(20))
+            persisted = try await harness.repository.job(id: job.jobID)
+        }
+        await processor.waitUntilIdleForTesting()
+
+        XCTAssertEqual(resolutionAttempts, 3)
+        XCTAssertEqual(persisted?.state, .failed)
+        XCTAssertEqual(persisted?.lastErrorCode, "ActivationFailure")
+        XCTAssertEqual(persisted?.lastErrorMessage, "Session provider could not be restored.")
     }
 
     func testConcurrentWakeSourcesNeverOverlapDrains() async throws {

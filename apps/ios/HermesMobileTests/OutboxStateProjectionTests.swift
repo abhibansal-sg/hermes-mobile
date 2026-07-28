@@ -45,7 +45,7 @@ final class OutboxStateProjectionTests: XCTestCase {
             // Wave 1.2 humanized the outbox labels (owner request): "Waiting for
             // connection" and "Needs retry" replace the terse "Waiting"/"Failed — Retry".
             [
-                "waiting": "Waiting for connection", "uploading": "Uploading", "sending": "Sending",
+                "waiting": "Waiting to send", "uploading": "Uploading", "sending": "Sending",
                 "sent": "Sent", "failed": "Needs retry", "cancelled": "Cancelled",
             ]
         )

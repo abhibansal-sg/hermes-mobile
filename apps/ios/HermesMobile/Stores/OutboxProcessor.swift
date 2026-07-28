@@ -60,11 +60,14 @@ final class OutboxProcessor {
         /// session-less / new-session / other-session work drains immediately.
         var busySessionID: () -> String? = { nil }
         var createDestination: (WorkJob) async throws -> OutboxDestination
-        var resolveRuntime: (String) async -> String?
+        var resolveRuntime: (String) async throws -> String?
         var uploadAsset: (WorkJob, WorkJobAssetSnapshot) async throws -> OutboxUploadedAsset
         var willSubmit: (WorkJob, [String]) -> Void
         var submit: (WorkJob, String, [String]) async throws -> OutboxSubmitResult
         var processLocalAppIntent: (WorkJob) async -> Bool = { _ in false }
+        var retryDelay: (Int) -> TimeInterval = { attempt in
+            TimeInterval(1 << max(0, min(attempt - 1, 3)))
+        }
     }
 
     static let leaseDuration: TimeInterval = 120
@@ -74,6 +77,8 @@ final class OutboxProcessor {
     private let owner = "ios-outbox-\(UUID().uuidString.lowercased())"
     private var dependencies: Dependencies
     private var drainTask: Task<Void, Never>?
+    private var retryTask: Task<Void, Never>?
+    private var scheduledRetryAt: Date?
     private var wakePending = false
     private var suspended = false
 
@@ -319,7 +324,7 @@ final class OutboxProcessor {
         if let createdRuntimeID {
             runtimeID = createdRuntimeID
         } else if let destinationID = job.destinationSessionID ?? job.storedSessionID,
-           let resolved = await dependencies.resolveRuntime(destinationID) {
+           let resolved = try await dependencies.resolveRuntime(destinationID) {
             runtimeID = resolved
         } else {
             throw OutboxProcessorError.destinationUnavailable
@@ -332,14 +337,19 @@ final class OutboxProcessor {
             result = try await dependencies.submit(job, runtimeID, remotePaths)
         } catch {
             // The request may have reached the gateway. Keep `submitting` and
-            // release the lease; the next wake retries the same client id.
+            // retry the same client id after a bounded delay.
             ReliabilityDiagnostics.shared.outboxAmbiguous(identifier: job.jobID)
+            let retryAt = job.attemptCount < 3
+                ? Date().addingTimeInterval(dependencies.retryDelay(job.attemptCount))
+                : nil
             try await repository.retainPendingJob(
                 id: job.jobID,
                 owner: owner,
                 status: "transport_ambiguous",
-                message: error.localizedDescription
+                message: error.localizedDescription,
+                nextAttemptAt: retryAt
             )
+            if let retryAt { scheduleRetry(at: retryAt) }
             return false
         }
 
@@ -382,20 +392,39 @@ final class OutboxProcessor {
         }
         let message = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
         let retryable = latest.attemptCount < 3
+        let nextAttemptAt = retryable
+            ? Date().addingTimeInterval(dependencies.retryDelay(latest.attemptCount))
+            : nil
         do {
             _ = try await repository.transitionJob(
                 id: jobID,
                 from: state,
                 to: retryable ? .retryWait : .failed,
                 owner: owner,
+                nextAttemptAt: nextAttemptAt,
                 errorCode: String(describing: type(of: error)),
                 errorMessage: message
             )
             try await repository.releaseLease(id: jobID, owner: owner)
+            if let nextAttemptAt { scheduleRetry(at: nextAttemptAt) }
         } catch {
             // A crash/lease expiry leaves the durable stage intact for a later
             // claimant. Never delete on an error path.
             _ = fallbackState
+        }
+    }
+
+    private func scheduleRetry(at date: Date) {
+        if let scheduledRetryAt, scheduledRetryAt <= date { return }
+        retryTask?.cancel()
+        scheduledRetryAt = date
+        retryTask = Task { [weak self] in
+            let delay = max(0, date.timeIntervalSinceNow)
+            try? await Task.sleep(for: .seconds(delay))
+            guard !Task.isCancelled, let self else { return }
+            self.scheduledRetryAt = nil
+            self.retryTask = nil
+            self.wake()
         }
     }
 
@@ -415,11 +444,14 @@ final class OutboxProcessor {
 
 enum OutboxProcessorError: Error, LocalizedError {
     case destinationUnavailable
+    case destinationActivationFailed(String)
 
     var errorDescription: String? {
         switch self {
         case .destinationUnavailable:
             "The queued prompt’s destination session is not active."
+        case .destinationActivationFailed(let message):
+            message
         }
     }
 }

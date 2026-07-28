@@ -1843,7 +1843,7 @@ private struct QueueSheet: View {
                                 // Lane C fix 3: only a genuinely failed row shows
                                 // its raw error in red — a queued-offline row that
                                 // is merely waiting must not render a red error
-                                // line under its "Waiting for connection" label.
+                                // line under its "Waiting to send" label.
                                 errorMessage: item.showsError ? item.errorMessage : nil,
                                 editable: item.isEditable,
                                 canRetry: item.canRetry,

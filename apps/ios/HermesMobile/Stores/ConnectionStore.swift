@@ -3032,10 +3032,6 @@ final class ConnectionStore {
                 guard self.isActiveGeneration(generation) else { return }
             }
         }
-        // Re-resolve the running model — it may have changed while we were
-        // offline (another client switched it) (F0).
-        await refreshActiveModel(generation: generation)
-        guard isActiveGeneration(generation) else { return false }
         // A failed resume for the still-selected session means this reconnect
         // did not recover a usable chat and must retry. A nil result after the
         // selection changed is supersession instead: follow the latest intent
@@ -3063,6 +3059,13 @@ final class ConnectionStore {
         }
         await sessionStore.refresh()
         guard isActiveGeneration(generation) else { return false }
+        // `model.info` is the gateway default, not the selected session's model.
+        // Existing sessions get their truth from active_list / resume info above;
+        // only a session-less draft needs the global default refreshed.
+        if sessionStore.activeStoredId == nil {
+            await refreshActiveModel(generation: generation)
+            guard isActiveGeneration(generation) else { return false }
+        }
         return true
     }
 

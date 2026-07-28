@@ -316,7 +316,7 @@ final class OutboxSendStateTests: XCTestCase {
     /// internal state name (notably "Indeterminate") ever reaches the sheet.
     func testOutboxRowLabelsAreHumanReadable() {
         typealias State = QueueStore.QueuedPrompt.DisplayState
-        XCTAssertEqual(State.waiting.title, "Waiting for connection")
+        XCTAssertEqual(State.waiting.title, "Waiting to send")
         XCTAssertEqual(State.uploading.title, "Uploading")
         XCTAssertEqual(State.sending.title, "Sending")
         XCTAssertEqual(State.sent.title, "Sent")

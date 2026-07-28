@@ -499,7 +499,11 @@ final class ProfilesTests: XCTestCase {
         chat.attach(connection: connection, sessions: sessions, attachments: attachments)
         sessions.attach(connection: connection, chat: chat)
         sessions.activeProfile = DefaultsKeys.allProfilesScope
-        sessions.profileThreadingAvailableForTesting = true
+        connection.capabilities._seedProfilesCapabilityForTesting(.available)
+        sessions._seedProfilesForTesting([
+            ProfileSummary(name: "work", isDefault: false, description: nil),
+            ProfileSummary(name: "personal", isDefault: false, description: nil),
+        ])
 
         var resumeProfile: String?
         sessions.resumeRPC = { requested, params in
@@ -523,14 +527,15 @@ final class ProfilesTests: XCTestCase {
 
         sessions.open(row("parent-session", profile: "work"))
         await sessions.waitForPendingOpenForTesting()
+        let runtime = await sessions.ensureActiveRuntime()
 
+        XCTAssertEqual(runtime, "runtime-child")
         XCTAssertEqual(resumeProfile, "work")
         XCTAssertTrue(transcriptCalls.contains { $0.sessionId == "parent-session" && $0.profile == "work" })
         XCTAssertTrue(transcriptCalls.contains { $0.sessionId == "child-session" && $0.profile == "work" },
                       "Compression-chain continuation seed must keep the parent row's profile scope")
         XCTAssertEqual(runtimeBoundCount, 1,
                        "The authoritative chain tip must pass the post-resume fence and drain queued work")
-        sessions.profileThreadingAvailableForTesting = nil
     }
 
     func testDefaultProfileRowsKeepProfilelessPerSessionActions() {

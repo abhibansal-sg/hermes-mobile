@@ -100,7 +100,8 @@ final class SubmitIdempotencyTests: XCTestCase {
                     clientMessageID: submitted.clientMessageID
                 )
             },
-            processLocalAppIntent: { _ in false }
+            processLocalAppIntent: { _ in false },
+            retryDelay: { _ in 0.01 }
         ))
 
         // Attempt 1: submit throws → the row is retained in `submitting` with the
@@ -119,7 +120,7 @@ final class SubmitIdempotencyTests: XCTestCase {
         // Attempt 2: the SAME id is replayed. The relay's LRU (keyed by cmid)
         // recognizes this and suppresses the second turn — covered by the relay
         // pytest; here we only prove the iOS replay.
-        processor.wake()
+        try? await Task.sleep(for: .milliseconds(30))
         await processor.waitUntilIdleForTesting()
         let completed = try await harness.repository.job(id: job.jobID)
         XCTAssertEqual(completed?.state, .completed)

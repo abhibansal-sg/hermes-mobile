@@ -7,6 +7,9 @@ struct TranscriptPageFetch: Sendable {
     let messages: [StoredMessage]
     let oldestId: Int?
     let hasMoreBefore: Bool
+    /// Canonical stored id returned by the stock messages endpoint. It can
+    /// differ from the requested id after context compression.
+    let sessionId: String?
     /// Absolute zero-based offset of ``messages.first`` in the gateway's active
     /// raw-row transcript. Nil for injected/legacy fetchers that cannot report it.
     let offset: Int?
@@ -15,11 +18,13 @@ struct TranscriptPageFetch: Sendable {
         messages: [StoredMessage],
         oldestId: Int?,
         hasMoreBefore: Bool,
+        sessionId: String? = nil,
         offset: Int? = nil
     ) {
         self.messages = messages
         self.oldestId = oldestId
         self.hasMoreBefore = hasMoreBefore
+        self.sessionId = sessionId
         self.offset = offset
     }
 }
@@ -65,6 +70,7 @@ func fetchStockTranscriptPage(
             messages: messages,
             oldestId: messages.first?.wireId,
             hasMoreBefore: pageOffset > 0 && !messages.isEmpty,
+            sessionId: root["session_id"]?.stringValue,
             offset: pageOffset
         )
     } catch {
@@ -191,16 +197,29 @@ func fetchBoundedStockTranscript(
     limit: Int
 ) async throws -> [StoredMessage] {
     let boundedLimit = max(1, limit)
+    // The stock messages route follows compression continuations while the
+    // session-detail route addresses the exact requested row. Resolve the
+    // canonical id first so count and page offsets belong to one transcript.
+    let identityPage = messageCount > boundedLimit
+        ? await fetchStockTranscriptPage(
+            rest: rest,
+            sessionId: sessionId,
+            profile: profile,
+            limit: 1,
+            offset: 0
+        )
+        : nil
+    let canonicalSessionId = identityPage?.sessionId ?? sessionId
     let currentCount = await currentStockMessageCount(
         rest: rest,
-        sessionId: sessionId,
+        sessionId: canonicalSessionId,
         profile: profile
     ) ?? messageCount
     if currentCount > 0 {
         let offset = max(0, currentCount - boundedLimit)
         if let page = await fetchTurnSafeStockTranscriptPage(
             rest: rest,
-            sessionId: sessionId,
+            sessionId: canonicalSessionId,
             profile: profile,
             limit: boundedLimit,
             offset: offset
@@ -208,7 +227,7 @@ func fetchBoundedStockTranscript(
             return page.messages
         }
     }
-    let all = try await rest.messages(sessionId: sessionId, profile: profile)
+    let all = try await rest.messages(sessionId: canonicalSessionId, profile: profile)
     guard all.count > boundedLimit else { return all }
     var start = all.count - boundedLimit
     let lowerBound = max(0, all.count - 500)

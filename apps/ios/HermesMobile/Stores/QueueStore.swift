@@ -25,7 +25,7 @@ final class QueueStore {
             /// connection, sending, or needing a manual retry.
             var title: String {
                 switch self {
-                case .waiting: "Waiting for connection"
+                case .waiting: "Waiting to send"
                 case .uploading: "Uploading"
                 case .sending: "Sending"
                 case .sent: "Sent"
