@@ -334,7 +334,7 @@ final class QueueStore {
         newSession: Bool = false,
         cwd: String? = nil,
         modelSelectionJSON: String? = nil,
-        wake: Bool = false,
+        wake: Bool = true,
         clientMessageID: String? = nil
     ) async -> QueuedPrompt? {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -420,8 +420,10 @@ final class QueueStore {
     }
 
     func retry(id: UUID) async {
-        guard (try? await repository.retryFailedJob(id: id.uuidString.lowercased())) != nil else { return }
-        processor?.wake()
+        do {
+            _ = try await repository.retryFailedJob(id: id.uuidString.lowercased())
+            processor?.wake()
+        } catch {}
     }
 
     /// "Resend" a stuck/failed transcript bubble (C1). Re-drives the EXISTING

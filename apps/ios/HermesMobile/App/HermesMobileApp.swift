@@ -59,6 +59,12 @@ final class StateFlushCoordinator {
         while let task = flushTask { await task.value }
     }
 
+    func enterForeground() async {
+        let pending = flushTask
+        pending?.cancel()
+        await pending?.value
+    }
+
     private func expire() {
         guard identifier != .invalid else { return }
         flushTask?.cancel()
@@ -281,7 +287,10 @@ struct HermesMobileApp: App {
                     environment.connectionStore.handleScenePhase(newPhase)
                     environment.appLock.handleScenePhase(newPhase)
                     if newPhase == .active {
-                        environment.queueStore.resumeFromBackground()
+                        Task {
+                            await environment.stateFlushCoordinator.enterForeground()
+                            environment.queueStore.resumeFromBackground()
+                        }
                         Task { await AttachmentBlobCache.shared.respondToLowAvailableCapacity() }
                     }
                     // On foreground: apply parked App Intents, surface/drain the

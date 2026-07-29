@@ -1026,6 +1026,8 @@ final class ChatStore {
         onToolChange?(nil)
         endLocalTurn()
         setStreaming(false, reason: "gatewayError")
+        watchOnlyStream = false
+        streamOwner = nil
         // `error` is a turn TERMINAL just like `message.complete` — the
         // turn's pending asks died with it server-side, so every card
         // (secure prompt included: answering a dead `request_id` is a
@@ -1254,6 +1256,8 @@ final class ChatStore {
         // The selected runtime's local turn finalized.
         endLocalTurn()
         setStreaming(false, reason: "handleMessageComplete")
+        watchOnlyStream = false
+        streamOwner = nil
         // Context-window occupancy updates once per completed turn (H1): the
         // just-finished turn's usage describes the occupancy of the last API
         // prompt. A turn whose usage omits the context fields leaves the prior
@@ -2587,8 +2591,8 @@ final class ChatStore {
         remotePaths: [String]
     ) async throws -> OutboxSubmitResult {
         guard let client else { throw GatewayError.notConnected }
-        let presentsInActiveChat =
-            (job.destinationSessionID ?? job.storedSessionID) == sessions?.activeStoredId
+        let storedDestination = job.destinationSessionID ?? job.storedSessionID
+        let presentsInActiveChat = storedDestination == sessions?.activeStoredId
         let submissionSelection = sessions?.selectionGeneration
         let priorBindingMode: SessionBindingMode?
         if presentsInActiveChat {
@@ -2601,16 +2605,42 @@ final class ChatStore {
         } else {
             priorBindingMode = nil
         }
-        do {
+        func issueSubmit(runtimeID: String) async throws -> OutboxSubmitResult {
             let result = try await client.requestRaw(
                 "prompt.submit",
                 params: .object([
-                    "session_id": .string(runtimeSessionID),
+                    "session_id": .string(runtimeID),
                     "text": .string(job.submissionText),
                     "client_message_id": .string(job.clientMessageID),
                 ])
             )
-            let receipt = OutboxSubmitResult(json: result)
+            return OutboxSubmitResult(json: result)
+        }
+        var submittedRuntimeID = runtimeSessionID
+        do {
+            let receipt: OutboxSubmitResult
+            do {
+                receipt = try await issueSubmit(runtimeID: submittedRuntimeID)
+            } catch let error as GatewayError {
+                guard case .rpc(let code, let message) = error,
+                      GatewayErrorCode.isPromptSessionNotFound(
+                        code: code,
+                        message: message
+                      ),
+                      let storedDestination,
+                      let recoveredRuntimeID = try await sessions?
+                        .runtimeForOutboxDestinationAfterNotFound(
+                            storedSessionID: storedDestination,
+                            rejectedRuntimeID: submittedRuntimeID
+                        ) else {
+                    throw error
+                }
+                submittedRuntimeID = recoveredRuntimeID
+                if presentsInActiveChat {
+                    _ = sessions?.beginPromptSubmission(runtimeID: recoveredRuntimeID)
+                }
+                receipt = try await issueSubmit(runtimeID: recoveredRuntimeID)
+            }
             observePromptReceipt(
                 clientMessageID: receipt.clientMessageID,
                 expected: job.clientMessageID
@@ -2621,7 +2651,7 @@ final class ChatStore {
             guard stillPresentsInActiveChat else { return receipt }
             if !(receipt.accepted && OutboxProcessor.acceptedDispositions.contains(receipt.status)) {
                 sessions?.restoreWatchAfterRejectedSubmission(
-                    runtimeID: runtimeSessionID,
+                    runtimeID: submittedRuntimeID,
                     priorMode: priorBindingMode
                 )
                 endLocalTurn()
@@ -2634,7 +2664,7 @@ final class ChatStore {
                 && (job.destinationSessionID ?? job.storedSessionID) == sessions?.activeStoredId
             guard stillPresentsInActiveChat else { throw error }
             sessions?.restoreWatchAfterRejectedSubmission(
-                runtimeID: runtimeSessionID,
+                runtimeID: submittedRuntimeID,
                 priorMode: priorBindingMode
             )
             endLocalTurn()
@@ -3562,6 +3592,7 @@ final class ChatStore {
         var updatedByID: [UUID: ChatMessage] = [:]
         var incomingOrder: [UUID] = []
         var consumedIDs: Set<UUID> = []   // existing ids consumed by an adoption
+        var retiredExistingIDs: Set<UUID> = []
 
         for newMessage in incoming {
             if var existing = existingByID[newMessage.id] {
@@ -3573,6 +3604,20 @@ final class ChatStore {
                 existing.presentation = newMessage.presentation
                 updatedByID[existing.id] = existing
                 incomingOrder.append(existing.id)
+                if !reconnectConsumed,
+                   let reconnect = reconnectRow,
+                   let reconnectAdoptTargetID,
+                   newMessage.id == reconnectAdoptTargetID,
+                   newMessage.role == .assistant,
+                   reconnect.role == .assistant,
+                   reconnect.id != existing.id {
+                    // The authoritative row was already painted before the
+                    // reattached live placeholder completed. Keep authority
+                    // and retire only its temporary twin.
+                    reconnectConsumed = true
+                    pendingReconnectReconcileID = nil
+                    retiredExistingIDs.insert(reconnect.id)
+                }
             } else if !reconnectConsumed,
                       let reconnect = reconnectRow,
                       let reconnectAdoptTargetID,
@@ -3660,6 +3705,7 @@ final class ChatStore {
         rebuilt.reserveCapacity(messages.count + incomingOrder.count)
         var emittedIncoming: Set<UUID> = []
         for existing in messages {
+            if retiredExistingIDs.contains(existing.id) { continue }
             if let updated = updatedByID[existing.id] {
                 rebuilt.append(updated)
                 emittedIncoming.insert(existing.id)

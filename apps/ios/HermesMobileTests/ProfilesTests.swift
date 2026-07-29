@@ -537,6 +537,41 @@ final class ProfilesTests: XCTestCase {
                        "The authoritative chain tip must pass the post-resume fence and drain queued work")
     }
 
+    func testCustomDeploymentEchoDoesNotBecomeDrawerProfileScope() async {
+        let chat = ChatStore()
+        let sessions = SessionStore()
+        let connection = ConnectionStore(sessionStore: sessions, chatStore: chat)
+        let attachments = AttachmentStore()
+        chat.attach(connection: connection, sessions: sessions, attachments: attachments)
+        sessions.attach(connection: connection, chat: chat)
+        connection.capabilities._seedProfilesCapabilityForTesting(.available)
+        sessions._seedProfilesForTesting([
+            ProfileSummary(name: "default", isDefault: true, description: nil),
+            ProfileSummary(name: "work", isDefault: false, description: nil),
+        ])
+        sessions.activeProfile = SessionStore.defaultProfileName
+        let untagged = row("custom-home-session", profile: nil)
+        sessions.sessions = [untagged]
+        sessions.transcriptFetchWithProfile = { _, _ in [] }
+        sessions.resumeRPC = { _, _ in
+            JSONValue.object([
+                "session_id": .string("runtime-custom-home"),
+                "resumed": .string("custom-home-session"),
+                "info": .object(["profile_name": .string("custom")]),
+            ]).decoded(as: SessionOpenResult.self)!
+        }
+
+        sessions.open(untagged)
+        await sessions.waitForPendingOpenForTesting()
+        let runtime = await sessions.ensureActiveRuntime()
+
+        XCTAssertEqual(runtime, "runtime-custom-home")
+        XCTAssertEqual(sessions.activeProfile, SessionStore.defaultProfileName)
+        XCTAssertEqual(sessions.activeStoredProfile, SessionStore.defaultProfileName)
+        XCTAssertEqual(sessions.visibleSessions.map(\.id), ["custom-home-session"],
+                       "An opaque custom-home echo must not filter default drawer rows away")
+    }
+
     func testDefaultProfileRowsKeepProfilelessPerSessionActions() {
         let defaultRow = row("default-session", profile: "default")
         XCTAssertNil(SessionStore.profileParam(for: defaultRow,

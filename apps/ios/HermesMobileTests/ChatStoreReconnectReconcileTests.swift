@@ -250,4 +250,48 @@ final class ChatStoreReconnectReconcileTests: XCTestCase {
         XCTAssertEqual(assistants.first?.text, "authoritative final")
         XCTAssertFalse(chat.isStreaming)
     }
+
+    func testColdWatchCompletionRetiresLiveTwinOfAlreadyPaintedAuthority() async {
+        let authoritative = [
+            storedMessage(role: "user", text: "cold-open prompt", wireId: 1),
+            storedMessage(role: "assistant", text: "cold-open answer", wireId: 2),
+        ]
+        let fetched = expectation(description: "watch terminal reconciled")
+        let (chat, _) = makeStore { _ in
+            fetched.fulfill()
+            return authoritative
+        }
+
+        // Cold-open race: the bounded REST seed completes just before the
+        // reattached live turn projects its own temporary assistant row.
+        chat.seed(from: authoritative)
+        await chat.reconcileLiveTurnStatus(
+            runtimeId: activeRuntime,
+            snapshotRunning: true,
+            watchOnly: true
+        )
+        XCTAssertEqual(chat.messages.filter { $0.role == .assistant }.count, 2)
+
+        chat.handle(event: localFrame(
+            type: "message.complete",
+            payload: ["text": "cold-open answer", "status": "complete"]
+        ))
+        await fulfillment(of: [fetched], timeout: 1)
+        for _ in 0..<5 { await Task.yield() }
+
+        XCTAssertEqual(
+            chat.messages.filter { $0.role == .assistant && $0.text == "cold-open answer" }.count,
+            1,
+            "the authoritative row and its reattached live placeholder are one logical reply"
+        )
+        XCTAssertFalse(chat.messages.contains(where: \.isStreaming))
+
+        // A real terminal also releases watch ownership. Otherwise the next
+        // authoritative seed is silently ignored by seed(normalized:policy:).
+        chat.seed(from: authoritative + [
+            storedMessage(role: "user", text: "later prompt", wireId: 3),
+            storedMessage(role: "assistant", text: "later answer", wireId: 4),
+        ], policy: .union)
+        XCTAssertEqual(chat.messages.filter { $0.text == "later answer" }.count, 1)
+    }
 }

@@ -56,6 +56,29 @@ final class JSONRPCFramingTests: XCTestCase {
         XCTAssertEqual(frame.error?.code, GatewayErrorCode.sessionNotFound)
     }
 
+    func testPromptSessionNotFoundUsesStockSubmitContractOnly() {
+        XCTAssertTrue(
+            GatewayErrorCode.isPromptSessionNotFound(
+                code: 4001,
+                message: "session not found"
+            )
+        )
+        XCTAssertFalse(
+            GatewayErrorCode.isPromptSessionNotFound(
+                code: 4007,
+                message: "session not found"
+            ),
+            "4007 belongs to stored-session RPCs such as session.resume"
+        )
+        XCTAssertFalse(
+            GatewayErrorCode.isPromptSessionNotFound(
+                code: 4001,
+                message: "no active session"
+            ),
+            "4001 is shared; only the stock prompt.submit message is definitive"
+        )
+    }
+
     // MARK: - Numeric id normalization
 
     func testNumericIdNormalizesToString() throws {

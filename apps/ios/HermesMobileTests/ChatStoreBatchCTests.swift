@@ -106,6 +106,42 @@ final class ChatStoreBatchCTests: XCTestCase {
         XCTAssertTrue(chat.messages.isEmpty, "explicit queued work echoes only when claimed for sending")
     }
 
+    func testExplicitQueueWakesTheInstalledProcessor() async throws {
+        let (queue, repository, directory) = try makeQueue()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let scope = try WorkScope(serverID: "https://gateway.test", profileID: "default")
+        var submitted = false
+        let processor = OutboxProcessor(repository: repository, dependencies: .init(
+            currentScope: { scope },
+            activeStoredSessionID: { "stored-A" },
+            isTransportReady: { true },
+            createDestination: { _ in
+                XCTFail("an existing-session prompt must not create a destination")
+                throw URLError(.badServerResponse)
+            },
+            resolveRuntime: { _ in "runtime-A" },
+            uploadAsset: { _, _ in
+                XCTFail("a text prompt must not upload")
+                throw URLError(.badServerResponse)
+            },
+            willSubmit: { _, _ in },
+            submit: { job, runtimeID, _ in
+                submitted = runtimeID == "runtime-A"
+                return OutboxSubmitResult(
+                    status: "streaming",
+                    accepted: true,
+                    clientMessageID: job.clientMessageID
+                )
+            }
+        ))
+        queue.installProcessor(processor)
+
+        _ = await queue.enqueue("send now", storedSessionId: "stored-A")
+        await processor.waitUntilIdleForTesting()
+
+        XCTAssertTrue(submitted, "an explicit queue action must start its own drain")
+    }
+
     func testEditBlockedDuringLocalTurnOnly() async {
         let (chat, _) = makeStore()
         chat.seed(from: [

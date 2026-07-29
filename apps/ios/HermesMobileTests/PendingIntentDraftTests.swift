@@ -408,6 +408,40 @@ final class StateFlushCoordinatorTests: XCTestCase {
         XCTAssertEqual(endCount, 1)
     }
 
+    func testForegroundWaitsForLateBackgroundFlushBeforeOutboxResume() async {
+        var draftStarted = false
+        var releaseDraft = false
+        var suspendedOutbox = false
+        var ended = false
+        let token = UIBackgroundTaskIdentifier(rawValue: 9)
+        let coordinator = StateFlushCoordinator(
+            backgroundTasks: BackgroundTaskClient(
+                begin: { _, _ in token },
+                end: { _ in ended = true }
+            ),
+            dependencies: .init(
+                flushDraft: {
+                    draftStarted = true
+                    while !releaseDraft { await Task.yield() }
+                },
+                suspendOutbox: { suspendedOutbox = true },
+                flushWidgetSnapshot: {},
+                flushPendingNavigation: {}
+            )
+        )
+
+        coordinator.enterBackground()
+        while !draftStarted { await Task.yield() }
+
+        let foreground = Task { await coordinator.enterForeground() }
+        await Task.yield()
+        releaseDraft = true
+        await foreground.value
+
+        XCTAssertFalse(suspendedOutbox)
+        XCTAssertTrue(ended)
+    }
+
     func testForceFlushCommitsLatestDraftRevisionBeforeReturning() async throws {
         let test = try makeWorkRepositoryTestConfiguration()
         defer { try? FileManager.default.removeItem(at: test.directory) }

@@ -92,6 +92,9 @@ enum GatewayError: Error, LocalizedError, Sendable {
 
 /// Well-known gateway error codes (tui_gateway/server.py).
 enum GatewayErrorCode {
+    /// `prompt.submit` resolves its in-memory runtime through `_sess_nowait`,
+    /// which returns 4001 when that runtime has expired.
+    static let promptSessionNotFound = 4001
     static let invalidParam = 4002
     static let missingParam = 4006
     static let sessionNotFound = 4007
@@ -102,4 +105,8 @@ enum GatewayErrorCode {
     /// `_set_session_cwd` `ValueError` — "working directory does not exist").
     static let cwdMissing = 4017
     static let staleTruncation = 4018
+
+    static func isPromptSessionNotFound(code: Int, message: String) -> Bool {
+        code == promptSessionNotFound && message == "session not found"
+    }
 }

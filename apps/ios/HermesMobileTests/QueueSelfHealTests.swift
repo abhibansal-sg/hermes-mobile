@@ -165,6 +165,31 @@ final class QueueSelfHealTests: XCTestCase {
             "the resume re-binds the runtime against the current transport")
     }
 
+    func testSessionNotFoundInvalidatesOnlyRejectedRuntimeAndResumesStoredSession() async throws {
+        let (_, sessions) = makeStores()
+        let connection = sessions.connectionForTesting!
+        connection._seedConnectedForTesting(serverURL: "https://gateway.test", token: "t")
+        sessions.activeStoredId = storedParent
+        sessions._bindActiveRuntimeForTesting(
+            id: "rt-expired",
+            epoch: connection.transportEpoch
+        )
+        var resumed = false
+        sessions.resumeRPC = { storedID, _ in
+            resumed = true
+            return self.stagedResult(sessionId: "rt-recovered", resumed: storedID)
+        }
+
+        let recovered = try await sessions.runtimeForOutboxDestinationAfterNotFound(
+            storedSessionID: storedParent,
+            rejectedRuntimeID: "rt-expired"
+        )
+
+        XCTAssertTrue(resumed)
+        XCTAssertEqual(recovered, "rt-recovered")
+        XCTAssertEqual(sessions.activeRuntimeId, "rt-recovered")
+    }
+
     func testEnsureActiveRuntimeReturnsNilWithNothingToResume() async {
         let (_, sessions) = makeStores()
         sessions.activeRuntimeId = nil

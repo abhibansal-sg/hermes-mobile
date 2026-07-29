@@ -3293,7 +3293,7 @@ final class SessionStore {
                 generation: connection?.transportEpoch
             )
             connection?.updatePhoneForeground(activeStoredId)
-            let echoedProfile = result.info?.profileName
+            let echoedProfile = selectableProfileEcho(result.info?.profileName)
             activeStoredProfile = Self.normalizedProfileID(
                 echoedProfile ?? (activeProfile == CacheScope.allProfilesKey
                     ? Self.defaultProfileName
@@ -3497,6 +3497,24 @@ final class SessionStore {
             timeout: .seconds(120)
         )
         return result.sessionId
+    }
+
+    /// A definitive `prompt.submit` "session not found" response proves the
+    /// gateway did not accept the prompt because this runtime no longer exists.
+    /// Invalidate only that rejected binding, then resolve the same durable
+    /// session again through the normal drive edge.
+    func runtimeForOutboxDestinationAfterNotFound(
+        storedSessionID: String,
+        rejectedRuntimeID: String
+    ) async throws -> String? {
+        if activeStoredId == storedSessionID,
+           activeRuntimeId == rejectedRuntimeID {
+            activeRuntimeId = nil
+            activeRuntimeEpoch = nil
+            cancelEnsureRuntime()
+            cancelRuntimeBinding()
+        }
+        return try await runtimeForOutboxDestination(storedSessionID)
     }
 
     /// `prompt.submit` is the deliberate watch -> drive ownership edge. Claim
@@ -3845,7 +3863,7 @@ final class SessionStore {
                     transportEpoch: bindingEpoch
                 )
             }
-            if let echoedProfile = result.info?.profileName {
+            if let echoedProfile = selectableProfileEcho(result.info?.profileName) {
                 activeStoredProfile = Self.normalizedProfileID(echoedProfile)
             }
             confirmActiveProfile(from: result.info)
@@ -4549,6 +4567,18 @@ final class SessionStore {
         )
     }
 
+    /// Return a profile echo only when it names a selectable profile. Stock Hermes
+    /// reports `"custom"` when HERMES_HOME is outside its named-profile tree; that
+    /// describes the deployment root, not a drawer/cache scope. Preserve a real
+    /// profile literally named "custom" when it is present in the profile list.
+    private func selectableProfileEcho(_ profile: String?) -> String? {
+        guard let echoed = profile?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !echoed.isEmpty else { return nil }
+        guard echoed != "custom"
+                || profiles.contains(where: { $0.name == echoed }) else { return nil }
+        return echoed
+    }
+
     /// Confirm/seed the active-profile pref from a create/resume `info` echo. The
     /// WS path silently falls back to the launch profile on an unknown name
     /// (`_profile_home` swallows resolver failures), so the server's echoed
@@ -4557,8 +4587,7 @@ final class SessionStore {
     /// actually differs, so a default-home session never clobbers an "all" scope.
     private func confirmActiveProfile(from info: SessionRuntimeInfo?) {
         guard isMultiProfileAvailable,
-              let echoed = info?.profileName?.trimmingCharacters(in: .whitespacesAndNewlines),
-              !echoed.isEmpty,
+              let echoed = selectableProfileEcho(info?.profileName),
               echoed != Self.defaultProfileName,
               echoed != activeProfile else { return }
         activeProfile = echoed
