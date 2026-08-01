@@ -492,6 +492,14 @@ struct ProseSelectionContainer: UIViewRepresentable {
         // yank an in-progress selection.
         if let current = uiView.attributedText, current.isEqual(to: text) { return }
         uiView.attributedText = text
+        // Streaming grows the same non-scrolling UITextView in place. UIKit's
+        // intrinsic-height cache is not invalidated by `attributedText` on all
+        // iOS 26 TextKit paths, so SwiftUI can keep the old height (the physical
+        // symptom was a visible `10.` marker with the rest of the list blank).
+        // Re-measure the existing view; do not replace the container or add a
+        // second renderer.
+        uiView.invalidateIntrinsicContentSize()
+        uiView.setNeedsLayout()
         uiView.ensureCompleteDocumentLayout()
     }
 

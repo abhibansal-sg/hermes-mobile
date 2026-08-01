@@ -428,6 +428,44 @@ final class ProtocolParityTests: XCTestCase {
         XCTAssertEqual(historyCalls, 1, "the running-to-idle edge refreshes exactly once")
     }
 
+    func testLocalWorkingSettlesWhenActiveListBecomesIdle() async {
+        let (chat, sessions) = makeStore()
+        _ = sessions.beginPromptSubmission(runtimeID: activeRuntime)
+        var status: SessionActiveItem.Status = .working
+        var historyCalls = 0
+        sessions.activeListRPC = {
+            SessionActiveListResult(sessions: [
+                SessionActiveItem(
+                    id: self.activeRuntime,
+                    sessionKey: self.storedId,
+                    status: status,
+                    model: nil
+                )
+            ])
+        }
+        chat.backfillFetch = { _ in
+            historyCalls += 1
+            return [
+                StoredMessage(role: "user", content: .string("phone prompt")),
+                StoredMessage(role: "assistant", content: .string("phone reply")),
+            ]
+        }
+        chat.handle(event: localFrame(type: "message.start"))
+        XCTAssertTrue(chat.localTurnInFlight)
+        XCTAssertTrue(chat.isStreaming)
+
+        status = .idle
+        await sessions.reconcileVisibleLiveStatus()
+
+        XCTAssertFalse(chat.isStreaming)
+        XCTAssertFalse(chat.localTurnInFlight)
+        XCTAssertEqual(historyCalls, 1)
+        XCTAssertTrue(chat.messages.contains { $0.text == "phone reply" })
+
+        await sessions.reconcileVisibleLiveStatus()
+        XCTAssertEqual(historyCalls, 1, "idle polling must settle once")
+    }
+
     func testSilentLocalTurnPreservesWorkingStockSessionWithoutHistoryFetch() async {
         let (chat, sessions) = makeStore()
         var activeListCalls = 0

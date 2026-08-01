@@ -1143,6 +1143,10 @@ final class SessionStore {
                           chat?.settleWatchOnlyTurn(runtimeId: live.id) == true {
                     markTurnCompleted(storedId: storedID, runtimeId: live.id)
                     await chat?.reconcileAuthoritativeTranscript(surfaceFailure: false)
+                } else if mode == .drive,
+                          chat?.settleLocalTurn(runtimeId: live.id) == true {
+                    markTurnCompleted(storedId: storedID, runtimeId: live.id)
+                    await chat?.reconcileAuthoritativeTranscript(surfaceFailure: false)
                 }
             case .absent:
                 guard sessionBinding?.mode == .watch,

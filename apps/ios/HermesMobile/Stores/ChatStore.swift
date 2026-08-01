@@ -1389,6 +1389,14 @@ final class ChatStore {
     ) async {
         guard runtimeId == activeSessionId else { return }
         guard snapshotRunning == true else { return }
+        // `active_list` is a read-only liveness poll, not a new turn. Once the
+        // selected stream already owns this runtime, restoring the snapshot
+        // again would rotate the local token and clear the subagent tree on
+        // every poll. Keep the live projection intact; the websocket remains
+        // the source of deltas for the turn already on screen.
+        if isStreaming, streamOwner == currentSelectionOwner {
+            if watchOnly == watchOnlyStream { return }
+        }
         restoreInflightTurn(inflight, watchRuntimeId: watchOnly ? runtimeId : nil)
     }
 
@@ -1397,7 +1405,38 @@ final class ChatStore {
     /// frame, so `active_list` moving to idle/absent is the authoritative edge.
     /// Returns true exactly once so the caller performs one transcript refresh.
     func settleWatchOnlyTurn(runtimeId: String?) -> Bool {
-        guard watchOnlyStream,
+        settleVisibleTurn(
+            runtimeId: runtimeId,
+            watchOnly: true,
+            notifyCompletion: false,
+            reason: "activeList.watchSettled"
+        )
+    }
+
+    /// Settle a phone-owned projection when stock `session.active_list` has
+    /// moved the selected runtime to `idle` but its terminal websocket frame
+    /// was missed. The authoritative transcript refresh that follows paints the
+    /// final reply; returning true makes that refresh a single edge-triggered
+    /// action instead of a poll loop.
+    func settleLocalTurn(runtimeId: String?) -> Bool {
+        settleVisibleTurn(
+            runtimeId: runtimeId,
+            watchOnly: false,
+            notifyCompletion: true,
+            reason: "activeList.localSettled"
+        )
+    }
+
+    private func settleVisibleTurn(
+        runtimeId: String?,
+        watchOnly: Bool,
+        notifyCompletion: Bool,
+        reason: String
+    ) -> Bool {
+        let ownsExpectedStream = watchOnly
+            ? watchOnlyStream
+            : (localTurnInFlight && !watchOnlyStream)
+        guard ownsExpectedStream,
               isStreaming,
               streamOwner == currentSelectionOwner,
               runtimeId == nil || runtimeId == activeSessionId else { return false }
@@ -1406,7 +1445,7 @@ final class ChatStore {
         mutateStreaming { $0.isStreaming = false }
         streamingMessageID = nil
         pendingReconnectReconcileID = settledMessageID
-        setStreaming(false, reason: "activeList.watchSettled")
+        setStreaming(false, reason: reason)
         watchOnlyStream = false
         streamOwner = nil
         turnStartedAt = nil
@@ -1414,6 +1453,8 @@ final class ChatStore {
         activeToolCallId = nil
         resetTurnLivenessState()
         expireTurnScopedPrompts(includeSecure: false)
+        endLocalTurn()
+        if notifyCompletion { onTurnComplete?() }
         return true
     }
 

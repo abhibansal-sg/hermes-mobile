@@ -423,6 +423,57 @@ final class ProseSelectionTests: XCTestCase {
                        "equal-content re-renders must never yank an in-progress selection")
     }
 
+    func testContainerRelayoutsWhenOrderedListGrowsAfterMount() throws {
+        func prose(_ body: String) throws -> NSAttributedString {
+            let pieces = ProseFlowBuilder.pieces(
+                body: body,
+                style: makeStyle(),
+                linkColor: .blue
+            )
+            guard case .prose(let attr) = pieces.first else {
+                throw NSError(domain: "ProseSelectionTests", code: 1,
+                              userInfo: [NSLocalizedDescriptionKey: "expected prose piece"])
+            }
+            return attr
+        }
+
+        let prefix = try prose("9. ninth item is already visible\n10." + " ")
+        let completed = try prose("""
+        9. ninth item is already visible
+        10. tenth item now has the complete sentence that used to be hidden
+        11. eleventh item remains visible after the growing list
+        """)
+        let controller = UIHostingController(
+            rootView: ProseSelectionContainer(text: prefix)
+                .frame(width: 360, alignment: .topLeading)
+        )
+        controller.view.frame = CGRect(x: 0, y: 0, width: 360, height: 900)
+        if let window = attachToWindow(controller) { attachedWindows.append(window) }
+        pumpLayout(controller)
+        let first = try XCTUnwrap(allTextViews(in: controller.view).first as? ProseTextView)
+        let prefixHeight = first.intrinsicContentSize.height
+
+        controller.rootView = ProseSelectionContainer(text: completed)
+            .frame(width: 360, alignment: .topLeading)
+        pumpLayout(controller)
+        let updated = try XCTUnwrap(allTextViews(in: controller.view).first as? ProseTextView)
+
+        XCTAssertTrue(updated.attributedText.string.contains("10.\ttenth item now"),
+                      "the updated ordered-list body must reach the native text view")
+        XCTAssertGreaterThan(
+            updated.intrinsicContentSize.height,
+            prefixHeight,
+            "growing a streamed list must invalidate the existing container's measured height"
+        )
+        let manager = try XCTUnwrap(updated.textLayoutManager)
+        let contentManager = try XCTUnwrap(manager.textContentManager)
+        let tail = try XCTUnwrap(
+            contentManager.location(contentManager.documentRange.endLocation, offsetBy: -1)
+        )
+        XCTAssertNotNil(manager.textLayoutFragment(for: tail),
+                        "the final ordered-list item must have a realized TextKit fragment")
+    }
+
     // MARK: - Opt-in on-screen evidence (word selection + handles)
 
     /// Hosts a two-paragraph assistant bubble on the active scene and drives a

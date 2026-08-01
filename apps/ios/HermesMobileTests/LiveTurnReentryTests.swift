@@ -164,6 +164,45 @@ final class LiveTurnReentryTests: XCTestCase {
         XCTAssertEqual(chat.interruptTarget, runtimeId)
     }
 
+    func testRepeatedActiveListRestorePreservesCurrentTurnProjection() async {
+        let (chat, _) = makeStore()
+        chat.seed(from: [
+            storedMessage(role: "user", text: "previous prompt"),
+            storedMessage(role: "assistant", text: "previous reply"),
+        ])
+        let inflight = SessionInflightTurn(
+            user: "write a long answer",
+            assistant: "partial answer",
+            streaming: true
+        )
+
+        await chat.reconcileLiveTurnStatus(
+            runtimeId: runtimeId,
+            snapshotRunning: true,
+            inflight: inflight
+        )
+        chat.handle(event: GatewayEvent(params: .object([
+            "type": .string("subagent.start"),
+            "session_id": .string(runtimeId),
+            "payload": .object([
+                "subagent_id": .string("sub-1"),
+                "goal": .string("Inspect the live turn"),
+            ]),
+        ]))!)
+        XCTAssertEqual(chat.subagentNodeCount, 1)
+
+        await chat.reconcileLiveTurnStatus(
+            runtimeId: runtimeId,
+            snapshotRunning: true,
+            inflight: inflight
+        )
+
+        XCTAssertEqual(chat.subagentNodeCount, 1,
+                       "an active-list poll must not reset the current turn's subagent tree")
+        XCTAssertTrue(chat.localTurnInFlight)
+        XCTAssertTrue(chat.messages.last?.isStreaming == true)
+    }
+
     func testDriveWaitsForSeedThenRestoresResumeSnapshot() async {
         let chat = ChatStore()
         let sessions = SessionStore()
