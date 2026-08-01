@@ -476,6 +476,10 @@ struct ProseSelectionContainer: UIViewRepresentable {
         // rebuilt when the environment's type size changes (new `text` value),
         // so UIKit must not also auto-scale them.
         view.adjustsFontForContentSizeCategory = false
+        // This view is a non-scrolling document inside the transcript's
+        // ScrollView.  It must not accept a stale/smaller vertical proposal
+        // while a streamed list grows in place.
+        view.setContentHuggingPriority(.required, for: .vertical)
         view.setContentCompressionResistancePriority(.required, for: .vertical)
         view.attributedText = text
         view.ensureCompleteDocumentLayout()
@@ -498,15 +502,14 @@ struct ProseSelectionContainer: UIViewRepresentable {
         // symptom was a visible `10.` marker with the rest of the list blank).
         // Re-measure the existing view; do not replace the container or add a
         // second renderer.
-        uiView.invalidateIntrinsicContentSize()
-        uiView.setNeedsLayout()
-        uiView.ensureCompleteDocumentLayout()
+        uiView.refreshCompleteDocumentLayout()
     }
 
     /// Self-size to the proposed width, like the `Text` this replaces. Never
     /// reads `UIScreen.main` (STR-695).
     func sizeThatFits(_ proposal: ProposedViewSize, uiView: ProseTextView, context: Context) -> CGSize? {
         let width = proposal.width ?? 320
+        uiView.prepareForMeasurement(width: width)
         uiView.ensureCompleteDocumentLayout()
         let fit = uiView.sizeThatFits(CGSize(width: width, height: .greatestFiniteMagnitude))
         return CGSize(width: width, height: ceil(fit.height))
@@ -562,6 +565,44 @@ final class ProseTextView: SelfSizingTextView {
         #if DEBUG
         didEnsureCompleteDocumentLayout = true
         #endif
+    }
+
+    /// Keep TextKit's container width/height in sync with the outer SwiftUI
+    /// proposal before forcing a full-document layout.  `attributedText` can
+    /// change while the representable keeps its identity; on iOS 26 the old
+    /// container height otherwise remains the clipping viewport (the visible
+    /// `10.` marker with the item's body and later rows missing).
+    func prepareForMeasurement(width: CGFloat? = nil) {
+        let proposedWidth = width ?? (bounds.width > 0 ? bounds.width : nil)
+        guard let proposedWidth else { return }
+        let horizontalInsets = textContainerInset.left + textContainerInset.right
+        textContainer.size = CGSize(
+            width: max(0, proposedWidth - horizontalInsets),
+            height: .greatestFiniteMagnitude
+        )
+    }
+
+    /// Re-measure an in-place streaming update and notify the UIKit ancestors
+    /// that SwiftUI uses for the representable's measured height.  No view
+    /// replacement is needed, so native selection remains intact.
+    func refreshCompleteDocumentLayout() {
+        prepareForMeasurement()
+        ensureCompleteDocumentLayout()
+        invalidateIntrinsicContentSize()
+        setNeedsLayout()
+
+        var ancestor = superview
+        while let view = ancestor {
+            view.invalidateIntrinsicContentSize()
+            view.setNeedsLayout()
+            ancestor = view.superview
+        }
+    }
+
+    override var intrinsicContentSize: CGSize {
+        prepareForMeasurement()
+        ensureCompleteDocumentLayout()
+        return super.intrinsicContentSize
     }
 
     /// Tests drive selection programmatically as a stand-in for the user

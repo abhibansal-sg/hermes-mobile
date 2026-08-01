@@ -83,11 +83,22 @@ final class ProseSelectionTests: XCTestCase {
             textView.attributedText.string.hasSuffix(fixture.expectedVisibleTail),
             "the mounted selection surface must retain the physical-device fixture's final sentence"
         )
+        XCTAssertTrue(
+            textView.attributedText.string.contains("10.\tFor R2 work"),
+            "the double-digit list item must retain its body, not only its marker"
+        )
         XCTAssertGreaterThan(
             textView.bounds.height,
             0,
             "the complete long document must receive a non-zero measured height"
         )
+        if let fragment = layoutManager.textLayoutFragment(for: tailLocation) {
+            XCTAssertLessThanOrEqual(
+                fragment.layoutFragmentFrame.maxY,
+                proseView.bounds.height + 1,
+                "the final fragment must be inside the mounted view's measured frame, not merely realized outside a clipped viewport"
+            )
+        }
     }
 
     /// A settled assistant message of TWO paragraphs must mount exactly ONE
@@ -452,6 +463,7 @@ final class ProseSelectionTests: XCTestCase {
         pumpLayout(controller)
         let first = try XCTUnwrap(allTextViews(in: controller.view).first as? ProseTextView)
         let prefixHeight = first.intrinsicContentSize.height
+        let prefixFrameHeight = first.frame.height
 
         controller.rootView = ProseSelectionContainer(text: completed)
             .frame(width: 360, alignment: .topLeading)
@@ -464,6 +476,11 @@ final class ProseSelectionTests: XCTestCase {
             updated.intrinsicContentSize.height,
             prefixHeight,
             "growing a streamed list must invalidate the existing container's measured height"
+        )
+        XCTAssertGreaterThan(
+            updated.frame.height,
+            prefixFrameHeight,
+            "the SwiftUI-hosted text view itself must grow; an intrinsic-height change that leaves the old frame in place still clips the list tail"
         )
         let manager = try XCTUnwrap(updated.textLayoutManager)
         let contentManager = try XCTUnwrap(manager.textContentManager)
