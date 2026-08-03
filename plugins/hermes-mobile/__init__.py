@@ -1,14 +1,12 @@
-"""Hermes Mobile edge plugin for a stock Hermes gateway.
+"""Hermes Mobile notification edge for a stock Hermes gateway.
 
-The phone talks to the co-located transparent relay. The plugin contributes
-mobile REST routes, pairing, idempotency receipts, and APNs delivery through
-the public Hermes plugin surface. Notification intake uses only stock v0.19
-lifecycle hooks; it does not observe or transform gateway frames.
+The phone connects directly to the stock gateway. This optional plugin adds
+APNs delivery, device registration, and idempotency receipts through public
+Hermes plugin seams. It does not observe or transform gateway frames.
 
 Modules:
 
 * ``push_engine`` — stock lifecycle hooks → relay/APNs + Live Activities.
-* ``gitbranch``   — fork-free branch lookup for the session.create fast path.
 * ``mobile_pair`` — the ``hermes mobile-pair`` CLI command (QR pairing),
   registered through the stock ``register_cli_command`` facade.
 * ``prompt_receipts`` — profile-scoped SQLite idempotency receipts for
@@ -224,14 +222,6 @@ def register(ctx) -> None:
             # Never break host startup on a wiring failure; the gateway simply
             # behaves like stock (no push) and logs why.
             _log.warning("hermes-mobile: push seam wiring failed", exc_info=True)
-    try:
-        from . import ios_turn_context
-
-        ios_turn_context.activate(ctx)
-    except Exception:
-        # Mobile formatting guidance is optional; a hook wiring failure must
-        # never take down the host process or affect non-mobile sessions.
-        _log.warning("hermes-mobile: iOS turn-context wiring failed", exc_info=True)
     try:
         _wire_token_auth()
     except Exception:
