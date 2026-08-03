@@ -1079,6 +1079,12 @@ final class ChatStore {
     @discardableResult
     private func ensureStreamingMessage() -> UUID {
         if let id = streamingMessageID { return id }
+        if let reconnectID = pendingReconnectReconcileID,
+           let index = messages.firstIndex(where: { $0.id == reconnectID && $0.role == .assistant }) {
+            streamingMessageID = reconnectID
+            messages[index].isStreaming = true
+            return reconnectID
+        }
         let message = ChatMessage(role: .assistant, isStreaming: true)
         streamingMessageID = message.id
         messages.append(message)

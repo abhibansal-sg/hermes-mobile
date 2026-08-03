@@ -203,6 +203,35 @@ final class LiveTurnReentryTests: XCTestCase {
         XCTAssertTrue(chat.messages.last?.isStreaming == true)
     }
 
+    func testLateCompletionReusesRowSettledByActiveList() async {
+        let (chat, _) = makeStore()
+        await chat.reconcileLiveTurnStatus(
+            runtimeId: runtimeId,
+            snapshotRunning: true,
+            inflight: SessionInflightTurn(
+                user: "give me the status",
+                assistant: "partial answer",
+                streaming: true
+            )
+        )
+
+        XCTAssertTrue(chat.settleLocalTurn(runtimeId: runtimeId))
+        chat.handle(event: GatewayEvent(params: .object([
+            "type": .string("message.complete"),
+            "session_id": .string(runtimeId),
+            "payload": .object([
+                "text": .string("final answer"),
+                "status": .string("complete"),
+            ]),
+        ]))!)
+
+        let replies = chat.messages.filter { $0.role == .assistant }
+        XCTAssertEqual(replies.count, 1,
+                       "a late terminal frame must finalize the settled live row, not append a duplicate")
+        XCTAssertEqual(replies.first?.text, "final answer")
+        XCTAssertFalse(replies.first?.isStreaming == true)
+    }
+
     func testDriveWaitsForSeedThenRestoresResumeSnapshot() async {
         let chat = ChatStore()
         let sessions = SessionStore()
