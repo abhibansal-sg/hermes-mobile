@@ -1347,7 +1347,7 @@ final class ConnectionStore {
     /// - Parameter issuedDeviceId: the server-minted `device_id` when this pairing
     ///   came from a W3a v2 QR (`kind=device`) — `token` is then ALREADY a device
     ///   token, so we record the id and SKIP auto-upgrade. `nil` for a v1 (shared)
-    ///   pairing, a manual token entry, or a saved-config bootstrap, where the
+    ///   pairing or a saved-config bootstrap, where the
     ///   post-connect auto-upgrade transparently swaps the shared token for a
     ///   device token if the server advertises the `devices` capability.
     func configure(urlString: String, token: String, issuedDeviceId: String? = nil) async -> String? {
