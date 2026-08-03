@@ -193,21 +193,17 @@ actor HermesGatewayClient {
     /// `GatewayError` on transport failure or if no ready frame arrives within
     /// 15 seconds. Any existing connection is torn down first.
     ///
-    /// - Parameter mode: the active connection mode, used to derive the correct
-    ///   `Host` header (loopback for Serve/sharedDashboard; real host for a
-    ///   non-loopback remoteURL target). Defaults to `.remoteURL` so callers that
-    ///   do not supply a mode keep the conservative real-host behaviour.
-    func connect(baseURL: URL, token: String, mode: ConnectionMode = .remoteURL) async throws {
+    func connect(baseURL: URL, token: String) async throws {
         try await connect(
-            request: WSURLBuilder.wsRequest(baseURL: baseURL, token: token, mode: mode)
+            request: WSURLBuilder.wsRequest(baseURL: baseURL, token: token)
         )
     }
 
     /// Gated-gateway counterpart to token auth. The ticket is minted by
     /// `POST /api/auth/ws-ticket` immediately before this call.
-    func connect(baseURL: URL, ticket: String, mode: ConnectionMode = .remoteURL) async throws {
+    func connect(baseURL: URL, ticket: String) async throws {
         try await connect(
-            request: WSURLBuilder.wsTicketRequest(baseURL: baseURL, ticket: ticket, mode: mode)
+            request: WSURLBuilder.wsTicketRequest(baseURL: baseURL, ticket: ticket)
         )
     }
 

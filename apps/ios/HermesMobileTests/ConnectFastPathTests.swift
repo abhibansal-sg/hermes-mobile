@@ -154,7 +154,7 @@ final class ConnectFastPathTests: XCTestCase {
         let gate = SuspensionGate()
         connection.statusRPC = { _, _ in await gate.suspend() }
         var connectDialed = false
-        connection.connectRPC = { _, _, _ in connectDialed = true }
+        connection.connectRPC = { _, _ in connectDialed = true }
 
         var returned = false
         let task = Task { @MainActor () -> String? in

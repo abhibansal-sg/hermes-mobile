@@ -65,7 +65,6 @@ struct RestClient: Sendable {
     let baseURL: URL
     let token: String
     let session: URLSession
-    let connectionMode: ConnectionMode
     /// The injected-session initializer is used by tests to keep uploads on the
     /// same URLProtocol-backed transport as the other REST calls. Production
     /// clients always use the durable background transfer path below.
@@ -81,8 +80,7 @@ struct RestClient: Sendable {
     init(
         baseURL: URL,
         token: String,
-        pathStyle: APIPathStyle = .legacy,
-        connectionMode: ConnectionMode = .remoteURL
+        pathStyle: APIPathStyle = .legacy
     ) {
         let config = URLSessionConfiguration.default
         config.timeoutIntervalForRequest = Self.timeout
@@ -94,7 +92,6 @@ struct RestClient: Sendable {
             token: token,
             session: URLSession(configuration: config),
             pathStyle: pathStyle,
-            connectionMode: connectionMode,
             usesInjectedUploadSession: false
         )
     }
@@ -106,15 +103,13 @@ struct RestClient: Sendable {
         baseURL: URL,
         token: String,
         session: URLSession,
-        pathStyle: APIPathStyle = .legacy,
-        connectionMode: ConnectionMode = .remoteURL
+        pathStyle: APIPathStyle = .legacy
     ) {
         self.init(
             baseURL: baseURL,
             token: token,
             session: session,
             pathStyle: pathStyle,
-            connectionMode: connectionMode,
             usesInjectedUploadSession: true
         )
     }
@@ -124,14 +119,12 @@ struct RestClient: Sendable {
         token: String,
         session: URLSession,
         pathStyle: APIPathStyle,
-        connectionMode: ConnectionMode,
         usesInjectedUploadSession: Bool
     ) {
         self.baseURL = baseURL
         self.token = token
         self.session = session
         self.pathStyle = pathStyle
-        self.connectionMode = connectionMode
         self.usesInjectedUploadSession = usesInjectedUploadSession
     }
 
@@ -142,7 +135,6 @@ struct RestClient: Sendable {
             token: token,
             session: session,
             pathStyle: style,
-            connectionMode: connectionMode,
             usesInjectedUploadSession: usesInjectedUploadSession
         )
     }
@@ -473,7 +465,7 @@ struct RestClient: Sendable {
             timeoutInterval: Self.timeout
         )
         request.httpMethod = method
-        if let host = WSURLBuilder.effectiveHost(for: baseURL, mode: connectionMode) {
+        if let host = WSURLBuilder.effectiveHost(for: baseURL) {
             request.setValue(host, forHTTPHeaderField: "Host")
         }
         if !token.isEmpty {

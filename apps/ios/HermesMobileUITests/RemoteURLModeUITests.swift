@@ -26,7 +26,7 @@ final class RemoteURLModeUITests: XCTestCase {
     // MARK: - Test 1: Remote-URL mode reaches .connected via real host
 
     /// Connects directly via the dev-env path (HERMES_URL/HERMES_TOKEN),
-    /// which exercises the full `configure → WSURLBuilder.wsRequest(mode:) →
+    /// which exercises the full `configure → WSURLBuilder.wsRequest() →
     /// client.connect` chain with the mode derived from the persisted value.
     /// The pre-launch argument seeds `.remoteURL` so the transport omits the
     /// loopback Host override — the gateway's `0.0.0.0` bind accepts the real

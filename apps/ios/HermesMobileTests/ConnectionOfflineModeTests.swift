@@ -25,7 +25,7 @@ final class ConnectionOfflineModeTests: XCTestCase {
         XCTAssertTrue(defaults.bool(forKey: DefaultsKeys.connectionOffline))
 
         var connected = false
-        connection.connectRPC = { _, _, _ in connected = true }
+        connection.connectRPC = { _, _ in connected = true }
         await connection.bootstrap()
         XCTAssertFalse(connected)
         XCTAssertEqual(connection.phase, .offline(nil))

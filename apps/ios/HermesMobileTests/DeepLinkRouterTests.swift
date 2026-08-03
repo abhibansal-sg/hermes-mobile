@@ -283,10 +283,7 @@ final class DeepLinkRouterTests: XCTestCase {
         XCTAssertTrue(s.connection.reauthRequired)
 
         var confirmationRequested = false
-        // Pin a deterministic non-.sharedDashboard start mode so the post-route
-        // flip to .sharedDashboard is a meaningful signal that applyPair ran
-        // (isolates the test from UserDefaults persisted in the test host).
-        s.connection.connectionMode = .remoteURL
+        s.connection.connectionMode = .hermesCloud
 
         HermesURLRouter.route(
             URL(string: "hermesapp://pair?url=https%3A%2F%2Fh%3A9119&token=freshtok")!,
@@ -301,12 +298,12 @@ final class DeepLinkRouterTests: XCTestCase {
             confirmationRequested,
             "A pair link in the post-revoke repair state is recovery, not a destructive re-pair — must not prompt."
         )
-        // `applyPair()` tags the mode `.sharedDashboard` synchronously before
-        // launching `configure()` asynchronously, so the mode flip is a
+        // `applyPair()` tags the mode Self-hosted synchronously before launching
+        // `configure()` asynchronously, so the mode flip is a
         // deterministic, sleep-free signal that the immediate-apply path ran.
         XCTAssertEqual(
-            s.connection.connectionMode, .sharedDashboard,
-            "The repair-state pair link must reach applyPair (mode flips to .sharedDashboard)."
+            s.connection.connectionMode, .remoteURL,
+            "The repair-state pair link must reach applyPair (mode flips to Self-hosted)."
         )
     }
 

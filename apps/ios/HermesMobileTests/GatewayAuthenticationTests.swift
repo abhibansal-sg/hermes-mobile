@@ -39,8 +39,7 @@ final class GatewayAuthenticationTests: XCTestCase {
         return RestClient(
             baseURL: URL(string: "https://gateway.example")!,
             token: token,
-            session: URLSession(configuration: configuration),
-            connectionMode: .remoteURL
+            session: URLSession(configuration: configuration)
         )
     }
 

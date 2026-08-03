@@ -12,9 +12,9 @@ final class ConnectionModePickerUITests: XCTestCase {
         continueAfterFailure = false
     }
 
-    // MARK: - Test 1: Fresh launch shows 3 mode buttons
+    // MARK: - Test 1: Fresh launch shows the two supported modes
 
-    func testFreshLaunchShowsThreeModes() throws {
+    func testFreshLaunchShowsTwoModes() throws {
         // Launch WITHOUT credentials so the app lands on WelcomeView.
         let app = XCUIApplication()
         app.launchArguments += ["-AppleLanguages", "(en)", "-AppleLocale", "en_US"]
@@ -24,17 +24,14 @@ final class ConnectionModePickerUITests: XCTestCase {
         app.launchArguments += ["--uitest-mute-audio"]
         app.launch()
 
-        // WelcomeView renders the mode picker — assert all three mode buttons exist.
-        let localBtn  = app.buttons["connectionModeButton_localDesktop"]
+        // WelcomeView offers one direct path and one hosted path.
         let remoteBtn = app.buttons["connectionModeButton_remoteURL"]
-        let sharedBtn = app.buttons["connectionModeButton_sharedDashboard"]
+        let cloudBtn = app.buttons["connectionModeButton_hermesCloud"]
 
-        XCTAssertTrue(localBtn.waitForExistence(timeout: 10),
-                      "Local desktop mode button not found")
         XCTAssertTrue(remoteBtn.waitForExistence(timeout: 5),
-                      "Remote URL mode button not found")
-        XCTAssertTrue(sharedBtn.waitForExistence(timeout: 5),
-                      "Shared dashboard mode button not found")
+                      "Self-hosted mode button not found")
+        XCTAssertTrue(cloudBtn.waitForExistence(timeout: 5),
+                      "Hermes Cloud mode button not found")
     }
 
     // MARK: - Test 2: Select Remote URL → enter :9123 URL+token → connected + session row
@@ -112,10 +109,10 @@ final class ConnectionModePickerUITests: XCTestCase {
         app.launchArguments += ["--uitest-mute-audio"]
         app.launch()
 
-        // Tap "Local desktop" to select it.
-        let localBtn = app.buttons["connectionModeButton_localDesktop"]
-        XCTAssertTrue(localBtn.waitForExistence(timeout: 10), "Local desktop button not found")
-        localBtn.tap()
+        // Select the non-default mode so persistence is observable.
+        let cloudBtn = app.buttons["connectionModeButton_hermesCloud"]
+        XCTAssertTrue(cloudBtn.waitForExistence(timeout: 10), "Hermes Cloud button not found")
+        cloudBtn.tap()
 
         // Small pause to let the UserDefaults write settle.
         Thread.sleep(forTimeInterval: 0.5)
@@ -128,13 +125,13 @@ final class ConnectionModePickerUITests: XCTestCase {
         app2.launchArguments += ["--uitest-mute-audio"]
         app2.launch()
 
-        // The Local desktop button should be selected (has .isSelected trait).
-        let localBtn2 = app2.buttons["connectionModeButton_localDesktop"]
-        XCTAssertTrue(localBtn2.waitForExistence(timeout: 10),
-                      "Local desktop button not found after relaunch")
+        // Hermes Cloud should still be selected (has .isSelected trait).
+        let cloudBtn2 = app2.buttons["connectionModeButton_hermesCloud"]
+        XCTAssertTrue(cloudBtn2.waitForExistence(timeout: 10),
+                      "Hermes Cloud button not found after relaunch")
         XCTAssertTrue(
-            localBtn2.isSelected,
-            "Local desktop mode was not persisted across relaunch"
+            cloudBtn2.isSelected,
+            "Hermes Cloud mode was not persisted across relaunch"
         )
     }
 }

@@ -99,4 +99,12 @@ final class ViewA11yTests: XCTestCase {
                            "modeButton a11y label must be exactly mode.label with no selection suffix")
         }
     }
+
+    func testLegacyDirectConnectionModesMigrateToSelfHosted() {
+        XCTAssertEqual(ConnectionMode.saved(rawValue: "localDesktop"), .remoteURL)
+        XCTAssertEqual(ConnectionMode.saved(rawValue: "sharedDashboard"), .remoteURL)
+        XCTAssertEqual(ConnectionMode.saved(rawValue: "remoteURL"), .remoteURL)
+        XCTAssertEqual(ConnectionMode.saved(rawValue: "hermesCloud"), .hermesCloud)
+        XCTAssertEqual(ConnectionMode.saved(rawValue: "unknown"), .remoteURL)
+    }
 }

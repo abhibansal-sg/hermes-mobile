@@ -72,7 +72,7 @@ final class SessionStoreTokenSourceTests: XCTestCase {
 
         // Inject a no-op fake transport so the reconnect loop completes without
         // opening a real socket.  Pattern mirrors ConnectionStoreReconnectTests.
-        connection.connectRPC = { _, _, _ in }
+        connection.connectRPC = { _, _ in }
 
         // Seed in-memory state as a prior configure() would have left it:
         //   serverURLString = testServer, currentToken = liveToken.

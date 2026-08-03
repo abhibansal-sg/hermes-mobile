@@ -172,7 +172,7 @@ final class ConnectionStoreReconnectTests: XCTestCase {
         issuedDeviceId: String? = nil
     ) async -> String? {
         connection.statusRPC = { _, _ in }
-        connection.connectRPC = { _, _, _ in }
+        connection.connectRPC = { _, _ in }
         return await connection.configure(
             urlString: serverURL,
             token: token,
@@ -288,7 +288,7 @@ final class ConnectionStoreReconnectTests: XCTestCase {
         var resumeCount = 0
         var backfillCount = 0
 
-        connection.connectRPC = { _, _, _ in connectCount += 1 }
+        connection.connectRPC = { _, _ in connectCount += 1 }
         sessions.resumeRPC = { stored, _ in
             resumeCount += 1
             XCTAssertEqual(stored, storedId)
@@ -342,7 +342,7 @@ final class ConnectionStoreReconnectTests: XCTestCase {
         let (connection, _, _) = makeStore()
 
         // Inject an always-succeeding fake transport so no socket is opened.
-        connection.connectRPC = { _, _, _ in
+        connection.connectRPC = { _, _ in
             // Simulates the gateway answering on the same stable address+token
             // (the restart-survival case: same URL, valid token, new process).
         }
@@ -377,7 +377,7 @@ final class ConnectionStoreReconnectTests: XCTestCase {
     func testReconnectSuccessEntersDraftWhenNoActiveSession() async {
         let (connection, sessions, _) = makeStore()
 
-        connection.connectRPC = { _, _, _ in }
+        connection.connectRPC = { _, _ in }
         XCTAssertNil(sessions.activeStoredId)
         XCTAssertFalse(sessions.isDraft)
 
@@ -397,7 +397,7 @@ final class ConnectionStoreReconnectTests: XCTestCase {
     func testReconnectSuccessDoesNotClobberActiveSession() async {
         let (connection, sessions, _) = makeStore()
 
-        connection.connectRPC = { _, _, _ in }
+        connection.connectRPC = { _, _ in }
         sessions.activeStoredId = "already-active-session"
         sessions.resumeRPC = { stored, _ in
             self.stagedResumeResult(sessionId: "runtime-after-reconnect", resumed: stored)
@@ -427,7 +427,7 @@ final class ConnectionStoreReconnectTests: XCTestCase {
         var resumeCount = 0
 
         connection.reconnectBackoffOverride = 0
-        connection.connectRPC = { _, _, _ in connectCount += 1 }
+        connection.connectRPC = { _, _ in connectCount += 1 }
         sessions.activeStoredId = storedID
         sessions.resumeRPC = { stored, _ in
             resumeCount += 1
@@ -463,7 +463,7 @@ final class ConnectionStoreReconnectTests: XCTestCase {
         connection.reconnectBackoffOverride = 0
 
         var callCount = 0
-        connection.connectRPC = { _, _, _ in
+        connection.connectRPC = { _, _ in
             callCount += 1
             if callCount == 1 {
                 // Simulate the gateway being momentarily unreachable.
@@ -501,7 +501,7 @@ final class ConnectionStoreReconnectTests: XCTestCase {
         let (connection, _, _) = makeStore()
 
         // connectRPC always fails with a non-auth transport error.
-        connection.connectRPC = { _, _, _ in
+        connection.connectRPC = { _, _ in
             throw URLError(.timedOut)
         }
 
@@ -546,7 +546,7 @@ final class ConnectionStoreReconnectTests: XCTestCase {
         // Zero-delay backoff so multiple attempts complete inside the settle window.
         connection.reconnectBackoffOverride = 0
         // Always-failing WS; probe returns false — gateway unreachable, not revoked.
-        connection.connectRPC = { _, _, _ in throw URLError(.cannotConnectToHost) }
+        connection.connectRPC = { _, _ in throw URLError(.cannotConnectToHost) }
         connection.probeIsAuthRevokedRPC = { false }
 
         connection._seedAndStartReconnect(
@@ -581,7 +581,7 @@ final class ConnectionStoreReconnectTests: XCTestCase {
         // Zero-delay backoff: threshold (3) consecutive failures fire quickly.
         connection.reconnectBackoffOverride = 0
         // Always failing — simulates a permanently revoked token at the WS gate.
-        connection.connectRPC = { _, _, _ in throw URLError(.cannotConnectToHost) }
+        connection.connectRPC = { _, _ in throw URLError(.cannotConnectToHost) }
         // REST probe confirms revocation.
         connection.probeIsAuthRevokedRPC = { true }
 
@@ -621,7 +621,7 @@ final class ConnectionStoreReconnectTests: XCTestCase {
         connection.probeIsAuthRevokedRPC = { false }
 
         var callCount = 0
-        connection.connectRPC = { _, _, _ in
+        connection.connectRPC = { _, _ in
             callCount += 1
             if callCount <= 2 {
                 // Two sub-threshold failures (threshold = 3).
@@ -664,7 +664,7 @@ final class ConnectionStoreReconnectTests: XCTestCase {
         // on the host value — any valid URL proves the property.
         let stableURL = "http://localhost:9123"
 
-        connection.connectRPC = { url, _, _ in
+        connection.connectRPC = { url, _ in
             // Assert the URL the loop resolved matches what was seeded.
             XCTAssertEqual(url.absoluteString, stableURL,
                            "reconnect loop must use the saved stable URL verbatim")
@@ -691,7 +691,7 @@ final class ConnectionStoreReconnectTests: XCTestCase {
         // A long grace window: attempt 0 must heal well inside it, proving the
         // heal — not the timer — is what ends grace.
         connection.graceWindowOverride = .seconds(30)
-        connection.connectRPC = { _, _, _ in }
+        connection.connectRPC = { _, _ in }
 
         // Deliberately no `activeStoredId`: `recoverActiveSession()` then skips
         // `backfill()` entirely, so the transcript below is left exactly as the
@@ -756,7 +756,7 @@ final class ConnectionStoreReconnectTests: XCTestCase {
         // resolves, so the timer fires while the loop is still suspended
         // inside `recoverActiveSession()`.
         connection.graceWindowOverride = .milliseconds(50)
-        connection.connectRPC = { _, _, _ in }
+        connection.connectRPC = { _, _ in }
 
         // `activeStoredId` routes `recoverActiveSession()` through
         // `resumeActiveAfterReconnect()` — the genuine network await this
@@ -811,7 +811,7 @@ final class ConnectionStoreReconnectTests: XCTestCase {
         // keeps retrying (and failing) fast underneath it.
         connection.graceWindowOverride = .milliseconds(50)
         connection.reconnectBackoffOverride = 0
-        connection.connectRPC = { _, _, _ in throw URLError(.cannotConnectToHost) }
+        connection.connectRPC = { _, _ in throw URLError(.cannotConnectToHost) }
         connection.probeIsAuthRevokedRPC = { false }
 
         connection._seedConnectedForTesting(serverURL: "http://localhost:9123", token: "test-stable-token")
@@ -853,7 +853,7 @@ final class ConnectionStoreReconnectTests: XCTestCase {
         // grace entirely rather than waiting for the timer.
         connection.graceWindowOverride = .seconds(30)
         connection.reconnectBackoffOverride = 0
-        connection.connectRPC = { _, _, _ in throw URLError(.cannotConnectToHost) }
+        connection.connectRPC = { _, _ in throw URLError(.cannotConnectToHost) }
         connection.probeIsAuthRevokedRPC = { true }
 
         connection._seedConnectedForTesting(serverURL: "http://localhost:9123", token: "revoked-token")
@@ -888,7 +888,7 @@ final class ConnectionStoreReconnectTests: XCTestCase {
         XCTAssertTrue(connection.isTransportReady)
         XCTAssertEqual(connection.transportReadiness, .ready(epoch: priorEpoch))
 
-        connection.connectRPC = { _, _, _ in await gate.suspend() }
+        connection.connectRPC = { _, _ in await gate.suspend() }
         connection._handleGatewayStateForTesting(.failed("background socket dropped"))
         await gate.waitUntilEntered()
 
@@ -923,7 +923,7 @@ final class ConnectionStoreReconnectTests: XCTestCase {
         connection._seedConnectedForTesting(
             serverURL: "http://127.0.0.1:9123", token: "test-token"
         )
-        connection.connectRPC = { _, _, _ in await gate.suspend() }
+        connection.connectRPC = { _, _ in await gate.suspend() }
         connection._handleGatewayStateForTesting(.failed("background socket dropped"))
         await gate.waitUntilEntered()
 
@@ -967,7 +967,7 @@ final class ConnectionStoreReconnectTests: XCTestCase {
         XCTAssertEqual(resumed, "runtime-A")
         XCTAssertEqual(sessions.activeRuntimeId, "runtime-A")
 
-        connection.connectRPC = { _, _, _ in await gate.suspend() }
+        connection.connectRPC = { _, _ in await gate.suspend() }
         connection._handleGatewayStateForTesting(.failed("background socket dropped"))
         await gate.waitUntilEntered()
 
@@ -1025,7 +1025,7 @@ final class ConnectionStoreReconnectTests: XCTestCase {
             await calls.append(stored)
             return self.stagedResumeResult(sessionId: "runtime-\(stored)", resumed: stored)
         }
-        connection.connectRPC = { _, _, _ in await reconnectGate.suspend() }
+        connection.connectRPC = { _, _ in await reconnectGate.suspend() }
 
         connection._handleGatewayStateForTesting(.failed("background socket dropped"))
         await reconnectGate.waitUntilEntered()
@@ -1110,7 +1110,7 @@ final class ConnectionStoreReconnectTests: XCTestCase {
         XCTAssertNil(sessions.activeRuntimeId)
         XCTAssertEqual(sessions.sessionBinding?.mode, .watch)
 
-        connection.connectRPC = { _, _, _ in
+        connection.connectRPC = { _, _ in
             await reconnectGate.suspend()
             transportReady = true
         }
@@ -1160,7 +1160,7 @@ final class ConnectionStoreReconnectTests: XCTestCase {
         try? KeychainService.saveToken("token", server: server)
         connection._skipEnvironmentBootstrapForTesting = true
         connection.statusRPC = { _, _ in await gate.suspend() }
-        connection.connectRPC = { _, _, _ in }
+        connection.connectRPC = { _, _ in }
         defer { KeychainService.deleteToken(server: server) }
 
         let bootstrap = Task { await connection.bootstrap() }
@@ -1204,7 +1204,7 @@ final class ConnectionStoreReconnectTests: XCTestCase {
         let gate = SuspensionGate()
         let server = "https://generation-connect.example"
         UserDefaults.standard.set(server, forKey: DefaultsKeys.serverURL)
-        connection.connectRPC = { _, _, _ in await gate.suspend() }
+        connection.connectRPC = { _, _ in await gate.suspend() }
 
         connection._seedAndStartReconnect(serverURL: server, token: "token")
         await gate.waitUntilEntered()
@@ -1222,7 +1222,7 @@ final class ConnectionStoreReconnectTests: XCTestCase {
         let gate = SuspensionGate()
         let server = "https://generation-recover.example"
         UserDefaults.standard.set(server, forKey: DefaultsKeys.serverURL)
-        connection.connectRPC = { _, _, _ in }
+        connection.connectRPC = { _, _ in }
         sessions.activeStoredId = "stored-stale"
         sessions.resumeRPC = { stored, _ in
             await gate.suspend()
@@ -1271,7 +1271,7 @@ final class ConnectionStoreReconnectTests: XCTestCase {
         let server = "https://generation-auth-probe.example"
         UserDefaults.standard.set(server, forKey: DefaultsKeys.serverURL)
         connection.reconnectBackoffOverride = 0
-        connection.connectRPC = { _, _, _ in throw URLError(.cannotConnectToHost) }
+        connection.connectRPC = { _, _ in throw URLError(.cannotConnectToHost) }
         connection.probeIsAuthRevokedRPC = {
             await gate.suspend()
             return true
@@ -1343,7 +1343,7 @@ final class ConnectionStoreReconnectTests: XCTestCase {
             // terminal `.offline` with `hasConnected == false`, but the monitor
             // was armed before the probe.
             connection.statusRPC = { _, _ in throw URLError(.notConnectedToInternet) }
-            connection.connectRPC = { _, _, _ in }
+            connection.connectRPC = { _, _ in }
             _ = await connection.configure(urlString: server, token: "tok")
 
             guard case .offline = connection.phase else {
@@ -1378,7 +1378,7 @@ final class ConnectionStoreReconnectTests: XCTestCase {
 
             let connectCalls = ResumeCallLog()
             connection.statusRPC = { _, _ in throw URLError(.notConnectedToInternet) }
-            connection.connectRPC = { _, _, _ in await connectCalls.append(server) }
+            connection.connectRPC = { _, _ in await connectCalls.append(server) }
             _ = await connection.configure(urlString: server, token: "tok")
             guard case .offline = connection.phase else {
                 return XCTFail("cold configure failure must land in .offline, got \(connection.phase)")
@@ -1409,7 +1409,7 @@ final class ConnectionStoreReconnectTests: XCTestCase {
         let server = "https://s3-connected.example:9119"
         let connectCalls = ResumeCallLog()
         connection.networkReconnectDebounceOverride = .milliseconds(5)
-        connection.connectRPC = { _, _, _ in await connectCalls.append(server) }
+        connection.connectRPC = { _, _ in await connectCalls.append(server) }
         let fake = FakePathMonitor()
         connection._pathMonitorForTesting = fake
         connection._startPathMonitorForTesting()
@@ -1441,7 +1441,7 @@ final class ConnectionStoreReconnectTests: XCTestCase {
         let gate = SuspensionGate()
         let connectCalls = ResumeCallLog()
         connection.networkReconnectDebounceOverride = .milliseconds(5)
-        connection.connectRPC = { _, _, _ in
+        connection.connectRPC = { _, _ in
             await connectCalls.append(server)
             // Suspend forever (until released) to represent a handshake that is
             // genuinely still in flight when the network trigger fires.
@@ -1490,7 +1490,7 @@ final class ConnectionStoreReconnectTests: XCTestCase {
         connection.reconnectBackoffOverride = 30
         connection.networkReconnectDebounceOverride = .milliseconds(5)
         let connectCalls = ResumeCallLog()
-        connection.connectRPC = { _, _, _ in
+        connection.connectRPC = { _, _ in
             await connectCalls.append(server)
             if await connectCalls.calls(for: server) == 1 {
                 throw URLError(.cannotConnectToHost)

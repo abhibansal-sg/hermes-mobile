@@ -5,8 +5,7 @@ import SwiftUI
 /// for a session token or opens the stock gateway login page. On success the
 /// phase flips to `.connected` and ``RootView`` re-renders automatically.
 struct ConnectionSetupView: View {
-    /// The connection mode this form is serving. Influences the URL placeholder
-    /// text (Local desktop gets a LAN/loopback hint) and the form title.
+    /// The connection mode this form is serving.
     var initialMode: ConnectionMode = .remoteURL
 
     @Environment(ConnectionStore.self) private var connection
@@ -64,21 +63,14 @@ struct ConnectionSetupView: View {
 
     /// URL placeholder text — adapts to the connection mode.
     private var urlPlaceholder: String {
-        switch initialMode {
-        case .localDesktop:
-            return "http://192.168.x.x:9119"
-        case .remoteURL, .hermesCloud, .sharedDashboard:
-            return "https://your-mac.tailnet.ts.net:9443"
-        }
+        "https://your-mac.tailnet.ts.net:9443"
     }
 
     /// Navigation title — adapts to the connection mode.
     private var formTitle: String {
         switch initialMode {
-        case .localDesktop:    return "Local gateway"
-        case .remoteURL:       return "Connect to Hermes"
-        case .hermesCloud:     return "Hermes Cloud"
-        case .sharedDashboard: return "Connect to Hermes"
+        case .remoteURL:   return "Connect to Hermes"
+        case .hermesCloud: return "Hermes Cloud"
         }
     }
 

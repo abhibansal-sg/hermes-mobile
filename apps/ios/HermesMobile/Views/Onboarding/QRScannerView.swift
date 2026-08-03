@@ -220,8 +220,7 @@ struct QRScannerView: View {
         connectTask?.cancel()
         connectTask = Task {
             // Inc 2 (Follow-up A): route through applyPair so in-app QR scans
-            // tag `.sharedDashboard` (and v2 device payloads keep their existing
-            // `.sharedDashboard` tag too). Previously this called configure()
+            // tag the connection as self-hosted. Previously this called configure()
             // directly, which skipped the mode-tagging in applyPair and left the
             // connection in whatever mode was last persisted. applyPair sets the
             // mode BEFORE configure() so the transport picks the right Host header.

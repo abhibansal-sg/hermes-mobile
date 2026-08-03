@@ -6,39 +6,21 @@ final class WSURLBuilderTests: XCTestCase {
 
     // MARK: - Helpers
 
-    private func wsRequest(
-        urlString: String,
-        mode: ConnectionMode
-    ) -> URLRequest {
+    private func wsRequest(urlString: String) -> URLRequest {
         let url = URL(string: urlString)!
-        return WSURLBuilder.wsRequest(baseURL: url, token: "test-token", mode: mode)
+        return WSURLBuilder.wsRequest(baseURL: url, token: "test-token")
     }
 
-    private func restRequest(
-        urlString: String,
-        mode: ConnectionMode
-    ) -> URLRequest {
+    private func restRequest(urlString: String) -> URLRequest {
         let url = URL(string: urlString)!
-        return WSURLBuilder.restRequest(baseURL: url, path: "/api/status", token: "test-token", mode: mode)
+        return WSURLBuilder.restRequest(baseURL: url, path: "/api/status", token: "test-token")
     }
 
     // MARK: - effectiveHost
 
-    func testEffectiveHost_sharedDashboard_remoteTargetPinsLoopback() {
-        let nonLoopback = URL(string: "http://192.168.1.100:9123")!
-        let host = WSURLBuilder.effectiveHost(for: nonLoopback, mode: .sharedDashboard)
-        XCTAssertEqual(host, "127.0.0.1")
-    }
-
-    func testEffectiveHost_localDesktop_remoteTargetPinsLoopback() {
-        let nonLoopback = URL(string: "http://10.0.0.5:9123")!
-        let host = WSURLBuilder.effectiveHost(for: nonLoopback, mode: .localDesktop)
-        XCTAssertEqual(host, "127.0.0.1")
-    }
-
     func testEffectiveHost_remoteURL_loopbackTarget_pinsLoopback() {
         let loopback = URL(string: "http://127.0.0.1:9123")!
-        let host = WSURLBuilder.effectiveHost(for: loopback, mode: .remoteURL)
+        let host = WSURLBuilder.effectiveHost(for: loopback)
         XCTAssertEqual(
             host, "127.0.0.1",
             ".remoteURL pointing at 127.0.0.1 must still pin loopback (local Serve target)"
@@ -47,7 +29,7 @@ final class WSURLBuilderTests: XCTestCase {
 
     func testEffectiveHost_remoteURL_localhostTarget_pinsLoopback() {
         let local = URL(string: "http://localhost:9123")!
-        let host = WSURLBuilder.effectiveHost(for: local, mode: .remoteURL)
+        let host = WSURLBuilder.effectiveHost(for: local)
         XCTAssertEqual(
             host, "127.0.0.1",
             ".remoteURL pointing at localhost must still pin loopback"
@@ -56,7 +38,7 @@ final class WSURLBuilderTests: XCTestCase {
 
     func testEffectiveHost_remoteURL_nonLoopbackIP_omitsOverride() {
         let remote = URL(string: "http://192.168.1.42:9123")!
-        let host = WSURLBuilder.effectiveHost(for: remote, mode: .remoteURL)
+        let host = WSURLBuilder.effectiveHost(for: remote)
         XCTAssertNil(
             host,
             ".remoteURL with non-loopback IP must return nil (no Host override — real host sent)"
@@ -65,7 +47,7 @@ final class WSURLBuilderTests: XCTestCase {
 
     func testEffectiveHost_remoteURL_hostnameTarget_omitsOverride() {
         let remote = URL(string: "http://mymac.local:9123")!
-        let host = WSURLBuilder.effectiveHost(for: remote, mode: .remoteURL)
+        let host = WSURLBuilder.effectiveHost(for: remote)
         XCTAssertNil(
             host,
             ".remoteURL with a hostname target must return nil (real host sent to gateway)"
@@ -74,15 +56,10 @@ final class WSURLBuilderTests: XCTestCase {
 
     // MARK: - wsRequest Host header
 
-    func testWsRequest_sharedDashboard_nonLoopback_hasLoopbackHost() {
-        let req = wsRequest(urlString: "http://192.168.1.42:9123", mode: .sharedDashboard)
-        XCTAssertEqual(req.value(forHTTPHeaderField: "Host"), "127.0.0.1")
-    }
-
     func testWsRequest_remoteURL_nonLoopback_hasRealHost() {
         // The REAL host for the non-loopback case: no override → URLRequest
         // carries no explicit Host, meaning the system sends the URL's own host.
-        let req = wsRequest(urlString: "http://192.168.1.42:9123", mode: .remoteURL)
+        let req = wsRequest(urlString: "http://192.168.1.42:9123")
         let overriddenHost = req.value(forHTTPHeaderField: "Host")
         // We assert it is NOT 127.0.0.1 — either nil or the real host is fine.
         XCTAssertNotEqual(
@@ -93,7 +70,7 @@ final class WSURLBuilderTests: XCTestCase {
 
     func testWsRequest_remoteURL_loopbackTarget_hasLoopbackHost() {
         // Regression: a remoteURL pointing at 127.0.0.1 (local Serve) must still pin loopback.
-        let req = wsRequest(urlString: "http://127.0.0.1:9123", mode: .remoteURL)
+        let req = wsRequest(urlString: "http://127.0.0.1:9123")
         XCTAssertEqual(
             req.value(forHTTPHeaderField: "Host"), "127.0.0.1",
             "WS request in .remoteURL mode for 127.0.0.1 must still pin loopback Host"
@@ -103,8 +80,7 @@ final class WSURLBuilderTests: XCTestCase {
     func testWsTicketRequest_usesTicketWithoutToken() {
         let request = WSURLBuilder.wsTicketRequest(
             baseURL: URL(string: "https://gateway.example")!,
-            ticket: "single-use",
-            mode: .remoteURL
+            ticket: "single-use"
         )
         let items = URLComponents(
             url: request.url!,
@@ -116,24 +92,10 @@ final class WSURLBuilderTests: XCTestCase {
         XCTAssertEqual(request.url?.scheme, "wss")
     }
 
-    func testEffectiveHost_cloudUsesRemoteHost() {
-        XCTAssertNil(
-            WSURLBuilder.effectiveHost(
-                for: URL(string: "https://agent.hermes.example")!,
-                mode: .hermesCloud
-            )
-        )
-    }
-
     // MARK: - restRequest Host header
 
-    func testRestRequest_sharedDashboard_nonLoopback_hasLoopbackHost() {
-        let req = restRequest(urlString: "http://192.168.1.42:9123", mode: .sharedDashboard)
-        XCTAssertEqual(req.value(forHTTPHeaderField: "Host"), "127.0.0.1")
-    }
-
     func testRestRequest_remoteURL_nonLoopback_omitsLoopbackHost() {
-        let req = restRequest(urlString: "http://192.168.1.42:9123", mode: .remoteURL)
+        let req = restRequest(urlString: "http://192.168.1.42:9123")
         XCTAssertNotEqual(
             req.value(forHTTPHeaderField: "Host"), "127.0.0.1",
             "REST request in .remoteURL mode for non-loopback must NOT pin loopback"
@@ -159,7 +121,7 @@ final class WSURLBuilderTests: XCTestCase {
     // MARK: - WS scheme derivation (unchanged from pre-Inc2)
 
     func testWsRequest_usesWsSchemeForHttp() {
-        let req = wsRequest(urlString: "http://127.0.0.1:9123", mode: .remoteURL)
+        let req = wsRequest(urlString: "http://127.0.0.1:9123")
         XCTAssertTrue(
             req.url?.scheme == "ws",
             "HTTP base URL must produce a ws:// WebSocket URL"
@@ -167,7 +129,7 @@ final class WSURLBuilderTests: XCTestCase {
     }
 
     func testWsRequest_usesWssSchemeForHttps() {
-        let req = wsRequest(urlString: "https://myserver.example.com", mode: .remoteURL)
+        let req = wsRequest(urlString: "https://myserver.example.com")
         XCTAssertTrue(
             req.url?.scheme == "wss",
             "HTTPS base URL must produce a wss:// WebSocket URL"
@@ -177,7 +139,7 @@ final class WSURLBuilderTests: XCTestCase {
     // MARK: - Regression: Serve/loopback path still pins loopback
 
     func testRegression_explicitLoopbackPath_stillPinsLoopback_ws() {
-        let req = wsRequest(urlString: "http://127.0.0.1:8080", mode: .sharedDashboard)
+        let req = wsRequest(urlString: "http://127.0.0.1:8080")
         XCTAssertEqual(
             req.value(forHTTPHeaderField: "Host"), "127.0.0.1",
             "An explicit loopback WS URL must pin loopback Host"
@@ -185,7 +147,7 @@ final class WSURLBuilderTests: XCTestCase {
     }
 
     func testRegression_explicitLoopbackPath_stillPinsLoopback_rest() {
-        let req = restRequest(urlString: "http://127.0.0.1:8080", mode: .sharedDashboard)
+        let req = restRequest(urlString: "http://127.0.0.1:8080")
         XCTAssertEqual(
             req.value(forHTTPHeaderField: "Host"), "127.0.0.1",
             "An explicit loopback REST URL must pin loopback Host"

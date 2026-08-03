@@ -66,7 +66,7 @@ final class ConnectionPhaseTests: XCTestCase {
         // `phase == .connected`, so the label is the only observable.
         let (connection, _, _) = makeStore()
         connection.graceWindowOverride = .seconds(60)
-        connection.connectRPC = { _, _, _ in throw URLError(.cannotConnectToHost) }
+        connection.connectRPC = { _, _ in throw URLError(.cannotConnectToHost) }
         connection._seedConnectedForTesting(serverURL: "http://localhost:9123", token: "test-stable-token")
         connection._handleGatewayStateForTesting(.failed("gateway process exited"))
         XCTAssertEqual(connection.phase, .connected)

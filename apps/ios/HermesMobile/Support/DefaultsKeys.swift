@@ -400,8 +400,7 @@ enum DefaultsKeys {
     /// Read + decode the persisted ``ConnectionMode``. Returns `.remoteURL` when
     /// unset (existing installs keep the existing behaviour unchanged).
     static func connectionModeValue(_ defaults: UserDefaults = .standard) -> ConnectionMode {
-        let raw = defaults.string(forKey: connectionMode) ?? ""
-        return ConnectionMode(rawValue: raw) ?? .remoteURL
+        ConnectionMode.saved(rawValue: defaults.string(forKey: connectionMode))
     }
 
 }

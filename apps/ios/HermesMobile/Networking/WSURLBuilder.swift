@@ -2,13 +2,10 @@ import Foundation
 
 /// Builds the `URLRequest`s that talk to the hermes gateway.
 ///
-/// Builds stock-gateway REST and WebSocket requests. Like Desktop, direct
-/// remote requests keep the URL's real Host. Local Desktop/shared-dashboard
-/// entry points may be fronted by Tailscale Serve and therefore retain the
-/// gateway's loopback Host.
+/// Builds stock-gateway REST and WebSocket requests. Like Desktop, remote
+/// requests keep the URL's real Host; explicit loopback URLs stay loopback.
 enum WSURLBuilder {
-    /// Loopback host the gateway expects in the `Host` header when
-    /// Tailscale Serve is in the path.
+    /// Canonical Host header for explicit loopback URLs.
     static let loopbackHost = "127.0.0.1"
     /// Header the gateway reads the session token from on REST requests.
     static let sessionTokenHeader = "X-Hermes-Session-Token"
@@ -17,17 +14,15 @@ enum WSURLBuilder {
     ///
     /// The scheme follows `baseURL` (http→ws, https→wss). The token is supplied
     /// as a query item (URL-encoded) and the `Host` header is overridden only
-    /// when the target is a loopback/Serve path (see ``effectiveHost(for:mode:)``).
+    /// when the target itself is loopback (see ``effectiveHost(for:)``).
     static func wsRequest(
         baseURL: URL,
-        token: String,
-        mode: ConnectionMode = .remoteURL
+        token: String
     ) -> URLRequest {
         authenticatedWSRequest(
             baseURL: baseURL,
             queryName: "token",
-            credential: token,
-            mode: mode
+            credential: token
         )
     }
 
@@ -35,22 +30,19 @@ enum WSURLBuilder {
     /// and single-use; the caller must mint a new one before every invocation.
     static func wsTicketRequest(
         baseURL: URL,
-        ticket: String,
-        mode: ConnectionMode = .remoteURL
+        ticket: String
     ) -> URLRequest {
         authenticatedWSRequest(
             baseURL: baseURL,
             queryName: "ticket",
-            credential: ticket,
-            mode: mode
+            credential: ticket
         )
     }
 
     private static func authenticatedWSRequest(
         baseURL: URL,
         queryName: String,
-        credential: String,
-        mode: ConnectionMode
+        credential: String
     ) -> URLRequest {
         var components = URLComponents(url: baseURL, resolvingAgainstBaseURL: false)
             ?? URLComponents()
@@ -62,7 +54,7 @@ enum WSURLBuilder {
         // in practice `components.url` is always non-nil for a valid base.
         let url = components.url ?? baseURL
         var request = URLRequest(url: url)
-        if let host = effectiveHost(for: baseURL, mode: mode) {
+        if let host = effectiveHost(for: baseURL) {
             request.setValue(host, forHTTPHeaderField: "Host")
         }
         return request
@@ -74,8 +66,7 @@ enum WSURLBuilder {
     static func restRequest(
         baseURL: URL,
         path: String,
-        token: String,
-        mode: ConnectionMode = .remoteURL
+        token: String
     ) -> URLRequest {
         var components = URLComponents(url: baseURL, resolvingAgainstBaseURL: false)
             ?? URLComponents()
@@ -83,30 +74,22 @@ enum WSURLBuilder {
 
         let url = components.url ?? baseURL.appendingPathComponent(path)
         var request = URLRequest(url: url)
-        if let host = effectiveHost(for: baseURL, mode: mode) {
+        if let host = effectiveHost(for: baseURL) {
             request.setValue(host, forHTTPHeaderField: "Host")
         }
         request.setValue(token, forHTTPHeaderField: sessionTokenHeader)
         return request
     }
 
-    // MARK: - Host-header derivation (Inc 2)
+    // MARK: - Host-header derivation
 
-    /// Return the Host expected by the selected topology.
-    ///
-    /// Shared-dashboard and Local Desktop URLs can be public Tailscale Serve
-    /// addresses proxying a loopback-bound gateway. Explicit remote and cloud
-    /// URLs instead preserve their real Host.
-    static func effectiveHost(for baseURL: URL, mode: ConnectionMode) -> String? {
+    /// Override only an explicit loopback URL. Remote and cloud URLs preserve
+    /// the host the user entered, matching the stock Desktop client.
+    static func effectiveHost(for baseURL: URL) -> String? {
         if isLoopback(baseURL.host) {
             return loopbackHost
         }
-        switch mode {
-        case .sharedDashboard, .localDesktop:
-            return loopbackHost
-        case .remoteURL, .hermesCloud:
-            return nil
-        }
+        return nil
     }
 
     /// `true` when `host` resolves to the local loopback interface.

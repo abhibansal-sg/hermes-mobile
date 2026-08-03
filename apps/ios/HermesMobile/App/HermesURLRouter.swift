@@ -538,17 +538,10 @@ enum HermesURLRouter {
     /// path, the confirmed (was-connected) path, and the in-app QR scanner so
     /// all three run byte-identical `configure`s with the correct mode tag.
     ///
-    /// **Inc 2 (Follow-up A):** all pair payloads — v1 (shared token) AND v2
-    /// (device token) — set `.sharedDashboard` so the mode picker reflects the
-    /// scan, and the transport uses loopback Host for the Tailscale-Serve path.
-    /// Previously only v2 payloads tagged the mode, leaving v1 scans on whatever
-    /// mode the picker last persisted (a stale `.remoteURL` would then emit the
-    /// wrong Host header once Inc 2 transport-branches on the mode).
+    /// Pair payloads are another entry into the direct self-hosted gateway path.
     static func applyPair(_ payload: PairPayload, connection: ConnectionStore) {
-        // All QR / deep-link pair payloads come from the shared-dashboard flow —
-        // tag the mode so the picker reflects the action AND so the transport
-        // derives the correct loopback Host header (Tailscale Serve path).
-        connection.connectionMode = .sharedDashboard
+        // Keep the picker aligned with the direct gateway transport.
+        connection.connectionMode = .remoteURL
         Task {
             _ = await connection.configure(
                 urlString: payload.url,

@@ -430,7 +430,7 @@ final class WSLivenessTests: XCTestCase {
         let (connection, sessions, _) = makeConnectionStore()
 
         // Reach .connected via the reconnect seam.
-        connection.connectRPC = { _, _, _ in }
+        connection.connectRPC = { _, _ in }
         connection._seedAndStartReconnect(
             serverURL: "http://127.0.0.1:9123",
             token: "test-token"
@@ -450,7 +450,7 @@ final class WSLivenessTests: XCTestCase {
         // escalates visibly after the grace window expires.
         connection.graceWindowOverride = .milliseconds(50)
         connection.reconnectBackoffOverride = 0
-        connection.connectRPC = { _, _, _ in
+        connection.connectRPC = { _, _ in
             throw URLError(.cannotConnectToHost)
         }
 
@@ -476,7 +476,7 @@ final class WSLivenessTests: XCTestCase {
         let (connection, sessions, _) = makeConnectionStore()
 
         // Reach .connected via the reconnect seam.
-        connection.connectRPC = { _, _, _ in }
+        connection.connectRPC = { _, _ in }
         connection._seedAndStartReconnect(
             serverURL: "http://127.0.0.1:9123",
             token: "test-token"
@@ -496,7 +496,7 @@ final class WSLivenessTests: XCTestCase {
         // Shorten cold-open grace, then keep recovery failing past expiry.
         connection.graceWindowOverride = .milliseconds(50)
         connection.reconnectBackoffOverride = 0
-        connection.connectRPC = { _, _, _ in
+        connection.connectRPC = { _, _ in
             throw URLError(.cannotConnectToHost)
         }
 
@@ -534,7 +534,7 @@ final class WSLivenessTests: XCTestCase {
         let (connection, _, _) = makeConnectionStore()
 
         // Step 1: reach .connected via the existing reconnect seam.
-        connection.connectRPC = { _, _, _ in
+        connection.connectRPC = { _, _ in
             // succeeds immediately — simulates a stable address+token
         }
         connection._seedAndStartReconnect(
@@ -559,7 +559,7 @@ final class WSLivenessTests: XCTestCase {
         // attempt 0 fires immediately and the phase is in .reconnecting when we check.
         connection.reconnectBackoffOverride = 0
         connection.graceWindowOverride = .milliseconds(50)
-        connection.connectRPC = { _, _, _ in
+        connection.connectRPC = { _, _ in
             throw URLError(.cannotConnectToHost)
         }
 

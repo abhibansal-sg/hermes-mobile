@@ -142,10 +142,8 @@ struct ManualTokenPromptView: View {
             .onAppear {
                 // Give the token field focus immediately so the user can paste.
                 tokenFieldFocused = true
-                // Pin the connection mode to localDesktop so the transport uses
-                // the loopback Host header (the discovered URL is a LAN address
-                // or loopback, not a Tailscale Serve host).
-                connection.connectionMode = .localDesktop
+                // Manual pairing enters the direct self-hosted gateway path.
+                connection.connectionMode = .remoteURL
             }
             .hermesThemed(themeStore)
         }

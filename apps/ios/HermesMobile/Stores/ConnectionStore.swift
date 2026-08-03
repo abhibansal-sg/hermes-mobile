@@ -691,15 +691,13 @@ final class ConnectionStore {
             return RestClient(
                 baseURL: baseURL,
                 token: token,
-                pathStyle: pathStyle,
-                connectionMode: connectionMode
+                pathStyle: pathStyle
             )
         case .session:
             return RestClient(
                 baseURL: baseURL,
                 token: "",
-                pathStyle: pathStyle,
-                connectionMode: connectionMode
+                pathStyle: pathStyle
             )
         }
     }
@@ -919,7 +917,7 @@ final class ConnectionStore {
     /// pattern as `SessionStore.resumeRPC`. Defaults to `nil`; the live path
     /// is taken in production (the nil-check is free). Set by unit tests to
     /// make the loop deterministic without a live socket.
-    var connectRPC: ((_ url: URL, _ token: String, _ mode: ConnectionMode) async throws -> Void)?
+    var connectRPC: ((_ url: URL, _ token: String) async throws -> Void)?
 
     #if DEBUG
     /// DEBUG-only test seam for deterministic single-flight auto-upgrade tests
@@ -1384,16 +1382,14 @@ final class ConnectionStore {
         }
         return try await RestClient(
             baseURL: url,
-            token: "",
-            connectionMode: connectionMode
+            token: ""
         ).authProbe()
     }
 
     private func connectGateway(
         baseURL: URL,
         authMode: GatewayAuthMode,
-        token: String?,
-        mode: ConnectionMode
+        token: String?
     ) async throws {
         switch authMode {
         case .token:
@@ -1401,9 +1397,9 @@ final class ConnectionStore {
                 throw RestError.network("Missing gateway token")
             }
             if let connectRPC {
-                try await connectRPC(baseURL, token, mode)
+                try await connectRPC(baseURL, token)
             } else {
-                try await client.connect(baseURL: baseURL, token: token, mode: mode)
+                try await client.connect(baseURL: baseURL, token: token)
             }
         case .session:
             guard let rest = restClient(
@@ -1415,9 +1411,9 @@ final class ConnectionStore {
             }
             let ticket = try await rest.webSocketTicket()
             if let connectRPC {
-                try await connectRPC(baseURL, ticket, mode)
+                try await connectRPC(baseURL, ticket)
             } else {
-                try await client.connect(baseURL: baseURL, ticket: ticket, mode: mode)
+                try await client.connect(baseURL: baseURL, ticket: ticket)
             }
         }
     }
@@ -1447,7 +1443,6 @@ final class ConnectionStore {
             return "A session token is required."
         }
         let stockTransportURL = url
-        let stockTransportMode = connectionMode
 
         // Cancel any reconnect loop tied to a previous configuration.
         reconnectTask?.cancel()
@@ -1523,8 +1518,7 @@ final class ConnectionStore {
             try await connectGateway(
                 baseURL: stockTransportURL,
                 authMode: authMode,
-                token: trimmedToken,
-                mode: stockTransportMode
+                token: trimmedToken
             )
         } catch {
             guard isCurrentGeneration(generation) else { return nil }
@@ -2531,15 +2525,12 @@ final class ConnectionStore {
                     return
                 }
                 let stockTransportURL = url
-                let stockTransportMode = self.connectionMode
-
                 do {
                     self.beginTransportAttempt()
                     try await self.connectGateway(
                         baseURL: stockTransportURL,
                         authMode: self.activeAuthMode,
-                        token: self.currentToken,
-                        mode: stockTransportMode
+                        token: self.currentToken
                     )
                     guard !Task.isCancelled,
                           self.isActiveGeneration(generation) else { return }

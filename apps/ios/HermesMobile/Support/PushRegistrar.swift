@@ -636,7 +636,7 @@ struct PushTokenPoster: Sendable {
             timeoutInterval: Self.timeout
         )
         request.httpMethod = method
-        if let host = WSURLBuilder.effectiveHost(for: baseURL, mode: .remoteURL) {
+        if let host = WSURLBuilder.effectiveHost(for: baseURL) {
             request.setValue(host, forHTTPHeaderField: "Host")
         }
         if !token.isEmpty {

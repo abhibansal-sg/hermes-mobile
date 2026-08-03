@@ -2,11 +2,9 @@ import SwiftUI
 
 /// First-run brand moment shown when ``ConnectionStore/Phase`` is `.needsSetup`.
 ///
-/// Owns the `needsSetup` surface (B1 routes to it from ``RootView``). Three
-/// Four paths off the welcome screen — one per ``ConnectionMode``:
-///   - **Shared dashboard** (QR) — presents ``QRScannerView`` full-screen.
-///   - **Remote URL / Local desktop** — presents ``ConnectionSetupView`` (the
-///     stock URL/auth form) in a native slide-up sheet.
+/// Owns the `needsSetup` surface (B1 routes to it from ``RootView``). Two paths:
+///   - **Self-hosted** — presents ``ConnectionSetupView`` (the stock URL/auth
+///     form) in a native slide-up sheet.
 ///   - **Hermes Cloud** — signs in to the portal and discovers hosted agents.
 ///
 /// The user first picks a mode via the segmented mode picker; the CTA below
@@ -16,9 +14,6 @@ struct WelcomeView: View {
     @Environment(ConnectionStore.self) private var connection
     @Environment(ThemeStore.self) private var themeStore
     @Environment(\.hermesTheme) private var theme
-
-    /// Drives the full-screen QR scanner presentation.
-    @State private var showingScanner = false
 
     /// Drives the slide-up manual-setup sheet.
     @State private var showingManualSetup = false
@@ -64,10 +59,6 @@ struct WelcomeView: View {
                 // Sync from persisted value on every appearance.
                 selectedMode = connection.connectionMode
             }
-            .fullScreenCover(isPresented: $showingScanner) {
-                QRScannerView()
-                    .hermesThemed(themeStore)
-            }
             // The manual URL+token form slides up as a native sheet with
             // medium/large detents and a drag indicator. Its own NavigationStack
             // hosts the form's inline title + a Cancel toolbar item; the theme is
@@ -96,7 +87,7 @@ struct WelcomeView: View {
 
     // MARK: - Mode picker
 
-    /// A segmented-style picker that lets the user choose between the three
+    /// A segmented-style picker that lets the user choose between the two
     /// connection topologies. Persists the choice immediately so the next
     /// relaunch lands on the same mode.
     private var modePicker: some View {
@@ -213,56 +204,17 @@ struct WelcomeView: View {
     // MARK: - Actions
 
     /// The CTA adapts to the selected mode:
-    /// - Shared dashboard → primary = scan QR, secondary = enter manually.
-    /// - Remote URL / Local desktop → primary = enter URL+token form.
+    /// - Self-hosted → stock gateway URL/auth form.
+    /// - Hermes Cloud → hosted discovery flow.
     @ViewBuilder
     private var actionButtons: some View {
         VStack(spacing: 12) {
             switch selectedMode {
-            case .sharedDashboard:
-                Button {
-                    showingScanner = true
-                } label: {
-                    Label("Scan pairing code", systemImage: "qrcode.viewfinder")
-                        .font(.body.weight(.semibold))
-                        .frame(maxWidth: .infinity)
-                        .frame(height: 52)
-                }
-                .foregroundStyle(theme.midground.contrastingForeground)
-                .background(theme.midground, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
-                // ESC-03: surface the scanner intent via an a11y hint so VoiceOver
-                // users understand this opens a camera before activating.
-                .accessibilityHint("Opens the camera to scan a QR code from hermes mobile-pair")
-                .accessibilityIdentifier("scanQRButton")
-
+            case .remoteURL:
                 Button {
                     showingManualSetup = true
                 } label: {
-                    Text("Enter manually")
-                        .font(.body.weight(.medium))
-                        .frame(maxWidth: .infinity)
-                        .frame(height: 52)
-                }
-                .foregroundStyle(theme.fg)
-                .background(theme.secondary, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
-                .overlay(
-                    RoundedRectangle(cornerRadius: 14, style: .continuous)
-                        .strokeBorder(theme.border, lineWidth: 1)
-                )
-                // ESC-03: manual-entry hint for VoiceOver users.
-                .accessibilityHint("Opens a form to enter the gateway URL and token directly")
-                .accessibilityIdentifier("enterManuallyButton")
-
-            case .remoteURL, .localDesktop:
-                Button {
-                    showingManualSetup = true
-                } label: {
-                    Label(
-                        selectedMode == .localDesktop
-                            ? "Enter local gateway address"
-                            : "Enter gateway URL",
-                        systemImage: selectedMode == .localDesktop ? "desktopcomputer" : "link"
-                    )
+                    Label("Connect to your gateway", systemImage: "server.rack")
                     .font(.body.weight(.semibold))
                     .frame(maxWidth: .infinity)
                     .frame(height: 52)
