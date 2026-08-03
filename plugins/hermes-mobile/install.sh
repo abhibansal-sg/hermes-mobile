@@ -1,9 +1,8 @@
 #!/bin/sh
 # install.sh — install the hermes-mobile plugin into a stock Hermes.
 #
-# Usage (two-line install):
+# Usage:
 #   curl -fsSL https://raw.githubusercontent.com/abhibansal-sg/hermes-mobile/main/plugins/hermes-mobile/install.sh | sh
-#   hermes mobile-pair
 #
 # What it does:
 #   1. Copies plugins/hermes-mobile/ into ~/.hermes/plugins/hermes-mobile/
@@ -51,4 +50,4 @@ rm -rf "$DEST/tests" "$DEST/__pycache__" 2>/dev/null || true
 echo ""
 echo "Installed. Next steps:"
 echo "  1. Restart your gateway:  hermes serve   (or hermes dashboard)"
-echo "  2. Pair your phone:       hermes mobile-pair"
+echo "  2. Connect Hermes Mobile using Self-hosted setup or a pairing link."
