@@ -145,17 +145,6 @@ struct RootView: View {
             } message: {
                 Text("This will disconnect your current session and pair with the new server from the link.")
             }
-            // Inc-3b: Local-desktop manual-token prompt. Shown when a
-            // hermesapp://pair?manual_token=true payload arrives and the plugin
-            // could not recover the token automatically. The user enters the token;
-            // on success, configure() transitions to .connected normally.
-            .sheet(item: manualTokenPairPayload) { payload in
-                ManualTokenPromptView(
-                    discoveredURL: payload.url,
-                    onDismiss: { deepLink.clearManualTokenPair() }
-                )
-                .hermesThemed(themeStore)
-            }
             // STR-691: Settings is presented from THIS root (above the
             // ``mainUI`` size-class branch) so its presentation identity — and
             // the NavigationStack/form `@State` SettingsView hosts (e.g. an
@@ -195,18 +184,6 @@ struct RootView: View {
             get: { deepLink.pendingPair != nil },
             set: { presented in
                 if !presented { deepLink.clear() }
-            }
-        )
-    }
-
-    /// Optional binding for the manual-token Local-desktop pairing sheet.
-    /// Uses `Binding<PairPayload?>` driven by `pendingManualTokenPair` so SwiftUI
-    /// can auto-dismiss when set to `nil`.
-    private var manualTokenPairPayload: Binding<HermesURLRouter.PairPayload?> {
-        Binding(
-            get: { deepLink.pendingManualTokenPair },
-            set: { value in
-                if value == nil { deepLink.clearManualTokenPair() }
             }
         )
     }

@@ -676,9 +676,8 @@ struct CustomProviderAPIModeEditState: Equatable {
 /// reject, the sheet stays open and shows the provider's detail; otherwise the
 /// callback fires with the new provider row and the view dismisses.
 ///
-/// Presented as a sheet (it's a create form, not a list push) — mirrors the
-/// ManualTokenPromptView sheet presentation. Cancel simply dismisses (no state
-/// is written until Save).
+/// Presented as a sheet (it's a create form, not a list push). Cancel simply
+/// dismisses; no state is written until Save.
 struct CustomProviderView: View {
     let rest: RestClient
     /// Invoked with the newly-added (or updated) provider row on a successful save.

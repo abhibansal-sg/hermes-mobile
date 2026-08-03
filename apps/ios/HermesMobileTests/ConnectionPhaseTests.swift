@@ -323,8 +323,8 @@ final class ConnectionPhaseTests: XCTestCase {
 
     // MARK: - Replace-connection confirmation gate (Inc-4 Hardening #2)
     //
-    // `ConnectionSetupView.connect()` and `ManualTokenPromptView.connect()` gate
-    // on `connection.hasConnected` before calling `configure()` — showing a
+    // `ConnectionSetupView.connect()` gates on `connection.hasConnected` before
+    // calling `configure()` — showing a
     // destructive-confirmation alert instead of silently swapping the gateway.
     // These tests pin the store-side discriminators the view logic reads.
 

@@ -12,22 +12,11 @@ import Observation
 /// means no confirmation is in flight. Owned at the app root and injected into
 /// `RootView` via the environment (it is not part of `AppEnvironment`, since the
 /// confirmation is a pure view-layer concern).
-///
-/// Also carries the Inc-3b Local-desktop manual-token pairing state: when a
-/// `hermesapp://pair?manual_token=true` arrives, the URL is pre-discovered but
-/// the token must be entered by the user. `pendingManualTokenPair` holds that
-/// state until `ManualTokenPromptView` resolves or dismisses it.
 @MainActor
 @Observable
 final class DeepLinkCoordinator {
     /// The pairing payload awaiting user confirmation, or `nil` when none.
     var pendingPair: HermesURLRouter.PairPayload?
-
-    /// A Local-desktop pairing payload that requires the user to enter the token
-    /// manually (the plugin-side discovery found the URL but not the token).
-    /// Non-nil causes `RootView`/`WelcomeView` to present `ManualTokenPromptView`.
-    /// Cleared on completion (connect success or dismiss).
-    var pendingManualTokenPair: HermesURLRouter.PairPayload?
 
     init() {}
 
@@ -37,23 +26,9 @@ final class DeepLinkCoordinator {
         pendingPair = payload
     }
 
-    /// Stash a manual-token Local-desktop payload. The user will be shown
-    /// `ManualTokenPromptView` to enter the token before pairing proceeds.
-    /// Last-write-wins (same as `requestPairConfirmation`).
-    func requestManualTokenPair(_ payload: HermesURLRouter.PairPayload) {
-        pendingManualTokenPair = payload
-    }
-
-    /// Drop any pending confirmation or manual-token prompt.
+    /// Drop any pending confirmation.
     func clear() {
         pendingPair = nil
-        pendingManualTokenPair = nil
-    }
-
-    /// Drop only the manual-token prompt (used when the user dismisses without
-    /// entering a token, leaving any unrelated `pendingPair` untouched).
-    func clearManualTokenPair() {
-        pendingManualTokenPair = nil
     }
 }
 
@@ -119,27 +94,16 @@ enum HermesURLRouter {
         let isDeviceToken: Bool
         /// The server-minted `device_id`, present iff `isDeviceToken`.
         let deviceId: String?
-        /// `true` when a pairing link pre-fills the URL but intentionally omits
-        /// the session token.
-        ///
-        /// When `true`, `token` is empty. The iOS app must ask the user to paste
-        /// the token from the Desktop app's Settings UI (or run
-        /// `hermes token` on the Mac).  The URL is pre-filled; only the token is
-        /// required from the user.  The happy path (token present) is unchanged.
-        ///
-        let manualToken: Bool
         init(
             url: String,
             token: String,
             isDeviceToken: Bool,
-            deviceId: String?,
-            manualToken: Bool
+            deviceId: String?
         ) {
             self.url = url
             self.token = token
             self.isDeviceToken = isDeviceToken
             self.deviceId = deviceId
-            self.manualToken = manualToken
         }
     }
 
@@ -147,17 +111,12 @@ enum HermesURLRouter {
     /// into a ``PairPayload``. Returns `nil` for any non-pair URL or one missing
     /// the required `url` value.
     ///
-    /// **Inc-3b additive:** when `manual_token=true` is present the `token` query
-    /// param may be absent (the plugin-side discovery cannot recover it). In that
-    /// case `token` is empty and `manualToken` is `true`; the caller must ask the
-    /// user to supply the token. For all other payloads `token` is required as
-    /// before (returns `nil` when absent/empty). The optional `kind`/`device_id`
+    /// The `token` query value is required. The optional `kind`/`device_id`
     /// keys are read additively — a v1 payload (no `kind`) yields `isDeviceToken ==
     /// false`; a v2 `kind=device` payload WITH a non-empty `device_id` yields
     /// `isDeviceToken == true`. Any other `kind` value, or a `kind=device` missing
     /// `device_id`, falls back to a shared pairing (defensive). Single parser
-    /// shared by the in-app QR scanner and the deep-link route so a scan and a
-    /// tapped link behave identically.
+    /// shared by generated QR codes and tapped links.
     static func parsePairPayload(_ payload: String) -> PairPayload? {
         guard
             let url = URL(string: payload),
@@ -177,14 +136,8 @@ enum HermesURLRouter {
         let urlValue = value("url") ?? ""
         guard !urlValue.isEmpty else { return nil }
 
-        // Inc-3b: `manual_token=true` signals that the plugin-side discovery
-        // couldn't recover the token (ephemeral/encrypted). Allow a missing or
-        // empty `token` param when this flag is present; set manualToken = true.
-        let manualTokenFlag = value("manual_token")?.lowercased() == "true"
         let tokenValue = value("token") ?? ""
-
-        // For standard payloads (no manual_token flag), token is still required.
-        if !manualTokenFlag && tokenValue.isEmpty { return nil }
+        guard !tokenValue.isEmpty else { return nil }
 
         // v2 additive keys (a v1 payload simply has neither).
         let deviceId = value("device_id")
@@ -192,10 +145,9 @@ enum HermesURLRouter {
 
         return PairPayload(
             url: urlValue,
-            token: manualTokenFlag ? "" : tokenValue,
+            token: tokenValue,
             isDeviceToken: isDevice,
-            deviceId: isDevice ? deviceId : nil,
-            manualToken: manualTokenFlag
+            deviceId: isDevice ? deviceId : nil
         )
     }
 
@@ -208,21 +160,13 @@ enum HermesURLRouter {
     ///   user can confirm the destructive disconnect-and-repair. `nil` is treated
     ///   as "no confirmation available" → a configured app then ignores the link
     ///   rather than silently nuking the live session.
-    /// - Parameter requestManualTokenPair: invoked when a `pair` link arrives
-    ///   with `manual_token=true` — the plugin-side Local-desktop discovery found
-    ///   the gateway URL but could not recover the token (ephemeral/encrypted).
-    ///   The payload carries the pre-discovered URL; the user must paste their
-    ///   Desktop token.  `nil` treated as "no prompt available" → the payload is
-    ///   dropped rather than silently failing (same defensive posture as the
-    ///   confirmation seam).  (Inc-3b)
     static func route(
         _ url: URL,
         connection: ConnectionStore,
         sessions: SessionStore,
         chat: ChatStore,
         inbox: InboxStore,
-        requestPairConfirmation: ((PairPayload) -> Void)? = nil,
-        requestManualTokenPair: ((PairPayload) -> Void)? = nil
+        requestPairConfirmation: ((PairPayload) -> Void)? = nil
     ) {
         guard url.scheme?.lowercased() == scheme else { return }
 
@@ -270,22 +214,7 @@ enum HermesURLRouter {
             // required values are ignored (no destructive reconfigure on a
             // malformed link). The shared parser reads the optional v2 keys so a
             // tapped link records the device identity exactly like a scan.
-            //
-            // Inc-3b: `?manual_token=true` signals a Local-desktop payload where
-            // the token cannot be auto-recovered; token is empty, URL is present.
             guard let payload = parsePairPayload(url.absoluteString) else { return }
-
-            // Inc-3b: manual-token Local-desktop pairing — the URL is pre-filled
-            // but the user must supply the token. Route to the token-entry prompt
-            // rather than straight to configure(), regardless of whether a
-            // connection already exists (the prompt carries all the context needed
-            // for the user to decide). The requestManualTokenPair seam is invoked
-            // to stash the payload; if no seam is wired, drop the link (same
-            // defensive posture as the pair-confirmation path).
-            if payload.manualToken {
-                requestManualTokenPair?(payload)
-                return
-            }
 
             // Re-pairing WHILE CONNECTED is destructive (it disconnects the
             // current session and re-points the gateway). If a configuration
