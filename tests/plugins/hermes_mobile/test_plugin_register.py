@@ -6,13 +6,11 @@ so the ONE production wiring path — ``register(ctx)`` invoked by the stock
 PluginManager — had zero coverage, and its swallow-all error handling means a
 regression there would ship with a green suite. These tests execute the real
 entry point with a real ``PluginContext`` and assert every registry it must
-populate, plus the ``hermes mobile-pair`` argparse round trip main.py performs
-for plugin CLI commands.
+populate.
 """
 
 from __future__ import annotations
 
-import argparse
 import sys
 from pathlib import Path
 
@@ -110,11 +108,7 @@ def test_register_populates_every_seam_registry(plugin_and_ctx):
     assert push_engine.handle_approval_request in hooks.get("pre_approval_request", [])
     assert push_engine.handle_approval_response in hooks.get("post_approval_response", [])
     assert push_engine.handle_session_finalize in hooks.get("on_session_finalize", [])
-    # CLI command registered on the manager facade
-    cmd = manager._cli_commands.get("mobile-pair")
-    assert cmd is not None
-    assert cmd["plugin"] == "hermes-mobile"
-    assert callable(cmd["setup_fn"]) and callable(cmd["handler_fn"])
+    assert manager._cli_commands == {}
 
 
 def test_manifest_hook_declaration_matches_runtime_registration(plugin_and_ctx):
@@ -179,26 +173,4 @@ def test_register_survives_wiring_failure_without_breaking_host(plugin_and_ctx, 
         plugin, "_wire_token_auth", lambda: (_ for _ in ()).throw(RuntimeError("boom"))
     )
     plugin.register(ctx)  # must not raise
-    # The CLI registration (independent wiring) still happened.
-    assert "mobile-pair" in manager._cli_commands
-
-
-def test_mobile_pair_argparse_round_trip(plugin_and_ctx):
-    """Replicates main.py's plugin-CLI discovery loop end-to-end."""
-    plugin, ctx, manager = plugin_and_ctx
-    plugin.register(ctx)
-    entry = manager._cli_commands["mobile-pair"]
-
-    parser = argparse.ArgumentParser(prog="hermes")
-    subparsers = parser.add_subparsers(dest="command")
-    sub = subparsers.add_parser(entry["name"], help=entry["help"])
-    entry["setup_fn"](sub)
-    sub.set_defaults(func=entry["handler_fn"])
-
-    args = parser.parse_args(["mobile-pair", "--shared-token"])
-    assert args.device_token is False
-    assert args.func is entry["handler_fn"]
-
-    args_default = parser.parse_args(["mobile-pair"])
-    assert args_default.device_token is True
-    assert args_default.url is None
+    assert manager._cli_commands == {}

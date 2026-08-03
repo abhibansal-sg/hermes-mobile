@@ -110,7 +110,7 @@ def test_register_late_wires_every_core_seam_after_attrs_restore(
     assert push_engine.handle_approval_request in manager._hooks[
         "pre_approval_request"
     ]
-    assert "mobile-pair" in manager._cli_commands
+    assert manager._cli_commands == {}
 
     warnings = [record.message for record in caplog.records if record.levelname == "WARNING"]
     assert not any("hermes-mobile:" in message for message in warnings)

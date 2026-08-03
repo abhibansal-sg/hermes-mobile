@@ -72,9 +72,7 @@ final class DeepLinkCoordinator {
 /// - `hermesapp://review`              → surface the pending-approval inbox.
 /// - `hermesapp://` (bare root)       → start a usable draft surface.
 /// - `hermesapp://pair?url=<u>&token=<t>` → configure the connection from a
-///   pairing deep link (the `hermes mobile-pair` QR / link, owned by B4). The
-///   same params the in-app QR scanner produces, so a tapped link and a scan
-///   share one code path. Both query values are percent-decoded. When the app is
+///   generated QR / link. Both query values are percent-decoded. When the app is
 ///   ALREADY configured (`ConnectionStore.rest != nil` — a live or saved
 ///   connection), re-pairing is destructive: it tears down the current session
 ///   and re-points the gateway. So a configured app does NOT reconfigure
@@ -121,18 +119,14 @@ enum HermesURLRouter {
         let isDeviceToken: Bool
         /// The server-minted `device_id`, present iff `isDeviceToken`.
         let deviceId: String?
-        /// `true` when the pairing payload arrives from the plugin-side Local-
-        /// desktop discovery (`mobile_pair.py` Inc-3a) and the token CANNOT be
-        /// recovered from disk — either the stock local gateway uses an ephemeral
-        /// memory-only token, or the Desktop's connection.json uses Electron
-        /// safeStorage encryption that is inaccessible outside the Electron context.
+        /// `true` when a pairing link pre-fills the URL but intentionally omits
+        /// the session token.
         ///
         /// When `true`, `token` is empty. The iOS app must ask the user to paste
         /// the token from the Desktop app's Settings UI (or run
         /// `hermes token` on the Mac).  The URL is pre-filled; only the token is
         /// required from the user.  The happy path (token present) is unchanged.
         ///
-        /// (Inc-3b: wires the plugin's `manual_token=True` signal into the iOS UX.)
         let manualToken: Bool
         init(
             url: String,

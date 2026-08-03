@@ -7,8 +7,6 @@ Hermes plugin seams. It does not observe or transform gateway frames.
 Modules:
 
 * ``push_engine`` — stock lifecycle hooks → relay/APNs + Live Activities.
-* ``mobile_pair`` — the ``hermes mobile-pair`` CLI command (QR pairing),
-  registered through the stock ``register_cli_command`` facade.
 * ``prompt_receipts`` — profile-scoped SQLite idempotency receipts for
   ID-enabled ``prompt.submit`` requests.
 * ``dashboard/api.py`` — REST routes, auto-mounted by the dashboard plugin
@@ -72,49 +70,6 @@ def _append_unique(module, attr: str, callback, seam: str) -> bool:
     if not _contains_callback(registry, callback):
         registry.append(callback)
     return True
-
-
-def _setup_mobile_pair_parser(parser) -> None:
-    """argparse wiring for ``hermes mobile-pair`` (moved from main.py)."""
-    parser.description = (
-        "Print a hermesapp://pair deep link and an in-terminal QR code so "
-        "the HermesMobile app can scan it to configure its connection."
-    )
-    parser.add_argument(
-        "--url",
-        default=None,
-        help=(
-            "Override the dashboard URL embedded in the pairing code "
-            "(default: auto-detect from Tailscale Serve)"
-        ),
-    )
-    parser.add_argument(
-        "--device-token",
-        action="store_true",
-        dest="device_token",
-        default=True,
-        help=(
-            "Mint a revocable per-device token and embed it in the pairing "
-            "code (QR v2) instead of the shared dashboard token. This is the "
-            "default. Requires a server with the hermes-mobile plugin (or the "
-            "legacy device routes)."
-        ),
-    )
-    parser.add_argument(
-        "--shared-token",
-        action="store_false",
-        dest="device_token",
-        help=(
-            "Use the legacy shared-dashboard-token pairing flow. Only use this "
-            "for stock gateways without the device-token routes."
-        ),
-    )
-
-
-def _cmd_mobile_pair(args) -> int:
-    from . import mobile_pair
-
-    return mobile_pair.mobile_pair_command(args)
 
 
 def _wire_approval_audit() -> None:
@@ -209,7 +164,7 @@ def _wire_prompt_receipts() -> bool:
 
 
 def register(ctx) -> None:
-    """Stock plugin entry point — wire the gateway seams + CLI command."""
+    """Stock plugin entry point — wire notification and receipt seams."""
     try:
         from . import push_engine
     except Exception:
@@ -238,16 +193,3 @@ def register(ctx) -> None:
         # Plugin-disabled and wiring-failure behavior is deliberately stock:
         # the empty core registry makes client_message_id a no-op.
         _log.warning("hermes-mobile: prompt-receipt wiring failed", exc_info=True)
-    try:
-        ctx.register_cli_command(
-            name="mobile-pair",
-            help="Pair the HermesMobile iOS app via a QR code",
-            setup_fn=_setup_mobile_pair_parser,
-            handler_fn=_cmd_mobile_pair,
-            description=(
-                "Print a hermesapp://pair deep link and an in-terminal QR "
-                "code so the HermesMobile app can scan it to pair."
-            ),
-        )
-    except Exception:
-        _log.warning("hermes-mobile: CLI registration failed", exc_info=True)
