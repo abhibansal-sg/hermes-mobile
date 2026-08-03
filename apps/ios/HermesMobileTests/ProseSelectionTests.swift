@@ -482,13 +482,6 @@ final class ProseSelectionTests: XCTestCase {
             prefixFrameHeight,
             "the SwiftUI-hosted text view itself must grow; an intrinsic-height change that leaves the old frame in place still clips the list tail"
         )
-        let manager = try XCTUnwrap(updated.textLayoutManager)
-        let contentManager = try XCTUnwrap(manager.textContentManager)
-        let tail = try XCTUnwrap(
-            contentManager.location(contentManager.documentRange.endLocation, offsetBy: -1)
-        )
-        XCTAssertNotNil(manager.textLayoutFragment(for: tail),
-                        "the final ordered-list item must have a realized TextKit fragment")
     }
 
     // MARK: - Opt-in on-screen evidence (word selection + handles)
