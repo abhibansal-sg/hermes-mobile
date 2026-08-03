@@ -424,14 +424,24 @@ async function cmdIssues(buildRunId) {
     // Fetch per-action issues
     let issues;
     try {
-      issues = await ascFetchAll(`/ciActions/${action.id}/issues`);
+      issues = await ascFetchAll(`/ciBuildActions/${action.id}/issues`);
     } catch (err) {
       console.error(`   [asc] Could not fetch issues for action ${action.id}: ${err.message}`);
       continue;
     }
 
+    const errors   = issues.filter(i => i.attributes?.issueType === 'ERROR');
     const failures = issues.filter(i => i.attributes?.issueType === 'TEST_FAILURE');
     const warnings = issues.filter(i => i.attributes?.issueType === 'WARNING');
+
+    if (errors.length) {
+      console.log(`\n   ERRORS (${errors.length}):`);
+      for (const issue of errors) {
+        const a = issue.attributes ?? {};
+        console.log(`     • ${a.message ?? '(no message)'}`);
+        if (a.fileSource) console.log(`       at ${a.fileSource}`);
+      }
+    }
 
     if (failures.length) {
       console.log(`\n   TEST FAILURES (${failures.length}):`);
@@ -444,7 +454,14 @@ async function cmdIssues(buildRunId) {
       console.log('   No test failures.');
     }
 
-    console.log(`   Warnings: ${warnings.length}`);
+    if (warnings.length) {
+      console.log(`\n   WARNINGS (${warnings.length}):`);
+      for (const issue of warnings) {
+        const a = issue.attributes ?? {};
+        console.log(`     • ${a.message ?? '(no message)'}`);
+        if (a.fileSource) console.log(`       at ${a.fileSource}`);
+      }
+    }
     totalFailures += failures.length;
     totalWarnings += warnings.length;
   }

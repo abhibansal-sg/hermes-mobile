@@ -8,4 +8,3 @@
 - `apps/ios/project.yml` is authoritative. Regenerate the Xcode project with `xcodegen` after changing it.
 - Use `scripts/ios-build.sh` for local Xcode builds. Never run concurrent `xcodebuild` processes.
 - Keep secrets and signing material outside the repository.
-

@@ -33,4 +33,3 @@ This repository contains only the Hermes Mobile product. Contributions to Hermes
 ## License
 
 See [LICENSE](LICENSE).
-
