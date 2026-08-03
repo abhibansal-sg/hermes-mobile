@@ -1,9 +1,6 @@
 name: iOS Tests
 
-# iOS lane for the autonomous pipeline (Abhi order 2026-07-11).
-# Runs focused HermesMobile unit suites on PRs that touch apps/ios/**.
-# OBSERVE-FIRST: not yet in the required gate — promote to required
-# once it proves stable/fast enough (watch 5-10 PRs).
+# Runs the HermesMobile unit suite for app changes.
 
 on:
   pull_request:
