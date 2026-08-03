@@ -4,7 +4,7 @@ import UserNotifications
 /// App settings, presented as a **full-height card sheet** (F2 / Amendment C),
 /// rebuilt on the native grouped **`List`** for UI Batch I (I2).
 ///
-/// ## Native chrome principle (CONTRACT-UI-I, binding)
+/// ## Native chrome principle
 ///
 /// "System components render chrome; Hermes identity expresses through tint,
 /// typography, and content surfaces." Settings is pure chrome, so it is now a

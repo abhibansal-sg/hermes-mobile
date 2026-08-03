@@ -1,6 +1,6 @@
 import XCTest
 
-/// Verifies the Increment 1 connection-mode picker (CONTRACT-CONNECTION-MODES.md §Inc1).
+/// Verifies the connection-mode picker.
 ///
 /// Reads the isolated test gateway credentials from the test-runner environment:
 ///   TEST_RUNNER_HERMES_URL  → HERMES_URL in the runner env

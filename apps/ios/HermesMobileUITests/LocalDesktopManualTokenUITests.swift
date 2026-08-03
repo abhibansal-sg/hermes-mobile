@@ -2,7 +2,7 @@ import XCTest
 
 /// Inc-3b XCUITest: verifies the Local-desktop manual-token flow.
 ///
-/// CONTRACT (CONTRACT-CONNECTION-MODES.md §Inc3b):
+/// Manual-token deep-link coverage:
 /// When a `hermesapp://pair?url=…&manual_token=true` link arrives, the app
 /// must NOT fail silently or attempt to configure with an empty token. Instead
 /// it must present `ManualTokenPromptView` — a token-entry sheet with the

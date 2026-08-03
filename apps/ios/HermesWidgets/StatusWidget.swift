@@ -5,7 +5,7 @@ import SwiftUI
 
 /// Deep links into the host app via the `hermesapp://` scheme. Centralised so
 /// both widgets stay consistent with the URL scheme registered on the app
-/// target (see CONTRACT-WAVE1C.md / project.yml CFBundleURLTypes).
+/// target (see project.yml CFBundleURLTypes).
 enum HermesWidgetLink {
     static let scheme = "hermesapp"
 

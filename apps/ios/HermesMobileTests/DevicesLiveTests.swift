@@ -3,7 +3,7 @@ import XCTest
 
 /// Live integration coverage for the W3A-A device-token REST surface against a
 /// running W3a hermes gateway — the issue→list→revoke round-trip from the
-/// `RestClient` layer (NOT the UI), per CONTRACT-W3A.md §VERIFY.
+/// `RestClient` layer (NOT the UI).
 ///
 /// Requires a W3a dashboard reachable with credentials in the test-runner env
 /// (TEST_RUNNER_HERMES_URL / TEST_RUNNER_HERMES_TOKEN → HERMES_URL / HERMES_TOKEN

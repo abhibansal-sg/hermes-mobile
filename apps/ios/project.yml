@@ -46,7 +46,7 @@ targets:
         embed: true
       # DEBUG-only debug bridge. Linked in all configs by XcodeGen, but its
       # modules compile to nothing in Release (source-level #if DEBUG), so no
-      # Offline-first SQLite cache (CONTRACT-OFFLINE-CACHE.md P1/P2).
+      # Offline-first SQLite cache.
       # HermesMobile only; no extension target links this.
       - package: GRDB
         product: GRDB

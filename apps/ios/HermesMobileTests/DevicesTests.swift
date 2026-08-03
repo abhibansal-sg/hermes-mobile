@@ -4,7 +4,7 @@ import XCTest
 /// W3A-A coverage for the per-device-token surface: the `devices` (eager)
 /// capability probe state machine, the `PairedDevice` / `IssuedDevice` /
 /// `RevokeDeviceResult` / `ApprovalAuditEntry` fixture decodes (captured verbatim
-/// from the pinned shapes in CONTRACT-W3A.md §Interface), the QR v1/v2 parse
+/// from the gateway wire shapes), the QR v1/v2 parse
 /// (v1 unchanged, v2 `kind=device` records the id, unknown keys ignored), the
 /// auto-upgrade decision logic (issues iff available + no recorded deviceId;
 /// keeps the shared token on failure; never reconfigures), the revoke

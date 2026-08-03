@@ -4,8 +4,7 @@ import XCTest
 /// Inc-4 lane 4b — deterministic proof of gateway-restart survival + auth-revoke
 /// threshold (Task #5 follow-up).
 ///
-/// SPEC (SPEC-INC4-RESTART-SURVIVAL.md §Lane 4b): a gateway restart at a
-/// STABLE address+token must drive the reconnect loop to `.connected` with
+/// A gateway restart at a stable address+token must drive the reconnect loop to `.connected` with
 /// `reauthRequired == false` and `hasConnected` still true — no re-pair prompt.
 ///
 /// All tests use the injectable `connectRPC` seam so no live socket is required

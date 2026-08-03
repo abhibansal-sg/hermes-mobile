@@ -5,7 +5,7 @@ import GRDB
 //
 // One row per StoredMessage (HUMAN sessions only; cron sessions are never
 // transcript-cached per the decided scope). The StoredMessage is encoded as
-// a JSON blob via StoredMessageMirror. See CONTRACT-OFFLINE-CACHE.md §2.2.
+// a JSON blob via StoredMessageMirror.
 
 struct MessageRowRecord: Codable, FetchableRecord, PersistableRecord, Sendable {
     var serverId: String

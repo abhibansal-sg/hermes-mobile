@@ -64,7 +64,7 @@ struct CacheIdentity: Sendable, Equatable, Hashable {
 //
 // One row per session (raw, includes cron). The full SessionSummary is stored
 // as a JSON blob in `summaryJSON`; only the four SQL-useful fields are promoted
-// to real columns for indexed WHERE/ORDER BY. See CONTRACT-OFFLINE-CACHE.md §2.2.
+// to real columns for indexed WHERE/ORDER BY.
 
 struct SessionCacheRecord: Codable, FetchableRecord, PersistableRecord, Sendable {
     /// SessionSummary.id (stored_session_id; stable across compression chains)

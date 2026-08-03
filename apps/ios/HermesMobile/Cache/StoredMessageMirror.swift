@@ -12,7 +12,6 @@ import Foundation
 // StoredMessage that, when fed through the existing toChatMessages path,
 // renders identically to the original.
 //
-// See CONTRACT-OFFLINE-CACHE.md §2.2 and §2 rationale.
 
 struct StoredMessageMirror: Codable, Sendable {
     var role: String

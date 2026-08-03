@@ -10,7 +10,7 @@ import XCTest
 /// These exercise the pure, host-runnable transforms. The network legs
 /// (`/api/approvals/respond`, `/api/push/live-activity`) and the LAContext gate
 /// are status-code / system-prompt driven and are validated by the integration
-/// gate (live dashboard on 9123); see CONTRACT-F2.md.
+/// gate against an isolated gateway.
 final class NotificationActionTests: XCTestCase {
 
     @MainActor

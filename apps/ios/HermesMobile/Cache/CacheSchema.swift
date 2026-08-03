@@ -5,7 +5,7 @@ import GRDB
 //
 // DatabaseMigrator with numbered, append-only migrations applied idempotently at
 // open. Each migration is safe to re-run (GRDB tracks applied migrations in the
-// `grdb_migrations` system table). See CONTRACT-OFFLINE-CACHE.md §2.4.
+// `grdb_migrations` system table).
 //
 // Migration policy:
 //   - v1: create all three tables + four indexes (first ship)

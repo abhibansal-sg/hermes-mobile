@@ -33,13 +33,11 @@ private struct DrawerExportedTranscript: Identifiable, Equatable {
 /// live-pulse + source glyphs, collapsible/pinnable workspace groups, the Inbox
 /// sheet, and the opt-in quick-capture entry.
 ///
-/// ## UI Batch I — I4 (FULL NATIVE drawer internals)
+/// ## Native drawer internals
 /// The drawer **mechanics** (push-card gesture, width, scrim-less layering) are
 /// UNCHANGED — they live in ``CompactLayout`` (RootView), not here. The drawer
 /// **internals** moved from a hand-rolled `ScrollView` + `LazyVStack` to a system
-/// `List(.plain)` with system `Section` headers, per CONTRACT-UI-I §I4 ("rows/
-/// sections move to system List (plainStyle) IF it coexists with the drawer's
-/// gesture + scroll edge effect").
+/// `List(.plain)` with system `Section` headers.
 ///
 /// Coexistence was validated against the binding architecture before adopting
 /// List:

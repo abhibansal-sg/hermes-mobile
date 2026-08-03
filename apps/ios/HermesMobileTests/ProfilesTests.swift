@@ -3,8 +3,8 @@ import XCTest
 
 /// F4B-A.6 coverage for the DORMANT multi-profile switcher: the `profiles`
 /// capability probe state machine, the `ProfileSummary` / `ProfilesSessionsResult`
-/// fixture decodes (captured verbatim from the pinned upstream shapes in
-/// CONTRACT-F4B.md §Interface), the `SessionSummary.profile` round-trip (incl. the
+/// fixture decodes (captured verbatim from the gateway wire shapes), the
+/// `SessionSummary.profile` round-trip (incl. the
 /// dormant-path nil regression guard), the switcher visibility gate, the
 /// `visibleSessions` profile filter, the create/resume `profile` threading
 /// decision, and the REST per-session error surfacing.

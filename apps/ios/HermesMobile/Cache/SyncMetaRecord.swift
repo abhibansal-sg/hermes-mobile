@@ -8,7 +8,6 @@ import GRDB
 //   "eviction.lastRunAt"           — Unix timestamp of the last eviction sweep
 //   "schemaVersion"                — fingerprint for the drop-and-rebuild escape hatch
 //
-// See CONTRACT-OFFLINE-CACHE.md §2.2 and §3.
 
 struct SyncMetaRecord: Codable, FetchableRecord, PersistableRecord, Sendable {
     /// e.g. "sessionList.lastFullFetchAt", "serverCaps.deltaSessions"

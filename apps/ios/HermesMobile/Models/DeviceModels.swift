@@ -3,8 +3,7 @@ import Foundation
 /// Decoded shapes for the W3A per-device-token endpoints (`GET /api/devices`,
 /// `POST /api/devices/issue`, `DELETE /api/devices/{id}`, `GET
 /// /api/approvals/audit`). Owned by Module W3A-A (devices panel / capability
-/// probe / storage / rotation). The wire contract is the pinned W3A interface
-/// (see CONTRACT-W3A.md §Interface) — these models match it field-for-field and
+/// probe / storage / rotation). These models match the gateway wire interface field-for-field and
 /// are decoded with explicit `CodingKeys` (the snake_case wire keys are mapped
 /// here, NOT via `convertFromSnakeCase`, so a `RestClient.decode(strategy:)`
 /// choice can't double-transform them).

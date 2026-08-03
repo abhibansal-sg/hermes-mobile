@@ -12,8 +12,6 @@ import GRDB
 // DB location: Application Support / hermes_cache.sqlite
 // WAL mode + foreign_keys=ON applied at open.
 // Excluded from iCloud backup (it is a reconstructible cache).
-//
-// See CONTRACT-OFFLINE-CACHE.md §1, §2, §3.
 
 actor CacheStore {
 
@@ -105,7 +103,7 @@ actor CacheStore {
                 .filter(Column("serverId") == scope.serverId)
             if scope.profileId == CacheScope.allProfilesKey {
                 // `all` is a query selector over concrete profile rows, never a
-                // stored row profile (CONTRACT-OFFLINE-CACHE identity invariant).
+                // stored row profile (cache identity invariant).
                 request = request.filter(Column("profileId") != CacheScope.legacy.profileId)
             } else {
                 request = request.filter(Column("profileId") == scope.profileId)
@@ -932,7 +930,7 @@ actor CacheStore {
 
     /// The concrete profile a row must be STORED under, given a summary and the
     /// active write scope. `all` is only ever a query selector, never a stored
-    /// value (CONTRACT-OFFLINE-CACHE identity invariant): a blank/absent summary
+    /// value (cache identity invariant): a blank/absent summary
     /// profile collapses to the scope's own profile, or `default` when the scope
     /// itself is the aggregate key. Shared by every session-list write path so
     /// the stored profileId can never drift between them.

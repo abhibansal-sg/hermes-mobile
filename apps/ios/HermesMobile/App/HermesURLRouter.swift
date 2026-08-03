@@ -61,7 +61,7 @@ final class DeepLinkCoordinator {
 /// Live Activity — see X1's `HermesWidgetLink`) into the live store graph.
 ///
 /// The widgets/activity only *produce* these URLs; acting on them is owned here.
-/// The link contract (from `CONTRACT-WAVE1C.md` + `HermesWidgetLink`):
+/// The link contract shared with `HermesWidgetLink`:
 ///
 /// - `hermesapp://new-session`        → create + activate a fresh session.
 /// - `hermesapp://session/<storedId>` → resume that stored session. When the id

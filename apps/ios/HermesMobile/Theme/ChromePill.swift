@@ -34,7 +34,7 @@ import SwiftUI
 /// fill + hairline `theme.border` + a soft lift shadow — so the pills read as
 /// lifted off the fading content exactly as before.
 ///
-/// Apply at the four floating-chrome call sites ONLY (per CONTRACT-UI-H H3):
+/// Apply only at floating-chrome call sites:
 /// the hamburger pill, the trailing actions pill, the scroll-to-bottom pill,
 /// and the drawer "+ New chat" capsule. No content surface uses it.
 struct ChromePillBackground<S: InsettableShape>: ViewModifier {

@@ -6,8 +6,7 @@ import XCTest
 /// stuck after `tool.complete`.
 ///
 /// Self-skips offline (no HERMES_URL/HERMES_TOKEN). Run against an isolated
-/// dashboard instance, never the live 9119 — see CONTRACT-F2 environment
-/// rules.
+/// gateway instance, never an operator's live gateway.
 final class ToolRowLiveUITests: XCTestCase {
 
     func testLiveToolRowRendersAndCompletes() throws {
